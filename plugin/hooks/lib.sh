@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+
+# Shared last-mile helpers. Runtime code stays within the bash 3.2 subset.
+
+khala_valid_name() {
+    printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*$'
+}
+
+khala_nonnegative_integer() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+khala_positive_integer() {
+    khala_nonnegative_integer "$1" || return 1
+    [ "$1" -gt 0 ] 2>/dev/null
+}
+
+khala_normalize_integer() {
+    khala_normalized=$(printf '%s\n' "$1" | sed 's/^0*//')
+    if [ -z "$khala_normalized" ]; then
+        khala_normalized=0
+    fi
+    printf '%s\n' "$khala_normalized"
+}
+
+khala_file_mtime() {
+    khala_mtime=$(stat -c %Y "$1" 2>/dev/null) || khala_mtime=
+    if khala_nonnegative_integer "$khala_mtime"; then
+        printf '%s\n' "$khala_mtime"
+        return 0
+    fi
+    khala_mtime=$(stat -f %m "$1" 2>/dev/null) || khala_mtime=
+    if khala_nonnegative_integer "$khala_mtime"; then
+        printf '%s\n' "$khala_mtime"
+        return 0
+    fi
+    return 1
+}
+
+khala_discover() {
+    if [ "${KHALA_HOME+x}" = x ]; then
+        KHALA_ROOT=$KHALA_HOME
+    elif [ -n "${HOME-}" ]; then
+        KHALA_ROOT=$HOME/.khala
+    else
+        KHALA_ROOT=
+    fi
+
+    KHALA_BIN=$(command -v khala 2>/dev/null) || KHALA_BIN=
+    if [ -z "$KHALA_BIN" ] && [ -n "${HOME-}" ] && [ -x "$HOME/.local/bin/khala" ]; then
+        KHALA_BIN=$HOME/.local/bin/khala
+    fi
+    if [ -z "$KHALA_BIN" ] && [ -n "${CLAUDE_PROJECT_DIR-}" ] && \
+        [ -x "$CLAUDE_PROJECT_DIR/bin/khala" ]; then
+        KHALA_BIN=$CLAUDE_PROJECT_DIR/bin/khala
+    fi
+
+    [ -n "$KHALA_ROOT" ] && [ -n "$KHALA_BIN" ] && [ -f "$KHALA_ROOT/config" ]
+}
+
+khala_read_session_file() {
+    khala_session_path=$1
+    KHALA_SESSION_FILE_VALUE=
+    khala_session_line_count=0
+    while IFS= read -r khala_session_line || [ -n "$khala_session_line" ]; do
+        khala_session_line_count=$((khala_session_line_count + 1))
+        if [ "$khala_session_line_count" -eq 1 ]; then
+            KHALA_SESSION_FILE_VALUE=$khala_session_line
+        fi
+    done < "$khala_session_path"
+    [ "$khala_session_line_count" -eq 1 ] && khala_valid_name "$KHALA_SESSION_FILE_VALUE"
+}
+
+# $1: allow basename fallback (1/0), $2: emit resolution warnings (1/0)
+khala_resolve_session() {
+    khala_allow_basename=$1
+    khala_emit_warning=$2
+    KHALA_RESOLVED_SESSION=
+    KHALA_SESSION_SOURCE=
+    KHALA_EXPLICIT_IDENTITY=0
+
+    if [ "${KHALA_SESSION+x}" = x ]; then
+        KHALA_EXPLICIT_IDENTITY=1
+        if khala_valid_name "$KHALA_SESSION"; then
+            KHALA_RESOLVED_SESSION=$KHALA_SESSION
+            KHALA_SESSION_SOURCE=environment
+            return 0
+        fi
+        if [ "$khala_emit_warning" -eq 1 ]; then
+            printf 'khala: KHALA_SESSION이 유효한 세션 이름이 아닙니다: %s (허용: [a-z0-9][a-z0-9-]*)\n' \
+                "$KHALA_SESSION"
+        fi
+        return 1
+    fi
+
+    khala_session_path=${CLAUDE_PROJECT_DIR-}/.khala-session
+    if [ -n "${CLAUDE_PROJECT_DIR-}" ] && [ -f "$khala_session_path" ]; then
+        if khala_read_session_file "$khala_session_path"; then
+            KHALA_RESOLVED_SESSION=$KHALA_SESSION_FILE_VALUE
+            KHALA_SESSION_SOURCE=file
+            KHALA_EXPLICIT_IDENTITY=1
+            return 0
+        fi
+        if [ "$khala_emit_warning" -eq 1 ]; then
+            printf '%s\n' 'khala: .khala-session이 한 줄의 유효한 세션 이름이 아닙니다 — 무시합니다'
+        fi
+    fi
+
+    [ "$khala_allow_basename" -eq 1 ] || return 1
+    if [ -z "${CLAUDE_PROJECT_DIR-}" ]; then
+        if [ "$khala_emit_warning" -eq 1 ]; then
+            printf '%s\n' 'khala: CLAUDE_PROJECT_DIR가 없어 세션을 정할 수 없습니다 — 드레인을 건너뜁니다'
+        fi
+        return 1
+    fi
+    khala_basename=$(basename "$CLAUDE_PROJECT_DIR")
+    if ! khala_valid_name "$khala_basename"; then
+        if [ "$khala_emit_warning" -eq 1 ]; then
+            printf 'khala: 프로젝트 디렉터리명으로 세션을 정할 수 없습니다: %s (허용: [a-z0-9][a-z0-9-]*) — 드레인을 건너뜁니다\n' \
+                "$khala_basename"
+        fi
+        return 1
+    fi
+    KHALA_RESOLVED_SESSION=$khala_basename
+    KHALA_SESSION_SOURCE=basename
+    return 0
+}
+
+khala_self_node() {
+    KHALA_NODE=$(sed -n 's/^self //p' "$KHALA_ROOT/config")
+    khala_valid_name "$KHALA_NODE"
+}
+
+khala_count_files() {
+    khala_count_dir=$1
+    khala_count=0
+    if [ -d "$khala_count_dir" ]; then
+        for khala_count_path in "$khala_count_dir"/*; do
+            [ -f "$khala_count_path" ] || continue
+            khala_count=$((khala_count + 1))
+        done
+    fi
+    printf '%s\n' "$khala_count"
+}
+
+# Sets KHALA_WATCH_PID and returns true only for a fresh, well-formed owner.
+khala_watch_is_fresh() {
+    khala_watch_session=$1
+    khala_owner=$KHALA_ROOT/run/watch.$khala_watch_session.lock.d/owner
+    [ -f "$khala_owner" ] || return 1
+
+    khala_owner_epoch=$(sed -n '1p' "$khala_owner")
+    khala_owner_line=$(sed -n '2p' "$khala_owner")
+    khala_owner_interval=$(sed -n '3p' "$khala_owner")
+    KHALA_WATCH_PID=$(printf '%s\n' "$khala_owner_line" | \
+        sed -n 's/^pid \([0-9][0-9]*\) watch$/\1/p')
+    khala_nonnegative_integer "$khala_owner_epoch" || return 1
+    khala_nonnegative_integer "$KHALA_WATCH_PID" || return 1
+    khala_positive_integer "$khala_owner_interval" || return 1
+
+    khala_owner_epoch=$(khala_normalize_integer "$khala_owner_epoch")
+    khala_owner_interval=$(khala_normalize_integer "$khala_owner_interval")
+    khala_now=$(date +%s) || return 1
+    [ "$khala_now" -ge "$khala_owner_epoch" ] || return 1
+    khala_age=$((khala_now - khala_owner_epoch))
+    khala_fresh_for=$((2 * (khala_owner_interval + 120)))
+    [ "$khala_age" -lt "$khala_fresh_for" ]
+}
+
+khala_find_link_binary() {
+    KHALA_LINK_BINARY=
+    if [ -x "$KHALA_ROOT/bin/khala-link" ]; then
+        KHALA_LINK_BINARY=$KHALA_ROOT/bin/khala-link
+        return 0
+    fi
+    khala_binary_dir=$(CDPATH= cd -- "$(dirname "$KHALA_BIN")" 2>/dev/null && pwd) || return 1
+    if [ -x "$khala_binary_dir/khala-link" ]; then
+        KHALA_LINK_BINARY=$khala_binary_dir/khala-link
+        return 0
+    fi
+    return 1
+}
+
+khala_link_is_fresh() {
+    khala_link_marker=$KHALA_ROOT/run/link.fresh
+    [ -f "$khala_link_marker" ] || return 1
+    khala_link_mtime=$(khala_file_mtime "$khala_link_marker") || return 1
+    khala_now=$(date +%s) || return 1
+    [ "$khala_now" -ge "$khala_link_mtime" ] || return 1
+    [ "$((khala_now - khala_link_mtime))" -le 60 ]
+}
