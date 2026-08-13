@@ -1,36 +1,52 @@
 # khala-network
 
-Account-independent mail between Claude Code sessions across your machines.
+> *For we are bound by the Khala. The sacred union of our every thought and emotion.*
+>
+> *— Artanis, the Hierarch of the Daelaam*
 
-Khala joins the Claude Code sessions running on a fleet of machines — cloud
-containers, lab servers, laptops — into one store-and-forward network that
-depends on no Claude account, no shared filesystem, and no third-party server.
-A message to a sleeping machine waits on the sender's disk and is delivered
-when a path opens; nothing is ever silently dropped.
+**Account-independent mail between Claude Code sessions across your machines.**
+
+The original Khala binds every Protoss mind into one psionic communion. This
+one binds Claude Code sessions — across cloud containers, lab servers, and
+the laptop that is usually asleep — into one store-and-forward mail network,
+through a somewhat humbler medium: plain files over ssh. No Claude account in
+the loop, no shared filesystem, and no third party holding your thoughts
+(relays may carry encrypted bytes; they keep no state and are never
+required). A letter to a sleeping machine waits on the sender's disk and is
+delivered the moment a path opens. Thought may be delayed; it is never
+silently dropped.
 
 ## How it works
 
-One design, three organs. Every node owns its slice of a single logical mail
-tree on disk; everything else exists to make those slices converge.
+One design, three organs — a communion of files, not of minds. Every node
+owns its slice of a single logical mail tree on disk; everything else exists
+to make those slices converge.
 
-- **Brain — `bin/khala`** (bash 3.2 compatible, zero dependencies beyond
+- **The brain — `bin/khala`** (bash 3.2 compatible, nothing beyond
   ssh/rsync/coreutils): all semantics. `send` is a durable enqueue; delivery,
-  acks, dedup, bounces, and expiry are decided only by the owner of each path.
-  Every on-disk format is plain text you can read with grep.
-- **Nerve — `khala link`** (single Go binary, optional): a zero-semantics
-  file-event pump that keeps node trees converging within seconds. It runs
-  over a plain ssh pipe — spokes dial `ssh <hub> khala link --serve`, so the
-  hub needs no daemon, no new port, no new credentials.
-- **Ear — `khala watch`**: exits the moment mail lands in a session's inbox,
-  so a Claude Code background task wakes the session. With a live link the
-  whole path is second-scale; without one, everything still arrives on the
-  next `khala sync`.
+  acks, dedup, bounces, and expiry are decided only by the owner of each
+  path. Every on-disk format is plain text you can read with grep — this
+  Khala keeps no secrets from its own templar.
+- **The nerve cord — `khala link`** (single Go binary, optional): a
+  zero-semantics file-event pump that keeps the trees converging within
+  seconds. It runs over a plain ssh pipe — spokes dial
+  `ssh <hub> khala link --serve` — so the hub runs no daemon, opens no new
+  port, and mints no new credentials.
+- **The ear — `khala watch`**: exits the moment mail lands in the session's
+  inbox, so a Claude Code background task wakes the session. With a live
+  nerve, send-to-wake is second-scale end to end.
+
+Severing the nerve cord does not cast a node out of the communion — it
+merely goes Nerazim: the same letters travel the same mailbox protocol on
+the next `khala sync`, at minute-scale cadence. The dark templar managed
+fine; so will your laptop.
 
 Messages are at-least-once with receiver-side dedup. Undeliverable mail
-bounces back to the sender; a bounce that cannot be delivered is laid to rest
-in a dead-letter box, never retried forever. Khala never types into a
-session's input line — the input line is the user's identity; delivery is by
-mailbox only.
+bounces back to the sender, and a bounce that cannot be delivered is laid to
+rest in a dead-letter box — never retried forever. One boundary is sacred:
+khala never types into a session's input line. The input line is the user's
+identity; delivery is by mailbox only, and a session is woken only by its
+own watch returning.
 
 ## Install
 
@@ -69,13 +85,13 @@ The hub is just any node the others can reach over ssh — its own config says
 Daily use:
 
 ```sh
-khala send alice@hub -m "build finished"    # body via -m or stdin
+khala send executor@hub -m "build finished" # body via -m or stdin
 khala sync                                  # one exchange cycle (idempotent)
 khala inbox --drain                         # read your mail
 khala presence                              # who is alive / asleep / watching
 ```
 
-## Optional: the link (second-scale propagation)
+## Optional: the nerve cord (`khala link`, second-scale propagation)
 
 ```sh
 cd link && go build -o ~/.khala/bin/khala-link .   # or cross-build with GOOS/GOARCH
