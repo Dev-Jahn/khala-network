@@ -1,6 +1,6 @@
 {
   "name": "khala",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Khala last mile: bundled CLI self-install, mail and stream drain on session start, watch armament repair on stop, khala usage skill.",
   "author": { "name": "Dev-Jahn" }
 }
