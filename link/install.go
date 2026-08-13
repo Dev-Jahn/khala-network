@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +55,17 @@ func (i *installer) destination(o offer) (string, error) {
 			return "", fmt.Errorf("serve accepts presence only from connected spoke %q", i.peer)
 		}
 		return filepath.Join(i.home, "presence", o.Basename), nil
+	case "stream":
+		if !validNode(o.Stream) || !validMessageID(o.Basename) {
+			return "", fmt.Errorf("invalid stream or Id")
+		}
+		if i.role == "dial" && o.Node == i.peer {
+			return "", fmt.Errorf("dial refuses reflected stream shard for self %q", i.peer)
+		}
+		if i.role == "serve" && o.Node != i.peer {
+			return "", fmt.Errorf("serve accepts stream only from connected spoke %q", i.peer)
+		}
+		return filepath.Join(i.home, "streams", o.Stream, o.Node, o.Basename), nil
 	default:
 		return "", fmt.Errorf("unknown object class %q", o.Class)
 	}
@@ -168,6 +180,17 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	if err != nil {
 		return quarantined, tmp, err
 	}
+	if o.Class == "stream" {
+		epoch, epochErr := streamEpoch(o.Basename)
+		if epochErr != nil || epoch > uint64(time.Now().Unix()+86400) {
+			quarantine, quarantineErr := i.quarantineFutureStream(tmp, o)
+			if quarantineErr != nil {
+				return quarantined, tmp, quarantineErr
+			}
+			i.logger.Printf("future stream epoch refused and quarantined at %s", quarantine)
+			return quarantined, quarantine, fmt.Errorf("stream Id epoch exceeds now+86400")
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
 		return quarantined, tmp, err
 	}
@@ -258,6 +281,65 @@ func (i *installer) quarantine(tmp string, o offer) (string, error) {
 		return "", err
 	}
 	return dest, nil
+}
+
+func streamEpoch(id string) (uint64, error) {
+	epoch, _, ok := strings.Cut(id, ".")
+	if !ok {
+		return 0, fmt.Errorf("stream Id has no epoch")
+	}
+	return strconv.ParseUint(epoch, 10, 64)
+}
+
+func (i *installer) quarantineFutureStream(tmp string, o offer) (string, error) {
+	dir := filepath.Join(i.home, "spool", "dead")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", err
+	}
+	dest := filepath.Join(dir, "stream."+o.Stream+"."+o.Node+"."+o.Basename)
+	installErr := renameNoReplace(tmp, dest)
+	linkedInstall := false
+	if unsupportedNoReplace(installErr) {
+		installErr = os.Link(tmp, dest)
+		linkedInstall = installErr == nil
+	}
+	if installErr == nil {
+		if err := syncDir(dir); err != nil {
+			return "", err
+		}
+		if linkedInstall {
+			committed := filepath.Join(i.home, "tmp", "link.committed")
+			if err := os.Rename(tmp, committed); err != nil {
+				i.logger.Printf("quarantined %s durably but could not compact staging link %s: %v", dest, tmp, err)
+			}
+		}
+		return dest, nil
+	}
+	if !os.IsExist(installErr) {
+		return "", fmt.Errorf("atomic future-stream quarantine: %w", installErr)
+	}
+	equal, digestErr := sameDigest(dest, o.Digest)
+	if digestErr == nil && equal {
+		committed := filepath.Join(i.home, "tmp", "link.committed")
+		if err := os.Rename(tmp, committed); err != nil {
+			return "", err
+		}
+		return dest, nil
+	}
+	if digestErr != nil {
+		return "", digestErr
+	}
+	conflict := fmt.Sprintf("%s.%d.conflict", dest, os.Getpid())
+	if err := os.Rename(tmp, conflict); err != nil {
+		return "", err
+	}
+	if err := syncDir(dir); err != nil {
+		return "", err
+	}
+	return conflict, nil
 }
 
 func syncDir(path string) error {

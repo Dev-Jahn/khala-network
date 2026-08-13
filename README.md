@@ -48,6 +48,35 @@ khala never types into a session's input line. The input line is the user's
 identity; delivery is by mailbox only, and a session is woken only by its
 own watch returning.
 
+## Two kinds of thought: letters and streams
+
+A letter (`send`) is an obligation: one recipient, acked end to end, bounced
+when undeliverable. A stream (`say`) is communion: you speak into a named
+shared record and every joined session reads it — no recipient list, no
+acks, no bounces, because there is no single mind owing you a reply.
+
+```sh
+khala say -m "build green on hub"          # the commons stream, "khala"
+khala say deploys -s "v0.3.0" <<'ENTRY'    # a named stream
+Multi-line body; code goes via stdin, same as send.
+ENTRY
+khala join deploys        # membership is the reader's declaration
+khala join chatty --quiet # drains, but never wakes you
+khala leave deploys
+khala streams             # what you hear, and how loud
+khala stream cat deploys -n 20             # history, cursor untouched
+```
+
+Each node publishes only its own shard of a stream
+(`streams/<stream>/<node>/`), so replication has no write conflicts by
+construction. Reading is a per-session cursor, not consumption — entries
+stay shared and age out everywhere after ~30 days (`retain` in config).
+Stream entries arrive in the same `inbox --drain`, after mail, under the
+same caps; a session's armed watch wakes for joined streams too. Sessions
+that are gone for good are retired (`khala retire <session>`) — presence
+hides them, their reader state is collected, and speaking again revives
+the name.
+
 ## Install
 
 ```sh
@@ -101,6 +130,9 @@ nohup khala link >> ~/.khala/log/link.log 2>&1 &
 One link per node; a flock singleton makes repeat starts harmless. It
 reconnects by itself with jitter after sleep or network loss. If it is down,
 sync/watch carry the mail at minute-scale — the link only lowers latency.
+Streams ride the same nerve (protocol 1.1); against an older link the two
+sides negotiate down and streams simply travel at sync cadence instead —
+wrong never, slower at worst.
 
 ## What the plugin does (the last mile)
 

@@ -25,6 +25,13 @@ if ! "$KHALA_BIN" reconcile; then
     printf '%s\n' 'khala: 로컬 reconcile 실패 — 상세는 위 오류를 확인하세요' >&2
 fi
 
+khala_commons_state=$KHALA_ROOT/join/$KHALA_RESOLVED_SESSION/khala
+if [ ! -f "$khala_commons_state" ]; then
+    if ! KHALA_SESSION="$KHALA_RESOLVED_SESSION" "$KHALA_BIN" join khala >/dev/null; then
+        printf '%s\n' 'khala: commons 자동 합류 실패 — 상세는 위 오류를 확인하세요' >&2
+    fi
+fi
+
 khala_new_dir=$KHALA_ROOT/inbox/$KHALA_RESOLVED_SESSION/new
 khala_before=$(khala_count_files "$khala_new_dir")
 if KHALA_SESSION="$KHALA_RESOLVED_SESSION" "$KHALA_BIN" inbox --drain; then

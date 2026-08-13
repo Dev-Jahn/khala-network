@@ -15,13 +15,16 @@ import (
 
 type candidate struct {
 	class             string
+	stream            string
 	node              string
 	basename          string
 	path              string
 	deleteAfterStored bool
 }
 
-func (c candidate) key() string { return c.class + "\x00" + c.node + "\x00" + c.basename }
+func (c candidate) key() string {
+	return c.class + "\x00" + c.stream + "\x00" + c.node + "\x00" + c.basename
+}
 
 type originSet struct {
 	mu sync.RWMutex
@@ -42,28 +45,30 @@ func (s *originSet) has(key, id string) bool {
 }
 
 type treeWatcher struct {
-	home         string
-	role         string
-	self         string
-	peer         string
-	logger       *log.Logger
-	brain        *brain
-	origins      *originSet
-	out          chan<- candidate
-	period       time.Duration
-	dropEvents   bool
-	overflowOnce bool
-	w            *fsnotify.Watcher
-	spoolWatches map[string]struct{}
+	home          string
+	role          string
+	self          string
+	peer          string
+	logger        *log.Logger
+	brain         *brain
+	origins       *originSet
+	out           chan<- candidate
+	period        time.Duration
+	dropEvents    bool
+	overflowOnce  bool
+	w             *fsnotify.Watcher
+	spoolWatches  map[string]struct{}
+	streamWatches map[string]struct{}
 }
 
 func newTreeWatcher(home, role, self, peer string, logger *log.Logger, b *brain, origins *originSet, out chan<- candidate, period time.Duration) *treeWatcher {
 	return &treeWatcher{
 		home: home, role: role, self: self, peer: peer, logger: logger, brain: b,
 		origins: origins, out: out, period: period,
-		dropEvents:   os.Getenv("KHALA_LINK_TEST_DROP_EVENTS") == "1",
-		overflowOnce: os.Getenv("KHALA_LINK_TEST_OVERFLOW_ON_EVENT") == "1",
-		spoolWatches: make(map[string]struct{}),
+		dropEvents:    os.Getenv("KHALA_LINK_TEST_DROP_EVENTS") == "1",
+		overflowOnce:  os.Getenv("KHALA_LINK_TEST_OVERFLOW_ON_EVENT") == "1",
+		spoolWatches:  make(map[string]struct{}),
+		streamWatches: make(map[string]struct{}),
 	}
 }
 
@@ -149,6 +154,13 @@ func (t *treeWatcher) register() error {
 	if err := t.w.Add(spoolRoot); err != nil {
 		return fmt.Errorf("watch spool root: %w", err)
 	}
+	streamsRoot := filepath.Join(t.home, "streams")
+	if err := os.MkdirAll(streamsRoot, 0700); err != nil {
+		return err
+	}
+	if err := t.addStreamWatch(streamsRoot); err != nil {
+		return fmt.Errorf("watch streams root: %w", err)
+	}
 	if t.role == "dial" {
 		outbox := filepath.Join(t.home, "outbox", "new")
 		if err := os.MkdirAll(outbox, 0700); err != nil {
@@ -224,6 +236,7 @@ func (t *treeWatcher) scanAll() {
 		t.scanSpool(t.peer)
 	}
 	t.scanPresence()
+	t.scanStreams()
 }
 
 func (t *treeWatcher) scanOutbox() {
@@ -283,6 +296,90 @@ func (t *treeWatcher) scanPresence() {
 	}
 }
 
+func (t *treeWatcher) addStreamWatch(path string) error {
+	if _, ok := t.streamWatches[path]; ok {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("stream path is not a directory: %s", path)
+	}
+	if err := t.w.Add(path); err != nil {
+		return err
+	}
+	t.streamWatches[path] = struct{}{}
+	return nil
+}
+
+func (t *treeWatcher) eligibleStreamNode(node string) bool {
+	if t.role == "dial" {
+		return node == t.self
+	}
+	return node != t.peer
+}
+
+func (t *treeWatcher) scanStreams() {
+	root := filepath.Join(t.home, "streams")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.logger.Printf("scan streams root failed: %v", err)
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !validNode(entry.Name()) {
+			continue
+		}
+		streamDir := filepath.Join(root, entry.Name())
+		if err := t.addStreamWatch(streamDir); err != nil {
+			t.logger.Printf("watch stream %s failed: %v", entry.Name(), err)
+			continue
+		}
+		t.scanStream(entry.Name())
+	}
+}
+
+func (t *treeWatcher) scanStream(stream string) {
+	dir := filepath.Join(t.home, "streams", stream)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.logger.Printf("scan stream/%s failed: %v", stream, err)
+		return
+	}
+	for _, entry := range entries {
+		node := entry.Name()
+		if !entry.IsDir() || !validNode(node) || !t.eligibleStreamNode(node) {
+			continue
+		}
+		shardDir := filepath.Join(dir, node)
+		if err := t.addStreamWatch(shardDir); err != nil {
+			t.logger.Printf("watch stream shard %s/%s failed: %v", stream, node, err)
+			continue
+		}
+		t.scanStreamShard(stream, node)
+	}
+}
+
+func (t *treeWatcher) scanStreamShard(stream, node string) {
+	dir := filepath.Join(t.home, "streams", stream, node)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.logger.Printf("scan stream shard %s/%s failed: %v", stream, node, err)
+		return
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !validMessageID(entry.Name()) {
+			continue
+		}
+		t.enqueue(candidate{
+			class: "stream", stream: stream, node: node, basename: entry.Name(),
+			path: filepath.Join(dir, entry.Name()),
+		})
+	}
+}
+
 func (t *treeWatcher) enqueue(c candidate) {
 	select {
 	case t.out <- c:
@@ -297,11 +394,35 @@ func (t *treeWatcher) handleHint(path string) {
 		return
 	}
 	spoolRoot := filepath.Join(t.home, "spool", "for")
+	streamsRoot := filepath.Join(t.home, "streams")
 	if info.IsDir() && filepath.Dir(path) == spoolRoot {
 		node := filepath.Base(path)
 		if t.role == "dial" && validNode(node) && node != t.self {
 			if err := t.addSpoolWatch(node); err != nil {
 				t.logger.Printf("watch new spool %s failed: %v", node, err)
+			}
+		}
+		return
+	}
+	if info.IsDir() && filepath.Dir(path) == streamsRoot {
+		stream := filepath.Base(path)
+		if validNode(stream) {
+			if err := t.addStreamWatch(path); err != nil {
+				t.logger.Printf("watch stream %s failed: %v", stream, err)
+			} else {
+				t.scanStream(stream)
+			}
+		}
+		return
+	}
+	if info.IsDir() && filepath.Dir(filepath.Dir(path)) == streamsRoot {
+		stream := filepath.Base(filepath.Dir(path))
+		node := filepath.Base(path)
+		if validNode(stream) && validNode(node) && t.eligibleStreamNode(node) {
+			if err := t.addStreamWatch(path); err != nil {
+				t.logger.Printf("watch stream shard %s/%s failed: %v", stream, node, err)
+			} else {
+				t.scanStreamShard(stream, node)
 			}
 		}
 		return
@@ -317,6 +438,16 @@ func (t *treeWatcher) handleHint(path string) {
 		node, ok := presenceNode(filepath.Base(path))
 		if ok && (t.role == "serve" || node == t.self) {
 			t.enqueue(candidate{class: "presence", node: node, basename: filepath.Base(path), path: path})
+		}
+		return
+	}
+	shardDir := filepath.Dir(path)
+	streamDir := filepath.Dir(shardDir)
+	if filepath.Dir(streamDir) == streamsRoot {
+		stream := filepath.Base(streamDir)
+		node := filepath.Base(shardDir)
+		if validNode(stream) && validNode(node) && t.eligibleStreamNode(node) && validMessageID(filepath.Base(path)) {
+			t.enqueue(candidate{class: "stream", stream: stream, node: node, basename: filepath.Base(path), path: path})
 		}
 		return
 	}

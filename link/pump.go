@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,30 +22,37 @@ type readWriter struct {
 }
 
 type pump struct {
-	home      string
-	role      string
-	self      string
-	peer      string
-	maxObject int64
-	scanEvery time.Duration
-	logger    *log.Logger
-	reader    *bufio.Reader
-	writer    *frameWriter
-	brain     *brain
-	origins   *originSet
-	responses chan frame
-	lastInput atomic.Int64
-	activeOut atomic.Bool
-	asyncErr  chan error
-	knownMu   sync.Mutex
-	known     map[string]string
-	rejected  map[string]string
+	home       string
+	role       string
+	self       string
+	peer       string
+	localMinor uint64
+	minor      uint64
+	maxObject  int64
+	scanEvery  time.Duration
+	logger     *log.Logger
+	reader     *bufio.Reader
+	writer     *frameWriter
+	brain      *brain
+	origins    *originSet
+	responses  chan frame
+	lastInput  atomic.Int64
+	activeOut  atomic.Bool
+	asyncErr   chan error
+	knownMu    sync.Mutex
+	known      map[string]string
+	rejected   map[string]string
 }
 
 func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, maxObject int64, scanEvery time.Duration, logger *log.Logger) (hello, error) {
+	localMinor, err := advertisedMinor(role)
+	if err != nil {
+		return hello{}, err
+	}
 	p := &pump{
 		home: home, role: role, self: self, peer: expectedPeer,
-		maxObject: maxObject, scanEvery: scanEvery, logger: logger,
+		localMinor: localMinor,
+		maxObject:  maxObject, scanEvery: scanEvery, logger: logger,
 		reader: bufio.NewReader(rw.Reader), writer: newFrameWriter(rw.Writer),
 		origins: newOriginSet(), responses: make(chan frame, 8), asyncErr: make(chan error, 4),
 		known: make(map[string]string), rejected: make(map[string]string),
@@ -55,6 +63,10 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	}
 	if role == "serve" {
 		p.peer = remote.Node
+	}
+	p.minor = minimumMinor(p.localMinor, remote.Minor)
+	if p.minor < streamMinor {
+		logger.Printf("negotiated protocol %d.%d; stream offers disabled", protocolMajor, p.minor)
 	}
 	if role == "dial" && expectedPeer != "" && remote.Node != expectedPeer {
 		p.fatal("PEER_MISMATCH", fmt.Sprintf("expected peer %q, got %q", expectedPeer, remote.Node))
@@ -103,7 +115,7 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 }
 
 func (p *pump) handshake() (hello, error) {
-	local := hello{Magic: protocolMagic, Major: protocolMajor, Minor: protocolMinor, Node: p.self, Role: p.role, Impl: implVersion}
+	local := hello{Magic: protocolMagic, Major: protocolMajor, Minor: p.localMinor, Node: p.self, Role: p.role, Impl: implVersion}
 	if err := p.writer.write(helloFrame(local)); err != nil {
 		return hello{}, fmt.Errorf("write HELLO: %w", err)
 	}
@@ -139,6 +151,25 @@ func (p *pump) handshake() (hello, error) {
 	return remote, nil
 }
 
+func minimumMinor(local, remote uint64) uint64 {
+	if remote < local {
+		return remote
+	}
+	return local
+}
+
+func advertisedMinor(role string) (uint64, error) {
+	value, set := os.LookupEnv("KHALA_LINK_TEST_SERVE_MINOR")
+	if role != "serve" || !set {
+		return protocolMinor, nil
+	}
+	minor, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || minor > protocolMinor {
+		return 0, fmt.Errorf("KHALA_LINK_TEST_SERVE_MINOR must be between 0 and %d", protocolMinor)
+	}
+	return minor, nil
+}
+
 func (p *pump) fatal(code, text string) {
 	p.logger.Printf("fatal protocol error %s: %s", code, text)
 	_ = p.writer.write(errorFrame(code, false, text))
@@ -169,6 +200,14 @@ func (p *pump) readLoop(ctx context.Context) error {
 			if err != nil {
 				p.fatal("BAD_OFFER", err.Error())
 				return err
+			}
+			if o.Class == "stream" && p.minor < streamMinor {
+				text := fmt.Sprintf("stream OFFER requires protocol minor %d", streamMinor)
+				p.logger.Printf("refused unnegotiated OFFER: %s", text)
+				if err := p.writer.write(errorFrame("UNNEGOTIATED_CLASS", true, text)); err != nil {
+					return err
+				}
+				continue
 			}
 			if o.Size > uint64(p.maxObject) {
 				text := fmt.Sprintf("%s is %d bytes; max-object-bytes is %d", o.Basename, o.Size, p.maxObject)
@@ -340,6 +379,9 @@ func (p *pump) sendLoop(ctx context.Context, candidates <-chan candidate) error 
 }
 
 func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
+	if c.class == "stream" && p.minor < streamMinor {
+		return nil
+	}
 	info, err := os.Lstat(c.path)
 	if os.IsNotExist(err) {
 		return nil
@@ -375,7 +417,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		return nil
 	}
 	digest := sha256.Sum256(data)
-	id := transferID(c.class, c.node, c.basename, digest)
+	id := transferID(c.class, c.stream, c.node, c.basename, digest)
 	if p.origins.has(c.key(), id) {
 		return nil
 	}
@@ -392,7 +434,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		}
 		return nil
 	}
-	o := offer{ID: id, Class: c.class, Node: c.node, Basename: c.basename, Size: uint64(len(data)), Digest: digest}
+	o := offer{ID: id, Class: c.class, Stream: c.stream, Node: c.node, Basename: c.basename, Size: uint64(len(data)), Digest: digest}
 	p.activeOut.Store(true)
 	defer p.activeOut.Store(false)
 	if err := p.writer.write(offerFrame(o)); err != nil {
@@ -527,7 +569,9 @@ func (p *pump) markRejected(key, id string) {
 	p.knownMu.Unlock()
 }
 
-func offerKey(o offer) string { return o.Class + "\x00" + o.Node + "\x00" + o.Basename }
+func offerKey(o offer) string {
+	return o.Class + "\x00" + o.Stream + "\x00" + o.Node + "\x00" + o.Basename
+}
 
 func (p *pump) touchFresh() error {
 	dir := filepath.Join(p.home, "run")
