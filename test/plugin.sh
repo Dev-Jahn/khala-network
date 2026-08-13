@@ -75,8 +75,8 @@ run_start_without_env() {
     run_output=$3
     (
         unset KHALA_SESSION
-        KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project PATH=$SHIM:/usr/bin:/bin \
-            "$START"
+        HOME=$FAKE_HOME KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project \
+            PATH=$SHIM:/usr/bin:/bin "$START"
     ) > "$run_output" 2> "$run_output.err"
 }
 
@@ -87,13 +87,20 @@ run_stop_without_env() {
     run_output=$4
     (
         unset KHALA_SESSION
-        printf '%s\n' "$run_input" | KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project \
-            PATH=$SHIM:/usr/bin:/bin "$STOP"
+        printf '%s\n' "$run_input" | HOME=$FAKE_HOME KHALA_HOME=$run_home \
+            CLAUDE_PROJECT_DIR=$run_project PATH=$SHIM:/usr/bin:/bin "$STOP"
     ) > "$run_output" 2> "$run_output.err"
 }
 
 mkdir -p "$RIG" "$SHIM" || fail setup "could not create fixture root"
 ln -s "$KHALA" "$SHIM/khala" || fail setup "could not create PATH shim"
+# Hooks self-install the bundled CLI into $HOME/.local/bin; every hook run in
+# this suite gets an isolated fake HOME, pre-seeded so ensure stays silent.
+FAKE_HOME=$RIG/home
+mkdir -p "$FAKE_HOME/.local/bin" || fail setup "could not create fake home"
+cp "$KHALA" "$FAKE_HOME/.local/bin/khala" || fail setup "could not seed fake CLI"
+chmod 755 "$FAKE_HOME/.local/bin/khala"
+printf 'khala-plugin\n' > "$FAKE_HOME/.local/bin/.khala.plugin-receipt"
 trap cleanup EXIT HUP INT TERM
 
 # Python is a test-rig-only JSON parser; the plugin runtime has no Python dependency.
@@ -101,7 +108,9 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/.claude-plugin/plugin.json" || fail 1 "plugin.json is invalid"
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/hooks/hooks.json" || fail 1 "hooks.json is invalid"
-pass 1 "plugin manifests are valid JSON (Python is test-only)"
+cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || \
+    fail 1 "plugin/bin/khala drifted from bin/khala"
+pass 1 "plugin manifests are valid JSON and bundled CLI matches bin/khala"
 
 UNINIT=$RIG/uninitialized
 UNINIT_PROJECT=$RIG/uninit-session
@@ -111,8 +120,8 @@ run_start_without_env "$UNINIT" "$UNINIT_PROJECT" "$RIG/uninit-start.out"
 [ "$?" -eq 0 ] || fail 2 "uninitialized SessionStart exited nonzero"
 [ "$(wc -l < "$RIG/uninit-start.out" | tr -d ' ')" -eq 1 ] || \
     fail 2 "uninitialized SessionStart did not print exactly one line"
-grep -Fqx 'khala: 미설치/미초기화 — 이 노드는 칼라 밖입니다' "$RIG/uninit-start.out" || \
-    fail 2 "uninitialized SessionStart line differs"
+grep -Fqx 'khala: 노드 미초기화 — 이 노드는 칼라 밖입니다 (참여하려면: khala init <노드별칭> 후 ~/.khala/config에 함대 선언)' \
+    "$RIG/uninit-start.out" || fail 2 "uninitialized SessionStart line differs"
 run_stop_without_env "$UNINIT" "$UNINIT_PROJECT" '{"stop_hook_active":false}' "$RIG/uninit-stop.out"
 [ ! -s "$RIG/uninit-stop.out" ] && [ ! -s "$RIG/uninit-stop.out.err" ] || \
     fail 2 "uninitialized Stop was not silent"
@@ -158,7 +167,7 @@ make_project "$PRE_PROJECT" file-session
 stage_letter "$PRE_HOME" env-session env-wins
 stage_letter "$PRE_HOME" file-session file-next
 stage_letter "$PRE_HOME" base-session basename-last
-KHALA_HOME=$PRE_HOME CLAUDE_PROJECT_DIR=$PRE_PROJECT KHALA_SESSION=env-session \
+HOME=$FAKE_HOME KHALA_HOME=$PRE_HOME CLAUDE_PROJECT_DIR=$PRE_PROJECT KHALA_SESSION=env-session \
     PATH=$SHIM:/usr/bin:/bin "$START" > "$RIG/precedence-env.out" 2> "$RIG/precedence-env.err" || \
     fail 5 "environment precedence run failed"
 grep -q 'env-wins' "$RIG/precedence-env.out" || fail 5 "environment identity did not win"
@@ -245,7 +254,7 @@ NO_ID_PROJECT=$RIG/no-identity
 init_home "$STOP_HOME"
 make_project "$STOP_PROJECT" stop-session
 make_project "$NO_ID_PROJECT"
-KHALA_HOME=$STOP_HOME CLAUDE_PROJECT_DIR=$STOP_PROJECT KHALA_SESSION=stop-session \
+HOME=$FAKE_HOME KHALA_HOME=$STOP_HOME CLAUDE_PROJECT_DIR=$STOP_PROJECT KHALA_SESSION=stop-session \
     PATH=$SHIM:/usr/bin:/bin "$STOP" <<<'{"stop_hook_active":true}' \
     > "$RIG/stop-active.out" 2> "$RIG/stop-active.err" || fail 8 "active Stop exited nonzero"
 [ ! -s "$RIG/stop-active.out" ] && [ ! -s "$RIG/stop-active.err" ] || \
@@ -290,9 +299,14 @@ if grep -En 'declare[[:space:]]+-A|mapfile|readarray|\$\{[^}]*,,|\$\{![^}]*\[@\]
     "$ROOT"/plugin/hooks/*.sh > "$RIG/bash4-audit.out"; then
     fail 11 "bash-4-only construct found: $(tr '\n' ' ' < "$RIG/bash4-audit.out")"
 fi
-grep -R -n '/tmp' "$ROOT/plugin" > "$RIG/tmp-audit.out" && \
+# Audit scope is the plugin's own runtime (hooks/skill/manifests); the bundled
+# CLI is a byte copy of bin/khala with its own suites (and its $KHALA_ROOT/tmp
+# usage is not the forbidden system /tmp).
+grep -R -n '/tmp' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
+    > "$RIG/tmp-audit.out" && \
     fail 11 "plugin references /tmp: $(tr '\n' ' ' < "$RIG/tmp-audit.out")"
-grep -R -n 'jq' "$ROOT/plugin" > "$RIG/jq-audit.out" && \
+grep -R -n 'jq' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
+    > "$RIG/jq-audit.out" && \
     fail 11 "plugin runtime references jq: $(tr '\n' ' ' < "$RIG/jq-audit.out")"
 pass 11 "R13, bash 3.2, no-jq, no-/tmp, and bash -n audits pass"
 
@@ -316,6 +330,64 @@ else
     printf 'SKIP link — Go toolchain missing at %s/go-toolchain/bin/go\n' "$HOME"
 fi
 pass 12 "all available existing suites pass unchanged"
+
+# Property 13 — CLI self-install ownership rules. Each case gets its own HOME.
+run_start_home() {
+    run_fake_home=$1
+    run_output=$2
+    (
+        unset KHALA_SESSION
+        HOME=$run_fake_home KHALA_HOME=$run_fake_home/absent-khala \
+            CLAUDE_PROJECT_DIR=$RIG/cli-project PATH=$SHIM:/usr/bin:/bin "$START"
+    ) > "$run_output" 2> "$run_output.err"
+}
+make_project "$RIG/cli-project" cli-session
+RECEIPT_REL=.local/bin/.khala.plugin-receipt
+
+CLI_FRESH=$RIG/cli-fresh
+mkdir -p "$CLI_FRESH"
+run_start_home "$CLI_FRESH" "$RIG/cli-fresh.out" || fail 13 "fresh-home run failed"
+cmp -s "$ROOT/plugin/bin/khala" "$CLI_FRESH/.local/bin/khala" || \
+    fail 13 "fresh home did not receive the bundled CLI"
+[ -f "$CLI_FRESH/$RECEIPT_REL" ] || fail 13 "fresh install left no receipt"
+grep -q 'CLI 설치됨' "$RIG/cli-fresh.out" || fail 13 "fresh install was silent"
+run_start_home "$CLI_FRESH" "$RIG/cli-again.out" || fail 13 "second run failed"
+grep -q 'CLI' "$RIG/cli-again.out" && fail 13 "idempotent rerun still talked about the CLI"
+
+CLI_UPDATE=$RIG/cli-update
+mkdir -p "$CLI_UPDATE/.local/bin"
+printf '#!/bin/sh\nexit 0\n' > "$CLI_UPDATE/.local/bin/khala"
+chmod 755 "$CLI_UPDATE/.local/bin/khala"
+printf 'khala-plugin\n' > "$CLI_UPDATE/$RECEIPT_REL"
+run_start_home "$CLI_UPDATE" "$RIG/cli-update.out" || fail 13 "receipted update run failed"
+cmp -s "$ROOT/plugin/bin/khala" "$CLI_UPDATE/.local/bin/khala" || \
+    fail 13 "receipted stale copy was not updated"
+grep -q 'CLI 갱신됨' "$RIG/cli-update.out" || fail 13 "receipted update was silent"
+
+CLI_MANUAL=$RIG/cli-manual
+mkdir -p "$CLI_MANUAL/.local/bin"
+printf '#!/bin/sh\nexit 7\n' > "$CLI_MANUAL/.local/bin/khala"
+chmod 755 "$CLI_MANUAL/.local/bin/khala"
+run_start_home "$CLI_MANUAL" "$RIG/cli-manual.out" || fail 13 "manual-copy run failed"
+printf '#!/bin/sh\nexit 7\n' | cmp -s - "$CLI_MANUAL/.local/bin/khala" || \
+    fail 13 "unreceipted manual copy was overwritten"
+grep -q '수동 설치본으로 보고 건드리지 않습니다' "$RIG/cli-manual.out" || \
+    fail 13 "manual copy was not announced"
+
+CLI_LINK=$RIG/cli-symlink
+mkdir -p "$CLI_LINK/.local/bin"
+printf '#!/bin/sh\nexit 9\n' > "$CLI_LINK/elsewhere"
+ln -s "$CLI_LINK/elsewhere" "$CLI_LINK/.local/bin/khala"
+run_start_home "$CLI_LINK" "$RIG/cli-symlink.out" || fail 13 "symlink run failed"
+[ -L "$CLI_LINK/.local/bin/khala" ] || fail 13 "symlink was replaced"
+printf '#!/bin/sh\nexit 9\n' | cmp -s - "$CLI_LINK/elsewhere" || \
+    fail 13 "symlink target was rewritten"
+grep -q '심링크(수동 관리)' "$RIG/cli-symlink.out" || fail 13 "divergent symlink was silent"
+rm -f "$CLI_LINK/elsewhere"
+cp "$ROOT/plugin/bin/khala" "$CLI_LINK/elsewhere"
+run_start_home "$CLI_LINK" "$RIG/cli-symlink-same.out" || fail 13 "identical-symlink run failed"
+grep -q 'CLI' "$RIG/cli-symlink-same.out" && fail 13 "identical symlink still warned"
+pass 13 "CLI self-install: fresh installs, receipt updates, manual copies and symlinks stay untouched"
 
 printf 'RESULT: PASS\n'
 printf 'Claude Code plugin hooks, skill, armament repair, and regressions passed\n'
