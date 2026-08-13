@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -16,9 +17,10 @@ var (
 )
 
 type config struct {
-	self      string
-	mailboxes []string
-	peers     map[string][]string
+	self       string
+	retainDays uint64
+	mailboxes  []string
+	peers      map[string][]string
 }
 
 type dialEndpoint struct {
@@ -32,7 +34,8 @@ func loadConfig(home string) (config, error) {
 		return config{}, fmt.Errorf("read config: %w", err)
 	}
 	defer f.Close()
-	c := config{peers: make(map[string][]string)}
+	c := config{retainDays: 30, peers: make(map[string][]string)}
+	retainSet := false
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
@@ -52,6 +55,16 @@ func loadConfig(home string) (config, error) {
 			if len(fields) > 2 {
 				c.peers[fields[1]] = append(c.peers[fields[1]], fields[2:]...)
 			}
+		case "retain":
+			if len(fields) != 2 || retainSet {
+				return config{}, errorsf("config retain must be exactly one non-negative integer")
+			}
+			days, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				return config{}, errorsf("config retain must be a non-negative integer")
+			}
+			c.retainDays = days
+			retainSet = true
 		}
 	}
 	if err := s.Err(); err != nil {

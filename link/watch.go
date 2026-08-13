@@ -31,6 +31,22 @@ type originSet struct {
 	m  map[string]string
 }
 
+type logOnceSet struct {
+	mu sync.Mutex
+	m  map[string]struct{}
+}
+
+func newLogOnceSet() *logOnceSet { return &logOnceSet{m: make(map[string]struct{})} }
+func (s *logOnceSet) first(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.m[key]; ok {
+		return false
+	}
+	s.m[key] = struct{}{}
+	return true
+}
+
 func newOriginSet() *originSet { return &originSet{m: make(map[string]string)} }
 func (s *originSet) add(key, id string) {
 	s.mu.Lock()
@@ -59,6 +75,8 @@ type treeWatcher struct {
 	w             *fsnotify.Watcher
 	spoolWatches  map[string]struct{}
 	streamWatches map[string]struct{}
+	presenceWatch bool
+	ageReady      bool
 }
 
 func newTreeWatcher(home, role, self, peer string, logger *log.Logger, b *brain, origins *originSet, out chan<- candidate, period time.Duration) *treeWatcher {
@@ -79,7 +97,7 @@ func (t *treeWatcher) run(ctx context.Context) error {
 	}
 	t.w = w
 	defer w.Close()
-	// C4 ordering: every eligible tree is registered before its initial scan.
+	// Spool is not age-governed and remains live even if the brain is busy.
 	if err := t.register(); err != nil {
 		return err
 	}
@@ -103,7 +121,9 @@ func (t *treeWatcher) run(ctx context.Context) error {
 			t.scanAll()
 		case <-presenceC:
 			presenceC = nil
-			t.scanPresence()
+			if t.ageScanReady() {
+				t.scanPresence()
+			}
 		case err, ok := <-w.Errors:
 			if !ok {
 				return nil
@@ -140,26 +160,12 @@ func (t *treeWatcher) run(ctx context.Context) error {
 }
 
 func (t *treeWatcher) register() error {
-	presence := filepath.Join(t.home, "presence")
-	if err := os.MkdirAll(presence, 0700); err != nil {
-		return err
-	}
-	if err := t.w.Add(presence); err != nil {
-		return fmt.Errorf("watch presence: %w", err)
-	}
 	spoolRoot := filepath.Join(t.home, "spool", "for")
 	if err := os.MkdirAll(spoolRoot, 0700); err != nil {
 		return err
 	}
 	if err := t.w.Add(spoolRoot); err != nil {
 		return fmt.Errorf("watch spool root: %w", err)
-	}
-	streamsRoot := filepath.Join(t.home, "streams")
-	if err := os.MkdirAll(streamsRoot, 0700); err != nil {
-		return err
-	}
-	if err := t.addStreamWatch(streamsRoot); err != nil {
-		return fmt.Errorf("watch streams root: %w", err)
 	}
 	if t.role == "dial" {
 		outbox := filepath.Join(t.home, "outbox", "new")
@@ -187,6 +193,27 @@ func (t *treeWatcher) register() error {
 		if err := t.addSpoolWatch(t.peer); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (t *treeWatcher) registerAgeGoverned() error {
+	presence := filepath.Join(t.home, "presence")
+	if err := os.MkdirAll(presence, 0700); err != nil {
+		return err
+	}
+	if !t.presenceWatch {
+		if err := t.w.Add(presence); err != nil {
+			return fmt.Errorf("watch presence: %w", err)
+		}
+		t.presenceWatch = true
+	}
+	streamsRoot := filepath.Join(t.home, "streams")
+	if err := os.MkdirAll(streamsRoot, 0700); err != nil {
+		return err
+	}
+	if err := t.addStreamWatch(streamsRoot); err != nil {
+		return fmt.Errorf("watch streams root: %w", err)
 	}
 	return nil
 }
@@ -235,8 +262,32 @@ func (t *treeWatcher) scanAll() {
 	} else {
 		t.scanSpool(t.peer)
 	}
+	t.scanAgeGoverned()
+}
+
+func (t *treeWatcher) scanAgeGoverned() {
+	if !t.ageScanReady() {
+		return
+	}
 	t.scanPresence()
 	t.scanStreams()
+}
+
+func (t *treeWatcher) ageScanReady() bool {
+	if err := t.brain.reconcile(true); err != nil {
+		t.ageReady = false
+		t.logger.Printf("age-governed scan skipped; brain reconcile failed: %v", err)
+		return false
+	}
+	// Presence has no filename epoch, so successful reconciliation is its
+	// only age gate. Register first, then scan to preserve C4 event coverage.
+	if err := t.registerAgeGoverned(); err != nil {
+		t.ageReady = false
+		t.logger.Printf("age-governed scan skipped; watch registration failed: %v", err)
+		return false
+	}
+	t.ageReady = true
+	return true
 }
 
 func (t *treeWatcher) scanOutbox() {
@@ -406,7 +457,7 @@ func (t *treeWatcher) handleHint(path string) {
 	}
 	if info.IsDir() && filepath.Dir(path) == streamsRoot {
 		stream := filepath.Base(path)
-		if validNode(stream) {
+		if validNode(stream) && t.ageScanReady() {
 			if err := t.addStreamWatch(path); err != nil {
 				t.logger.Printf("watch stream %s failed: %v", stream, err)
 			} else {
@@ -418,7 +469,7 @@ func (t *treeWatcher) handleHint(path string) {
 	if info.IsDir() && filepath.Dir(filepath.Dir(path)) == streamsRoot {
 		stream := filepath.Base(filepath.Dir(path))
 		node := filepath.Base(path)
-		if validNode(stream) && validNode(node) && t.eligibleStreamNode(node) {
+		if validNode(stream) && validNode(node) && t.eligibleStreamNode(node) && t.ageScanReady() {
 			if err := t.addStreamWatch(path); err != nil {
 				t.logger.Printf("watch stream shard %s/%s failed: %v", stream, node, err)
 			} else {
@@ -446,7 +497,7 @@ func (t *treeWatcher) handleHint(path string) {
 	if filepath.Dir(streamDir) == streamsRoot {
 		stream := filepath.Base(streamDir)
 		node := filepath.Base(shardDir)
-		if validNode(stream) && validNode(node) && t.eligibleStreamNode(node) && validMessageID(filepath.Base(path)) {
+		if t.ageReady && validNode(stream) && validNode(node) && t.eligibleStreamNode(node) && validMessageID(filepath.Base(path)) {
 			t.enqueue(candidate{class: "stream", stream: stream, node: node, basename: filepath.Base(path), path: path})
 		}
 		return
