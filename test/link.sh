@@ -121,7 +121,7 @@ if [ ! -x "$GO" ]; then
 fi
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
-    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.0-test' -o "$BIN" .) \
+    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.1-test' -o "$BIN" .) \
     >"$RIG/go.out" 2>"$RIG/go.err"; then
     fail 0 "Go tests/build failed: $(tr '\n' ' ' < "$RIG/go.err")"
 fi
@@ -307,6 +307,7 @@ DIAL_WATCHED_AFTER=$(dial_watched_count "$A" alpha)
 pass 11 "STORED delay held transit; sole unlink is serve-gated; dial view count stayed fixed"
 
 stop_link "$B_PID"
+rm -f -- "$B/run/link.fresh"
 start_link "$B" beta
 B_PID=$LAST_PID
 wait_file "$B/run/link.fresh" 5 || fail 11 "normal beta link did not restart after delay test"
@@ -371,7 +372,7 @@ pass 14 "healthy idle survived >65s fresh; silent serve exited at 60s; suppresse
 
 mkdir -p "$W/run"
 touch "$W/run/link.fresh"
-if KHALA_HOME="$W" "$KHALA" watch --session local --interval 30 --max-wait 2 \
+if KHALA_HOME="$W" "$KHALA" watch --session local --interval 30 --max-wait 8 \
     >"$W/fresh-watch.out" 2>"$W/fresh-watch.err"; then
     fail 15 "fresh-marker empty watch unexpectedly found mail"
 else
@@ -380,7 +381,7 @@ fi
 [ "$fresh_watch_status" -eq 3 ] || fail 15 "fresh-marker watch exited $fresh_watch_status"
 grep -q 'sync 실패' "$W/fresh-watch.err" && fail 15 "fresh marker did not suppress exchange"
 touch -d '20 seconds ago' "$W/run/link.fresh"
-if KHALA_HOME="$W" "$KHALA" watch --session stale --interval 1 --max-wait 2 \
+if KHALA_HOME="$W" "$KHALA" watch --session stale --interval 1 --max-wait 8 \
     >"$W/stale-watch.out" 2>"$W/stale-watch.err"; then
     fail 15 "stale-marker empty watch unexpectedly found mail"
 else
@@ -417,17 +418,26 @@ pass 16 "second dial was idempotent; restart replaced the holder; kill -9 releas
 
 stop_link "$A_PID"
 stop_link "$C_PID"
-start_link "$A" alpha KHALA_LINK_TEST_DATA_INSTALL_DELAY=2s
+rm -f -- "$A/run/link.fresh" "$C/run/link.fresh"
+start_link "$A" alpha KHALA_LINK_TEST_DATA_INSTALL_DELAY=3s
 A_PID=$LAST_PID
-start_link "$C" gamma KHALA_LINK_TEST_DATA_INSTALL_DELAY=2s
+start_link "$C" gamma KHALA_LINK_TEST_DATA_INSTALL_DELAY=3s
 C_PID=$LAST_PID
 wait_file "$A/run/link.fresh" 5 || fail 17 "writer-identity alpha link did not start"
 wait_file "$C/run/link.fresh" 5 || fail 17 "writer-identity gamma link did not start"
-WRITER_AC_ID=$(KHALA_HOME="$A" KHALA_SESSION=writer-a "$KHALA" send writer-a@gamma -m 'A serve writer') || fail 17 "A writer send failed"
-WRITER_CA_ID=$(KHALA_HOME="$C" KHALA_SESSION=writer-c "$KHALA" send writer-c@alpha -m 'C serve writer') || fail 17 "C writer send failed"
+KHALA_HOME="$A" KHALA_SESSION=writer-a "$KHALA" send writer-a@gamma -m 'A serve writer' \
+    >"$A/writer-ac.id" 2>"$A/writer-ac.err" &
+WRITER_AC_SEND_PID=$!
+KHALA_HOME="$C" KHALA_SESSION=writer-c "$KHALA" send writer-c@alpha -m 'C serve writer' \
+    >"$C/writer-ca.id" 2>"$C/writer-ca.err" &
+WRITER_CA_SEND_PID=$!
+wait "$WRITER_AC_SEND_PID" || fail 17 "A writer send failed"
+wait "$WRITER_CA_SEND_PID" || fail 17 "C writer send failed"
+WRITER_AC_ID=$(sed -n '1p' "$A/writer-ac.id")
+WRITER_CA_ID=$(sed -n '1p' "$C/writer-ca.id")
 cp "$A/spool/for/gamma/$WRITER_AC_ID" "$A/tmp/writer-a.source"
 cp "$C/spool/for/alpha/$WRITER_CA_ID" "$C/tmp/writer-c.source"
-writer_deadline=$(( $(date +%s) + 4 ))
+writer_deadline=$(( $(date +%s) + 10 ))
 WRITER_A_TMP=
 WRITER_C_TMP=
 while { [ -z "$WRITER_A_TMP" ] || [ -z "$WRITER_C_TMP" ]; } && \
@@ -448,10 +458,11 @@ case $WRITER_A_PID:$WRITER_C_PID in
     *[!0-9:]*|:*|*:) fail 17 "serve tmp names omitted numeric writer identities" ;;
 esac
 [ "$WRITER_A_PID" != "$WRITER_C_PID" ] || fail 17 "two spoke arrivals used the same serve writer identity"
-wait_file "$C/inbox/writer-a/new/$WRITER_AC_ID" 8 || fail 17 "A writer object did not reach C"
-wait_file "$A/inbox/writer-c/new/$WRITER_CA_ID" 8 || fail 17 "C writer object did not reach A"
+wait_file "$C/inbox/writer-a/new/$WRITER_AC_ID" 10 || fail 17 "A writer object did not reach C"
+wait_file "$A/inbox/writer-c/new/$WRITER_CA_ID" 10 || fail 17 "C writer object did not reach A"
 stop_link "$A_PID"
 stop_link "$C_PID"
+rm -f -- "$A/run/link.fresh" "$C/run/link.fresh"
 start_link "$A" alpha
 A_PID=$LAST_PID
 start_link "$C" gamma

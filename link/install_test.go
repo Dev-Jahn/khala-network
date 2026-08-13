@@ -182,6 +182,46 @@ func TestFutureStreamInstallMovesToBrainQuarantineEncoding(t *testing.T) {
 	}
 }
 
+func TestExpiredStreamInstallSkipsWithoutLiveOrQuarantineFile(t *testing.T) {
+	home := testKhalaHome(t)
+	name := fmt.Sprintf("%d.2.3.ear@alpha", time.Now().Unix()-32*86400)
+	data := []byte("expired stream bytes")
+	o := testStreamOffer("khala", "alpha", name, data)
+	i := installer{home: home, role: "serve", peer: "alpha", retainDays: 30, logger: testLogger{t}}
+	result, _, err := i.receive(o, data)
+	if err != nil || result != expiredSkipped {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "streams", "khala", "alpha", name)); !os.IsNotExist(statErr) {
+		t.Fatalf("expired entry polluted live tree: %v", statErr)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(home, "spool", "dead", "*"+name+"*"))
+	if globErr != nil || len(matches) != 0 {
+		t.Fatalf("expired entry was quarantined: matches=%v err=%v", matches, globErr)
+	}
+}
+
+func TestStreamExpirationSlackBoundaryDoesNotFlap(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	cutoff := now.Unix() - 31*86400
+	for _, test := range []struct {
+		epoch   int64
+		expired bool
+	}{
+		{epoch: cutoff - 1, expired: true},
+		{epoch: cutoff, expired: false},
+		{epoch: cutoff + 1, expired: false},
+	} {
+		name := fmt.Sprintf("%d.2.3.ear@alpha", test.epoch)
+		for cycle := 0; cycle < 2; cycle++ {
+			got, err := streamExpiredAt(name, 30, 1, now)
+			if err != nil || got != test.expired {
+				t.Fatalf("epoch=%d cycle=%d expired=%t want %t err=%v", test.epoch, cycle, got, test.expired, err)
+			}
+		}
+	}
+}
+
 func TestInspectRejectsExistingSymlink(t *testing.T) {
 	home := testKhalaHome(t)
 	data := []byte("outside bytes")

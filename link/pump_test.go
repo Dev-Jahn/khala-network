@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -75,7 +78,7 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := runPump(context.Background(), readWriter{Reader: local, Writer: local},
-			home, "serve", "b200", "", "/bin/true", 1<<20, time.Hour,
+			home, "serve", "b200", "", "/bin/true", 1<<20, 30, time.Hour, newLogOnceSet(),
 			log.New(io.Discard, "", 0))
 		result <- err
 	}()
@@ -101,6 +104,69 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 		}
 	case <-time.After(63 * time.Second):
 		t.Fatal("serve did not stop after its 60s quiet timeout")
+	}
+}
+
+func TestPumpShutdownWaitsForAgeScanReconcile(t *testing.T) {
+	home := testKhalaHome(t)
+	brainPath := filepath.Join(home, "fake-brain")
+	brainScript := `#!/bin/sh
+if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ]; then
+    mkdir "$KHALA_HOME/run/brain.lock.d" || exit 1
+    printf '%s\n' "$$" > "$KHALA_HOME/run/brain.lock.d/owner"
+    : > "$KHALA_HOME/gate.started"
+    sleep 1
+    rm -f "$KHALA_HOME/run/brain.lock.d/owner"
+    rmdir "$KHALA_HOME/run/brain.lock.d"
+    : > "$KHALA_HOME/gate.done"
+fi
+`
+	if err := os.WriteFile(brainPath, []byte(brainScript), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	result := make(chan error, 1)
+	go func() {
+		_, err := runPump(ctx, readWriter{Reader: local, Writer: local}, home, "serve", "b200", "",
+			brainPath, 1<<20, 30, time.Hour, newLogOnceSet(), log.New(io.Discard, "", 0))
+		result <- err
+	}()
+	remoteReader := bufio.NewReader(remote)
+	if _, err := readFrame(remoteReader, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := newFrameWriter(remote).write(helloFrame(hello{
+		Magic: protocolMagic, Major: protocolMajor, Minor: protocolMinor,
+		Node: "alpha", Role: "dial", Impl: "shutdown-test-double",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	started := filepath.Join(home, "gate.started")
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("age-scan reconcile did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_ = remote.Close()
+	select {
+	case <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not stop after age-scan reconcile completed")
+	}
+	if _, err := os.Stat(filepath.Join(home, "gate.done")); err != nil {
+		t.Fatalf("pump returned before age-scan reconcile finished: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "run", "brain.lock.d")); !os.IsNotExist(err) {
+		t.Fatalf("pump stranded brain lock on shutdown: %v", err)
 	}
 }
 
@@ -154,6 +220,84 @@ func TestInboundInstallDoesNotBlockOppositeDirectionResponses(t *testing.T) {
 	case <-p.brain.dirty:
 	case <-time.After(time.Second):
 		t.Fatal("install completion did not trigger the brain")
+	}
+	_ = remote.Close()
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("reader did not stop after pipe close")
+	}
+}
+
+func TestExpiredOutboundStreamProducesNoOfferAndLogsOnce(t *testing.T) {
+	home := testKhalaHome(t)
+	name := fmt.Sprintf("%d.1.1.speaker@alpha", time.Now().Unix()-32*86400)
+	path := filepath.Join(home, "streams", "commons", "alpha", name)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("expired"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var wire bytes.Buffer
+	var logs bytes.Buffer
+	p := &pump{
+		role: "dial", minor: streamMinor, retainDays: 30, maxObject: 1 << 20,
+		logger: log.New(&logs, "", 0), writer: newFrameWriter(&wire),
+		expiredOfferLogs: newLogOnceSet(), origins: newOriginSet(),
+		known: make(map[string]string), rejected: make(map[string]string),
+	}
+	c := candidate{class: "stream", stream: "commons", node: "alpha", basename: name, path: path}
+	for cycle := 0; cycle < 2; cycle++ {
+		if err := p.sendCandidate(context.Background(), c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if wire.Len() != 0 {
+		t.Fatalf("expired stream wrote %d wire bytes", wire.Len())
+	}
+	if count := strings.Count(logs.String(), name); count != 1 {
+		t.Fatalf("expired skip log count=%d logs=%q", count, logs.String())
+	}
+}
+
+func TestInboundExpiredOfferIsRecoverableWithoutDataOrBrainTrigger(t *testing.T) {
+	home := testKhalaHome(t)
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+	p := &pump{
+		home: home, role: "serve", self: "b200", peer: "alpha", minor: streamMinor,
+		retainDays: 30, maxObject: 1 << 20,
+		reader: bufio.NewReader(local), writer: newFrameWriter(local),
+		logger: log.New(io.Discard, "", 0), responses: make(chan frame, 1),
+		origins: newOriginSet(), asyncErr: make(chan error, 1),
+		brain: &brain{dirty: make(chan struct{}, 1)},
+	}
+	result := make(chan error, 1)
+	go func() { result <- p.readLoop(context.Background()) }()
+
+	name := fmt.Sprintf("%d.1.1.speaker@alpha", time.Now().Unix()-32*86400)
+	data := []byte("expired in flight")
+	o := testStreamOffer("commons", "alpha", name, data)
+	if err := newFrameWriter(remote).write(offerFrame(o)); err != nil {
+		t.Fatal(err)
+	}
+	f, err := readFrame(bufio.NewReader(remote), 1<<20)
+	if err != nil || f.typ != frameError {
+		t.Fatalf("response type=%d err=%v", f.typ, err)
+	}
+	protocolErr, err := decodeError(f)
+	if err != nil || protocolErr.Code != "STREAM_EXPIRED" || !protocolErr.Recoverable {
+		t.Fatalf("response=%+v err=%v", protocolErr, err)
+	}
+	if _, err := os.Stat(filepath.Join(home, "streams", "commons", "alpha", name)); !os.IsNotExist(err) {
+		t.Fatalf("expired offer installed: %v", err)
+	}
+	select {
+	case <-p.brain.dirty:
+		t.Fatal("expired offer triggered the brain")
+	default:
 	}
 	_ = remote.Close()
 	select {

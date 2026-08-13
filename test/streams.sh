@@ -246,6 +246,50 @@ property_6() {
         die "laggard drain failed"
     grep -q '커서 이전 항목들이 retention을 지나 소멸했습니다' "$RIG/p6-lost.out" ||
         die "retention-loss notice was omitted"
+
+    KHALA_HOME=$home_a KHALA_SESSION=flight-reader "$KHALA" inbox >/dev/null ||
+        die "in-flight reader heartbeat failed"
+    KHALA_HOME=$home_a KHALA_SESSION=flight-reader "$KHALA" join flight --from-start >/dev/null ||
+        die "in-flight reader join failed"
+    flight_epoch=$(( $(date +%s) - 2678400 ))
+    flight_id=$(write_entry "$home_a" flight alpha stale "$flight_epoch" 'in-flight expired') ||
+        die "in-flight expired fixture failed"
+    flight_dir=$home_a/streams/flight/alpha
+    flight_fixture=$home_a/tmp/$flight_id.fixture
+    cp "$flight_dir/$flight_id" "$flight_fixture" || die "could not preserve in-flight fixture"
+    rm -f "$flight_dir/$flight_id"
+    flight_control=$home_a/tmp/inject-expired
+    : > "$flight_control"
+    (
+        while [ -f "$flight_control" ]; do
+            cp "$flight_fixture" "$flight_dir/.$flight_id.incoming" || exit 1
+            mv "$flight_dir/.$flight_id.incoming" "$flight_dir/$flight_id" || exit 1
+            sleep 0.02
+        done
+    ) &
+    flight_inject_pid=$!
+    if KHALA_HOME=$home_a "$KHALA" watch --session flight-reader --interval 1 --max-wait 3 \
+        >"$RIG/p6-flight-watch.out" 2>"$RIG/p6-flight-watch.err"; then
+        rm -f "$flight_control"
+        wait "$flight_inject_pid" 2>/dev/null || :
+        die "in-flight expired entry woke watch"
+    else
+        flight_watch_status=$?
+    fi
+    [ "$flight_watch_status" -eq 3 ] || die "in-flight watch exited $flight_watch_status"
+    : > "$RIG/p6-flight-drain.out"
+    flight_attempt=1
+    while [ "$flight_attempt" -le 8 ]; do
+        KHALA_HOME=$home_a KHALA_SESSION=flight-reader "$KHALA" inbox --drain \
+            >>"$RIG/p6-flight-drain.out" 2>"$RIG/p6-flight-drain.err" ||
+            die "in-flight drain attempt $flight_attempt failed"
+        flight_attempt=$((flight_attempt + 1))
+    done
+    rm -f "$flight_control"
+    wait "$flight_inject_pid" || die "in-flight injector failed"
+    [ ! -s "$RIG/p6-flight-watch.out" ] || die "expired watch produced output"
+    [ ! -s "$RIG/p6-flight-drain.out" ] || die "expired entry appeared in drain"
+    [ ! -e "$home_a/cursor/flight-reader/flight" ] || die "expired entry advanced the cursor"
 }
 
 property_7() {
@@ -293,7 +337,7 @@ run_link_streams_suite() {
 
 property_8() {
     run_link_streams_suite || die "link stream suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
-    for property in 8a 8b 8c L1 L2; do
+    for property in 8a 8b 8c L1 L2 H1 H2; do
         grep -q "^ok $property —" "$RIG/link-streams.out" || die "link stream suite omitted $property"
     done
 }

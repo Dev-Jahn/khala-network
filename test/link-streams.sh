@@ -89,6 +89,56 @@ wait_file() {
     [ -f "$wait_path" ]
 }
 
+wait_absent() {
+    wait_path=$1
+    wait_seconds=$2
+    wait_deadline=$(( $(date +%s) + wait_seconds ))
+    while [ -e "$wait_path" ] && [ "$(date +%s)" -lt "$wait_deadline" ]; do
+        sleep 0.05
+    done
+    [ ! -e "$wait_path" ]
+}
+
+wait_either_file() {
+    wait_first=$1
+    wait_second=$2
+    wait_seconds=$3
+    wait_deadline=$(( $(date +%s) + wait_seconds ))
+    while [ ! -f "$wait_first" ] && [ ! -f "$wait_second" ] && \
+        [ "$(date +%s)" -lt "$wait_deadline" ]; do
+        sleep 0.05
+    done
+    [ -f "$wait_first" ] || [ -f "$wait_second" ]
+}
+
+carrier_child() {
+    carrier_parent=$1
+    for carrier_pid in $(pgrep -P "$carrier_parent" 2>/dev/null); do
+        carrier_command=$(ps -p "$carrier_pid" -o command= 2>/dev/null) || continue
+        case "$carrier_command" in
+            *"khala-link --serve"*) printf '%s\n' "$carrier_pid"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+wait_new_child() {
+    wait_parent=$1
+    wait_old_child=$2
+    wait_seconds=$3
+    wait_deadline=$(( $(date +%s) + wait_seconds ))
+    wait_child=
+    while [ "$(date +%s)" -lt "$wait_deadline" ]; do
+        wait_child=$(carrier_child "$wait_parent") || wait_child=
+        if [ -n "$wait_child" ] && [ "$wait_child" != "$wait_old_child" ]; then
+            printf '%s\n' "$wait_child"
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
 write_entry() {
     entry_home=$1
     entry_stream=$2
@@ -117,7 +167,7 @@ trap cleanup EXIT HUP INT TERM
 [ -x "$GO" ] || fail 0 "Go toolchain missing at $GO"
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
-    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.0-test' -o "$BIN" .) \
+    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.1-test' -o "$BIN" .) \
     >"$RIG/go.out" 2>"$RIG/go.err"; then
     fail 0 "Go tests/build failed: $(tr '\n' ' ' < "$RIG/go.err")"
 fi
@@ -127,19 +177,63 @@ B=$RIG/beta
 HUB=$RIG/b200
 OLD_A=$RIG/old-alpha
 OLD_HUB=$RIG/old-b200
+HARD_A=$RIG/hard-alpha
+HARD_HUB=$RIG/hard-b200
 init_home "$A" alpha
 init_home "$B" beta
 init_home "$HUB" b200
 init_home "$OLD_A" oldalpha
 init_home "$OLD_HUB" b200
+init_home "$HARD_A" hardalpha
+init_home "$HARD_HUB" b200
 write_config "$A" alpha "$HUB"
 write_config "$B" beta "$HUB"
 write_config "$OLD_A" oldalpha "$OLD_HUB"
+write_config "$HARD_A" hardalpha "$HARD_HUB"
+
+HARD_OLD_EPOCH=$(( $(date +%s) - 32 * 86400 ))
+HARD_OLD_ID=$(write_entry "$HARD_A" bounded hardalpha ancient "$HARD_OLD_EPOCH" 'must never be offered') ||
+    fail H1 "expired fixture failed"
+HARD_FRESH_ID=$(write_entry "$HARD_A" bounded hardalpha living "$(date +%s)" 'must be offered') ||
+    fail H1 "fresh fixture failed"
+start_link "$HARD_A" hardalpha "$HARD_HUB"
+HARD_PID=$LAST_PID
+wait_file "$HARD_HUB/streams/bounded/hardalpha/$HARD_FRESH_ID" 5 ||
+    fail H1 "fresh entry was not offered after startup reconcile"
+wait_absent "$HARD_A/streams/bounded/hardalpha/$HARD_OLD_ID" 5 ||
+    fail H1 "startup reconcile did not prune expired owner entry"
+[ ! -e "$HARD_HUB/streams/bounded/hardalpha/$HARD_OLD_ID" ] ||
+    fail H1 "expired owner entry reached the hub live tree"
+if grep -Fq "$HARD_OLD_ID" "$HARD_HUB/log/link.log" 2>/dev/null; then
+    fail H1 "hub wire endpoint observed an expired OFFER"
+fi
+pass H1 "link-first startup reconciled before offering; expired OFFER count was zero"
+
+HARD_CHILD=$(carrier_child "$HARD_PID")
+[ -n "$HARD_CHILD" ] || fail H2 "initial carrier child missing"
+hard_round=1
+while [ "$hard_round" -le 3 ]; do
+    kill -KILL "$HARD_CHILD" 2>/dev/null || fail H2 "could not kill carrier round $hard_round"
+    HARD_REPLAY_ID=$(write_entry "$HARD_A" bounded hardalpha ancient "$HARD_OLD_EPOCH" 'must never be reoffered') ||
+        fail H2 "expired reinjection failed in round $hard_round"
+    [ "$HARD_REPLAY_ID" = "$HARD_OLD_ID" ] || fail H2 "reinjection changed fixture Id"
+    HARD_CHILD=$(wait_new_child "$HARD_PID" "$HARD_CHILD" 6) ||
+        fail H2 "carrier did not redial in round $hard_round"
+    wait_absent "$HARD_A/streams/bounded/hardalpha/$HARD_OLD_ID" 5 ||
+        fail H2 "expired entry survived redial reconcile in round $hard_round"
+    [ ! -e "$HARD_HUB/streams/bounded/hardalpha/$HARD_OLD_ID" ] ||
+        fail H2 "expired entry reached hub in round $hard_round"
+    hard_round=$((hard_round + 1))
+done
+HARD_LOG_COUNT=$(grep -Fh "$HARD_OLD_ID" "$HARD_A/log/link.log" "$HARD_HUB/log/link.log" 2>/dev/null | wc -l | tr -d ' ')
+[ "$HARD_LOG_COUNT" -le 1 ] || fail H2 "expired item logged $HARD_LOG_COUNT times across three redials"
+stop_link "$HARD_PID"
+pass H2 "three carrier redials produced zero expired OFFERs and at most one skip log"
 
 start_link "$A" alpha "$HUB"
 A_PID=$LAST_PID
 wait_file "$A/run/link.fresh" 5 || fail 8a "alpha link did not handshake"
-A_CHILD_BEFORE=$(pgrep -P "$A_PID" | sed -n '1p')
+A_CHILD_BEFORE=$(carrier_child "$A_PID")
 [ -n "$A_CHILD_BEFORE" ] || fail 8a "alpha carrier child missing"
 start_ns=$(date +%s%N)
 PIPE_ID=$(KHALA_HOME="$A" KHALA_SESSION=speaker "$KHALA" say pipe -m 'pipe stream') ||
@@ -148,7 +242,7 @@ wait_file "$HUB/streams/pipe/alpha/$PIPE_ID" 3 || fail 8a "pipe stream did not r
 end_ns=$(date +%s%N)
 PIPE_MS=$(( (end_ns - start_ns) / 1000000 ))
 [ "$PIPE_MS" -le 2000 ] || fail 8a "pipe latency ${PIPE_MS}ms"
-A_CHILD_AFTER=$(pgrep -P "$A_PID" | sed -n '1p')
+A_CHILD_AFTER=$(carrier_child "$A_PID")
 [ "$A_CHILD_BEFORE" = "$A_CHILD_AFTER" ] || fail 8a "carrier reconnected during delivery"
 pass 8a "A say reached the pipe receiver in ${PIPE_MS}ms without reconnect"
 
@@ -191,11 +285,13 @@ KHALA_HOME="$B" "$KHALA" watch --session future-reader --interval 1 --max-wait 2
 FUTURE_WATCH_PID=$!
 PIDS="$PIDS $FUTURE_WATCH_PID"
 sleep 0.5
-FUTURE_EPOCH=$(( $(date +%s) + 86401 ))
+FUTURE_EPOCH=$(( $(date +%s) + 90000 ))
 FUTURE_ID=$(write_entry "$A" future alpha timewarp "$FUTURE_EPOCH" 'must quarantine') ||
     fail L2 "future fixture failed"
-FUTURE_DEAD=$HUB/spool/dead/stream.future.alpha.$FUTURE_ID
-wait_file "$FUTURE_DEAD" 4 || fail L2 "future link entry did not use brain quarantine encoding"
+FUTURE_DEAD_LOCAL=$A/spool/dead/stream.future.alpha.$FUTURE_ID
+FUTURE_DEAD_HUB=$HUB/spool/dead/stream.future.alpha.$FUTURE_ID
+wait_either_file "$FUTURE_DEAD_LOCAL" "$FUTURE_DEAD_HUB" 4 ||
+    fail L2 "future link entry did not use brain quarantine encoding"
 if wait "$FUTURE_WATCH_PID"; then
     fail L2 "future link entry woke a joined reader"
 else
@@ -204,7 +300,11 @@ fi
 [ "$FUTURE_WATCH_STATUS" -eq 3 ] || fail L2 "future watch exited $FUTURE_WATCH_STATUS"
 [ ! -e "$HUB/streams/future/alpha/$FUTURE_ID" ] || fail L2 "future entry polluted hub live tree"
 [ ! -e "$B/streams/future/alpha/$FUTURE_ID" ] || fail L2 "future entry fanned out to beta"
-grep -Fq "$FUTURE_ID" "$HUB/log/link.log" || fail L2 "future quarantine was not logged loudly"
+if [ -f "$FUTURE_DEAD_LOCAL" ]; then
+    grep -Fq "$FUTURE_ID" "$A/log/link.log" || fail L2 "source quarantine was not logged loudly"
+else
+    grep -Fq "$FUTURE_ID" "$HUB/log/link.log" || fail L2 "install quarantine was not logged loudly"
+fi
 pass L2 "future epoch was quarantined before live-tree install and caused no wake"
 rm -f -- "$A/streams/future/alpha/$FUTURE_ID"
 
