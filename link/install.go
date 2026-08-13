@@ -19,6 +19,7 @@ type installer struct {
 	home           string
 	role           string
 	peer           string
+	retainDays     uint64
 	logger         loggerLike
 	linkInstallLog sync.Once
 }
@@ -31,6 +32,7 @@ const (
 	installed installResult = iota
 	alreadyStored
 	quarantined
+	expiredSkipped
 )
 
 func (i *installer) destination(o offer) (string, error) {
@@ -190,6 +192,18 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 			i.logger.Printf("future stream epoch refused and quarantined at %s", quarantine)
 			return quarantined, quarantine, fmt.Errorf("stream Id epoch exceeds now+86400")
 		}
+		expired, expiredErr := streamExpiredAt(o.Basename, i.retainDays, 1, time.Now())
+		if expiredErr != nil {
+			return quarantined, tmp, expiredErr
+		}
+		if expired {
+			committed := filepath.Join(i.home, "tmp", "link.committed")
+			if err := os.Rename(tmp, committed); err != nil {
+				return quarantined, tmp, fmt.Errorf("compact expired stream staging file: %w", err)
+			}
+			i.logger.Printf("expired stream skipped without install or quarantine: %s", o.Basename)
+			return expiredSkipped, committed, nil
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
 		return quarantined, tmp, err
@@ -289,6 +303,25 @@ func streamEpoch(id string) (uint64, error) {
 		return 0, fmt.Errorf("stream Id has no epoch")
 	}
 	return strconv.ParseUint(epoch, 10, 64)
+}
+
+func streamExpiredAt(id string, retainDays, slackDays uint64, now time.Time) (bool, error) {
+	epoch, err := streamEpoch(id)
+	if err != nil {
+		return false, err
+	}
+	if now.Unix() < 0 {
+		return false, nil
+	}
+	nowEpoch := uint64(now.Unix())
+	if epoch >= nowEpoch || retainDays > ^uint64(0)-slackDays {
+		return false, nil
+	}
+	days := retainDays + slackDays
+	if days > ^uint64(0)/86400 {
+		return false, nil
+	}
+	return nowEpoch-epoch > days*86400, nil
 }
 
 func (i *installer) quarantineFutureStream(tmp string, o offer) (string, error) {

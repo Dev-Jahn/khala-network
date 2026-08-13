@@ -22,7 +22,7 @@ TMP_DIR=$KHALA_ROOT/tmp
 SYNC_FAILED=0
 EPOCH_DATE_STYLE=
 TTL_LINK=12
-KHALA_VERSION=0.3.0
+KHALA_VERSION=0.3.1
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -235,12 +235,16 @@ acquire_lock() {
     lock_path=$1
     lock_stale_after=$2
     lock_what=$3
+    lock_attempt_limit=60
+    if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ] && [ "$lock_what" = reconcile ]; then
+        lock_attempt_limit=1
+    fi
     if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
         error "$KHALA_ROOT/run: lock 디렉터리를 준비하지 못했습니다"
         return 1
     fi
     lock_attempt=0
-    while [ "$lock_attempt" -lt 60 ]; do
+    while [ "$lock_attempt" -lt "$lock_attempt_limit" ]; do
         if mkdir "$lock_path" 2>/dev/null; then
             lock_now=$(date +%s) || {
                 rmdir "$lock_path" 2>/dev/null || :
@@ -271,10 +275,10 @@ acquire_lock() {
             continue
         fi
         lock_attempt=$((lock_attempt + 1))
-        [ "$lock_attempt" -lt 60 ] || break
+        [ "$lock_attempt" -lt "$lock_attempt_limit" ] || break
         sleep 1
     done
-    error "$lock_path: 60회 시도 후에도 lock을 얻지 못했습니다"
+    error "$lock_path: ${lock_attempt_limit}회 시도 후에도 lock을 얻지 못했습니다"
     return 1
 }
 
@@ -562,6 +566,12 @@ build_unread_stream_entries() {
         fi
         unread_cursor_epoch=${unread_cursor%%.*}
     fi
+    unread_retain_days=$(retain_days) || return 1
+    unread_now=$(date +%s) || {
+        error "현재 시각을 읽지 못했습니다"
+        return 1
+    }
+    unread_retain_seconds=$((unread_retain_days * 86400))
     unread_all=$(mktemp "$TMP_DIR/stream-unread-all.XXXXXX") || return 1
     if ! collect_stream_entries "$unread_stream" "$unread_all"; then
         rm -f "$unread_all"
@@ -573,6 +583,10 @@ build_unread_stream_entries() {
     }
     while IFS="$TAB" read -r unread_epoch unread_id unread_path; do
         [ -n "${unread_epoch-}" ] || continue
+        unread_epoch_normalized=$(normalize_integer "$unread_epoch")
+        if [ "$((unread_epoch_normalized + unread_retain_seconds))" -lt "$unread_now" ]; then
+            continue
+        fi
         unread_include=0
         if [ -n "$unread_cursor" ]; then
             if [ "$unread_epoch" -gt "$unread_cursor_epoch" ] || \

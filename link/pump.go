@@ -22,29 +22,31 @@ type readWriter struct {
 }
 
 type pump struct {
-	home       string
-	role       string
-	self       string
-	peer       string
-	localMinor uint64
-	minor      uint64
-	maxObject  int64
-	scanEvery  time.Duration
-	logger     *log.Logger
-	reader     *bufio.Reader
-	writer     *frameWriter
-	brain      *brain
-	origins    *originSet
-	responses  chan frame
-	lastInput  atomic.Int64
-	activeOut  atomic.Bool
-	asyncErr   chan error
-	knownMu    sync.Mutex
-	known      map[string]string
-	rejected   map[string]string
+	home             string
+	role             string
+	self             string
+	peer             string
+	localMinor       uint64
+	minor            uint64
+	maxObject        int64
+	retainDays       uint64
+	scanEvery        time.Duration
+	logger           *log.Logger
+	reader           *bufio.Reader
+	writer           *frameWriter
+	brain            *brain
+	origins          *originSet
+	responses        chan frame
+	lastInput        atomic.Int64
+	activeOut        atomic.Bool
+	asyncErr         chan error
+	knownMu          sync.Mutex
+	known            map[string]string
+	rejected         map[string]string
+	expiredOfferLogs *logOnceSet
 }
 
-func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, maxObject int64, scanEvery time.Duration, logger *log.Logger) (hello, error) {
+func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, maxObject int64, retainDays uint64, scanEvery time.Duration, expiredOfferLogs *logOnceSet, logger *log.Logger) (hello, error) {
 	localMinor, err := advertisedMinor(role)
 	if err != nil {
 		return hello{}, err
@@ -52,10 +54,10 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	p := &pump{
 		home: home, role: role, self: self, peer: expectedPeer,
 		localMinor: localMinor,
-		maxObject:  maxObject, scanEvery: scanEvery, logger: logger,
+		maxObject:  maxObject, retainDays: retainDays, scanEvery: scanEvery, logger: logger,
 		reader: bufio.NewReader(rw.Reader), writer: newFrameWriter(rw.Writer),
 		origins: newOriginSet(), responses: make(chan frame, 8), asyncErr: make(chan error, 4),
-		known: make(map[string]string), rejected: make(map[string]string),
+		known: make(map[string]string), rejected: make(map[string]string), expiredOfferLogs: expiredOfferLogs,
 	}
 	remote, err := p.handshake()
 	if err != nil {
@@ -84,18 +86,25 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 		p.brain.run(sessionCtx)
 		close(brainDone)
 	}()
+	candidates := make(chan candidate, 256)
+	watcher := newTreeWatcher(home, role, self, p.peer, logger, p.brain, p.origins, candidates, scanEvery)
+	errs := make(chan error, 4)
+	watcherDone := make(chan struct{})
+	go func() {
+		errs <- watcher.run(sessionCtx)
+		close(watcherDone)
+	}()
 	defer func() {
 		cancel()
+		// A scan-gate reconcile can own brain.lock.d. Let the watcher finish it
+		// before this process exits, otherwise the child dies with a live lock.
+		<-watcherDone
 		select {
 		case <-brainDone:
 		case <-time.After(10 * time.Second):
 			logger.Printf("brain reconcile still running after link shutdown; leaving it alive to release brain.lock.d")
 		}
 	}()
-	candidates := make(chan candidate, 256)
-	watcher := newTreeWatcher(home, role, self, p.peer, logger, p.brain, p.origins, candidates, scanEvery)
-	errs := make(chan error, 4)
-	go func() { errs <- watcher.run(sessionCtx) }()
 	go func() { errs <- p.sendLoop(sessionCtx, candidates) }()
 	go func() { errs <- p.readLoop(sessionCtx) }()
 	go func() { errs <- p.keepalive(sessionCtx) }()
@@ -181,7 +190,7 @@ func (p *pump) readLoop(ctx context.Context) error {
 	if p.role == "dial" {
 		installPeer = p.self
 	}
-	ins := &installer{home: p.home, role: p.role, peer: installPeer, logger: p.logger}
+	ins := &installer{home: p.home, role: p.role, peer: installPeer, retainDays: p.retainDays, logger: p.logger}
 	var incoming *offer
 	var installing atomic.Bool
 	for {
@@ -224,6 +233,25 @@ func (p *pump) readLoop(ctx context.Context) error {
 					return err
 				}
 				continue
+			}
+			if o.Class == "stream" {
+				expired, err := streamExpiredAt(o.Basename, p.retainDays, 1, time.Now())
+				if err != nil {
+					text := fmt.Sprintf("invalid stream epoch %s: %v", o.Basename, err)
+					p.logger.Printf("%s", text)
+					if err := p.writer.write(errorFrame("INVALID_OFFER", true, text)); err != nil {
+						return err
+					}
+					continue
+				}
+				if expired {
+					text := fmt.Sprintf("expired stream skipped without install or quarantine: %s", o.Basename)
+					p.logger.Printf("%s", text)
+					if err := p.writer.write(errorFrame("STREAM_EXPIRED", true, text)); err != nil {
+						return err
+					}
+					continue
+				}
 			}
 			_, equal, inspectErr := ins.inspect(o)
 			if inspectErr == nil && equal {
@@ -333,6 +361,14 @@ func (p *pump) readLoop(ctx context.Context) error {
 // replies with STORED or ERROR, so the per-direction in-flight limit stays one.
 func (p *pump) installIncoming(ins *installer, o offer, data []byte, active *atomic.Bool) {
 	result, path, installErr := ins.receive(o, data)
+	if result == expiredSkipped && installErr == nil {
+		active.Store(false)
+		text := fmt.Sprintf("expired stream skipped without install or quarantine: %s", o.Basename)
+		if err := p.writer.write(errorFrame("STREAM_EXPIRED", true, text)); err != nil {
+			p.reportAsyncError(err)
+		}
+		return
+	}
 	if installErr != nil || result == quarantined {
 		text := fmt.Sprintf("%s/%s refused: %v", o.Node, o.Basename, installErr)
 		p.logger.Printf("%s", text)
@@ -381,6 +417,19 @@ func (p *pump) sendLoop(ctx context.Context, candidates <-chan candidate) error 
 func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	if c.class == "stream" && p.minor < streamMinor {
 		return nil
+	}
+	if c.class == "stream" {
+		expired, err := streamExpiredAt(c.basename, p.retainDays, 1, time.Now())
+		if err != nil {
+			p.logger.Printf("invalid stream epoch skipped: %s: %v", c.basename, err)
+			return nil
+		}
+		if expired {
+			if p.expiredOfferLogs == nil || p.expiredOfferLogs.first(c.key()) {
+				p.logger.Printf("expired stream offer skipped: %s", c.basename)
+			}
+			return nil
+		}
 	}
 	info, err := os.Lstat(c.path)
 	if os.IsNotExist(err) {

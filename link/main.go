@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-var implVersion = "0.3.0"
+var implVersion = "0.3.1"
 
 type options struct {
 	serve    bool
@@ -68,7 +68,7 @@ func run(args []string) int {
 			return fatalf("recover stale link tmp files: %v", err)
 		}
 		rw := readWriter{Reader: os.Stdin, Writer: os.Stdout}
-		_, err := runPump(ctx, rw, home, "serve", cfg.self, "", brainPath, opts.maxBytes, opts.scan, logger)
+		_, err := runPump(ctx, rw, home, "serve", cfg.self, "", brainPath, opts.maxBytes, cfg.retainDays, opts.scan, newLogOnceSet(), logger)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			logger.Printf("serve stopped: %v", err)
 			return fatalf("serve stopped: %v", err)
@@ -114,7 +114,7 @@ func run(args []string) int {
 	if err != nil {
 		return fatalf("%v", err)
 	}
-	if err := dialForever(ctx, home, cfg.self, brainPath, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
+	if err := dialForever(ctx, home, cfg.self, brainPath, cfg.retainDays, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
 		return fatalf("dial stopped: %v", err)
 	}
 	return 0
@@ -241,14 +241,15 @@ func terminatePrior(home string, logger *log.Logger) error {
 	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
-func dialForever(ctx context.Context, home, self, brainPath string, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
+func dialForever(ctx context.Context, home, self, brainPath string, retainDays uint64, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
 	attempt := 0
 	index := 0
+	expiredOfferLogs := newLogOnceSet()
 	for {
 		endpoint := endpoints[index%len(endpoints)]
 		index++
 		started := time.Now()
-		err := runCarrier(ctx, home, self, brainPath, opts, endpoint, logger)
+		err := runCarrier(ctx, home, self, brainPath, retainDays, opts, endpoint, expiredOfferLogs, logger)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -271,7 +272,7 @@ func dialForever(ctx context.Context, home, self, brainPath string, opts options
 	}
 }
 
-func runCarrier(ctx context.Context, home, self, brainPath string, opts options, endpoint dialEndpoint, logger *log.Logger) error {
+func runCarrier(ctx context.Context, home, self, brainPath string, retainDays uint64, opts options, endpoint dialEndpoint, expiredOfferLogs *logOnceSet, logger *log.Logger) error {
 	cmd, err := carrierCommand(brainPath, opts, endpoint)
 	if err != nil {
 		return err
@@ -295,7 +296,7 @@ func runCarrier(ctx context.Context, home, self, brainPath string, opts options,
 	stderrDone := make(chan struct{})
 	go func() { logStderr(logger, stderr); close(stderrDone) }()
 	rw := readWriter{Reader: stdout, Writer: stdin}
-	_, pumpErr := runPump(ctx, rw, home, "dial", self, endpoint.node, brainPath, opts.maxBytes, opts.scan, logger)
+	_, pumpErr := runPump(ctx, rw, home, "dial", self, endpoint.node, brainPath, opts.maxBytes, retainDays, opts.scan, expiredOfferLogs, logger)
 	// Carrier cleanup is deliberately process-group scoped. It never signals a
 	// user session; only the child carrier started immediately above.
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
