@@ -26,7 +26,8 @@ const (
 const (
 	protocolMagic  = "KHALA1"
 	protocolMajor  = uint64(1)
-	protocolMinor  = uint64(0)
+	protocolMinor  = uint64(1)
+	streamMinor    = uint64(1)
 	maxControlSize = 64 << 10
 )
 
@@ -192,6 +193,7 @@ func decodeHello(f frame) (hello, error) {
 type offer struct {
 	ID       string
 	Class    string
+	Stream   string
 	Node     string
 	Basename string
 	Size     uint64
@@ -202,6 +204,9 @@ func offerFrame(o offer) frame {
 	var e encoder
 	e.str(o.ID)
 	e.str(o.Class)
+	if o.Class == "stream" {
+		e.str(o.Stream)
+	}
 	e.str(o.Node)
 	e.str(o.Basename)
 	e.u64(o.Size)
@@ -219,6 +224,11 @@ func decodeOffer(f frame) (offer, error) {
 	}
 	if o.Class, err = d.str(); err != nil {
 		return o, err
+	}
+	if o.Class == "stream" {
+		if o.Stream, err = d.str(); err != nil {
+			return o, err
+		}
 	}
 	if o.Node, err = d.str(); err != nil {
 		return o, err
@@ -240,7 +250,7 @@ func decodeOffer(f frame) (offer, error) {
 	if err := d.done(); err != nil {
 		return o, err
 	}
-	if o.ID != transferID(o.Class, o.Node, o.Basename, o.Digest) {
+	if o.ID != transferID(o.Class, o.Stream, o.Node, o.Basename, o.Digest) {
 		return o, errors.New("OFFER transfer id does not match its object identity")
 	}
 	return o, nil
@@ -331,10 +341,18 @@ func decodeError(f frame) (protocolError, error) {
 	return p, d.done()
 }
 
-func transferID(class, node, basename string, digest [sha256.Size]byte) string {
+func transferID(class, stream, node, basename string, digest [sha256.Size]byte) string {
 	h := sha256.New()
 	_, _ = io.WriteString(h, class)
 	_, _ = io.WriteString(h, "\x00")
+	// Stream is part of a stream object's path identity, so binding it here
+	// prevents the same node/basename/digest in two streams from sharing a
+	// transfer ID. Omitting this field for every legacy class preserves the
+	// protocol 1.0 transfer-ID bytes exactly for spool and presence.
+	if class == "stream" {
+		_, _ = io.WriteString(h, stream)
+		_, _ = io.WriteString(h, "\x00")
+	}
 	_, _ = io.WriteString(h, node)
 	_, _ = io.WriteString(h, "\x00")
 	_, _ = io.WriteString(h, basename)

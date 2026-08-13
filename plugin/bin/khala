@@ -22,6 +22,10 @@ TMP_DIR=$KHALA_ROOT/tmp
 SYNC_FAILED=0
 EPOCH_DATE_STYLE=
 TTL_LINK=12
+KHALA_VERSION=0.3.0
+TAB=$(printf '\t')
+LC_ALL=C
+export LC_ALL
 
 error() {
     printf 'khala: %s\n' "$*" >&2
@@ -30,8 +34,15 @@ error() {
 usage() {
     cat >&2 <<'EOF'
 usage:
+  khala version
   khala init <node>
   khala send <session@node> [-s subject] [-e seconds] [-m message] [--as session]
+  khala say [stream] [-s subject] [-r ref-id] [-m message]
+  khala join <stream> [--from-start] [--quiet]
+  khala leave <stream>
+  khala streams
+  khala stream cat <stream> [-n N]
+  khala retire <session>
   khala reconcile
   khala sync
   khala link [restart] [--max-object-bytes bytes]
@@ -58,6 +69,11 @@ valid_address() {
     printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$'
 }
 
+valid_message_id() {
+    printf '%s\n' "$1" | grep -q \
+        '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$'
+}
+
 positive_or_zero_integer() {
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
@@ -76,6 +92,18 @@ normalize_integer() {
         normalized=0
     fi
     printf '%s\n' "$normalized"
+}
+
+retain_days() {
+    retained=$(sed -n 's/^retain //p' "$CONFIG")
+    if [ -z "$retained" ]; then
+        retained=30
+    fi
+    if ! positive_or_zero_integer "$retained"; then
+        error "config의 retain이 0 이상의 정수가 아닙니다"
+        return 1
+    fi
+    normalize_integer "$retained"
 }
 
 file_mtime() {
@@ -109,6 +137,14 @@ session_name() {
         session=$explicit
     elif [ "${KHALA_SESSION+x}" = x ]; then
         session=$KHALA_SESSION
+    elif [ -n "${PWD-}" ] && [ -f "$PWD/.khala-session" ] && \
+        session_file=$(sed -n '1p' "$PWD/.khala-session") && \
+        [ "$(wc -l < "$PWD/.khala-session" | tr -d ' ')" -le 1 ] && \
+        valid_name "$session_file"; then
+        # The checkout's declared identity: the same one-line .khala-session
+        # the hooks read. Without this step a bare CLI send in a hook-managed
+        # checkout silently completes under the directory basename instead.
+        session=$session_file
     else
         if [ -z "${PWD-}" ]; then
             error "발신 세션 이름을 정할 수 없습니다; --as를 지정하세요"
@@ -148,6 +184,26 @@ atomic_copy() {
     rm -f "$copy_tmp"
     error "$destination_file: 원자 no-clobber 설치에 실패했습니다"
     return 1
+}
+
+atomic_line() {
+    line_destination=$1
+    line_value=$2
+    line_kind=$3
+    line_parent=$(dirname "$line_destination") || return 1
+    if ! mkdir -p "$line_parent"; then
+        return 1
+    fi
+    line_tmp=$(mktemp "$TMP_DIR/$line_kind.XXXXXX") || return 1
+    if ! printf '%s\n' "$line_value" > "$line_tmp"; then
+        rm -f "$line_tmp"
+        return 1
+    fi
+    if ! mv "$line_tmp" "$line_destination"; then
+        rm -f "$line_tmp"
+        return 1
+    fi
+    return 0
 }
 
 detect_epoch_date_style() {
@@ -373,6 +429,170 @@ new_message_id() {
     printf '%s.%s.%s.%s\n' "$id_now" "$$" "$RANDOM" "$id_from"
 }
 
+validate_stream_file() {
+    stream_file=$1
+    stream_expected=$2
+    stream_node_expected=$3
+    stream_id=$(header_value Id "$stream_file")
+    stream_from=$(header_value From "$stream_file")
+    stream_name=$(header_value Stream "$stream_file")
+    stream_date=$(header_value Date "$stream_file")
+    stream_type=$(header_value Type "$stream_file")
+    stream_refs=$(header_value Refs "$stream_file")
+    if ! valid_message_id "$stream_id" || [ "$(basename "$stream_file")" != "$stream_id" ]; then
+        return 1
+    fi
+    if ! valid_address "$stream_from" || [ "${stream_from#*@}" != "$stream_node_expected" ]; then
+        return 1
+    fi
+    stream_id_address=${stream_id#*.*.*.}
+    if [ "$stream_id_address" != "$stream_from" ]; then
+        return 1
+    fi
+    if [ "$stream_name" != "$stream_expected" ] || [ -z "$stream_date" ] || \
+        [ "$stream_type" != entry ]; then
+        return 1
+    fi
+    if [ "$(header_value Khala "$stream_file")" != 0.1 ] || \
+        grep -q '^Expires:' "$stream_file"; then
+        return 1
+    fi
+    if [ -n "$stream_refs" ] && ! valid_message_id "$stream_refs"; then
+        return 1
+    fi
+    return 0
+}
+
+quarantine_stream_file() {
+    quarantine_file=$1
+    quarantine_stream=$2
+    quarantine_node=$3
+    quarantine_id=$4
+    quarantine_reason=$5
+    quarantine_dir=$KHALA_ROOT/spool/dead
+    if ! mkdir -p "$quarantine_dir"; then
+        error "$quarantine_file: stream quarantine 디렉터리를 만들지 못했습니다"
+        return 1
+    fi
+    # AMBIGUOUS: D13 requires reuse of the existing quarantine machinery but
+    # does not name an encoding for stream/node provenance in spool/dead.
+    quarantine_destination=$quarantine_dir/stream.$quarantine_stream.$quarantine_node.$quarantine_id
+    if [ -e "$quarantine_destination" ] && ! cmp -s "$quarantine_file" "$quarantine_destination"; then
+        quarantine_destination=$quarantine_destination.$$.conflict
+    fi
+    if [ -e "$quarantine_destination" ]; then
+        if ! rm -f "$quarantine_file"; then
+            error "$quarantine_file: 중복 quarantine 원본을 지우지 못했습니다"
+            return 1
+        fi
+    elif ! mv "$quarantine_file" "$quarantine_destination"; then
+        error "$quarantine_file: stream 항목을 quarantine으로 옮기지 못했습니다"
+        return 1
+    fi
+    error "$quarantine_id: $quarantine_reason — spool/dead로 격리했습니다"
+    return 0
+}
+
+collect_stream_entries() {
+    collect_stream=$1
+    collect_output=$2
+    collect_unsorted=$(mktemp "$TMP_DIR/stream-list.XXXXXX") || return 1
+    : > "$collect_unsorted" || {
+        rm -f "$collect_unsorted"
+        return 1
+    }
+    for collect_file in "$KHALA_ROOT/streams/$collect_stream"/*/*; do
+        [ -f "$collect_file" ] || continue
+        collect_id=$(basename "$collect_file")
+        collect_epoch=${collect_id%%.*}
+        if ! positive_or_zero_integer "$collect_epoch"; then
+            continue
+        fi
+        printf '%s\t%s\t%s\n' "$collect_epoch" "$collect_id" "$collect_file" >> "$collect_unsorted" || {
+            rm -f "$collect_unsorted"
+            return 1
+        }
+    done
+    if ! sort -k1,1n -k2,2 "$collect_unsorted" > "$collect_output"; then
+        rm -f "$collect_unsorted"
+        return 1
+    fi
+    rm -f "$collect_unsorted"
+    return 0
+}
+
+latest_stream_id() {
+    latest_stream=$1
+    latest_list=$(mktemp "$TMP_DIR/stream-latest.XXXXXX") || return 1
+    if ! collect_stream_entries "$latest_stream" "$latest_list"; then
+        rm -f "$latest_list"
+        return 1
+    fi
+    latest_id=$(tail -n 1 "$latest_list" | cut -f 2)
+    rm -f "$latest_list"
+    printf '%s\n' "$latest_id"
+}
+
+build_unread_stream_entries() {
+    unread_session=$1
+    unread_stream=$2
+    unread_output=$3
+    unread_state_file=$KHALA_ROOT/join/$unread_session/$unread_stream
+    [ -f "$unread_state_file" ] || {
+        : > "$unread_output"
+        return 0
+    }
+    IFS=' ' read -r unread_state unread_join_epoch unread_extra < "$unread_state_file"
+    case "$unread_state" in
+        joined|quiet) ;;
+        *) : > "$unread_output"; return 0 ;;
+    esac
+    if ! positive_or_zero_integer "$unread_join_epoch" || [ -n "${unread_extra-}" ]; then
+        error "$unread_state_file: 잘못된 join 상태"
+        return 1
+    fi
+    unread_cursor_file=$KHALA_ROOT/cursor/$unread_session/$unread_stream
+    unread_cursor=
+    unread_cursor_epoch=
+    if [ -f "$unread_cursor_file" ]; then
+        unread_cursor=$(sed -n '1p' "$unread_cursor_file")
+        if ! valid_message_id "$unread_cursor"; then
+            error "$unread_cursor_file: 잘못된 stream cursor"
+            return 1
+        fi
+        unread_cursor_epoch=${unread_cursor%%.*}
+    fi
+    unread_all=$(mktemp "$TMP_DIR/stream-unread-all.XXXXXX") || return 1
+    if ! collect_stream_entries "$unread_stream" "$unread_all"; then
+        rm -f "$unread_all"
+        return 1
+    fi
+    : > "$unread_output" || {
+        rm -f "$unread_all"
+        return 1
+    }
+    while IFS="$TAB" read -r unread_epoch unread_id unread_path; do
+        [ -n "${unread_epoch-}" ] || continue
+        unread_include=0
+        if [ -n "$unread_cursor" ]; then
+            if [ "$unread_epoch" -gt "$unread_cursor_epoch" ] || \
+                { [ "$unread_epoch" -eq "$unread_cursor_epoch" ] && [ "$unread_id" \> "$unread_cursor" ]; }; then
+                unread_include=1
+            fi
+        elif [ "$unread_epoch" -ge "$unread_join_epoch" ]; then
+            unread_include=1
+        fi
+        if [ "$unread_include" -eq 1 ]; then
+            printf '%s\t%s\t%s\n' "$unread_epoch" "$unread_id" "$unread_path" >> "$unread_output" || {
+                rm -f "$unread_all"
+                return 1
+            }
+        fi
+    done < "$unread_all"
+    rm -f "$unread_all"
+    return 0
+}
+
 infrastructure_message_id() {
     infra_id_type=$1
     infra_id_ref=$2
@@ -511,6 +731,8 @@ mailbox_rsync() {
     rsync_local_path=$3
     rsync_mailbox_path=$4
     rsync_remove_source=$5
+    rsync_ignore_existing=${6-0}
+    rsync_ensure_destination=${7-0}
 
     case "$rsync_endpoint" in
         /*)
@@ -530,6 +752,13 @@ mailbox_rsync() {
         rsync_destination=$rsync_mailbox_root/$rsync_mailbox_path
         if [ "$rsync_remote" -eq 1 ]; then
             rsync_destination=$rsync_endpoint:$rsync_destination
+            if [ "$rsync_ensure_destination" -eq 1 ] && \
+                ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$rsync_endpoint" \
+                "test -d $rsync_mailbox_root && mkdir -p $rsync_mailbox_root/$rsync_mailbox_path"; then
+                return 1
+            fi
+        elif [ "$rsync_ensure_destination" -eq 1 ] && ! mkdir -p "$rsync_destination"; then
+            return 1
         fi
     else
         rsync_source=$rsync_mailbox_root/$rsync_mailbox_path
@@ -554,10 +783,86 @@ mailbox_rsync() {
     if [ "$rsync_remove_source" -eq 1 ]; then
         set -- "$@" --remove-source-files
     fi
+    if [ "$rsync_ignore_existing" -eq 1 ]; then
+        set -- "$@" --ignore-existing
+    fi
     if [ "$rsync_remote" -eq 1 ]; then
         set -- "$@" -e "ssh -o ConnectTimeout=5 -o BatchMode=yes"
     fi
     rsync "$@" "$rsync_source" "$rsync_destination"
+}
+
+install_pulled_streams() {
+    install_root=$1
+    install_now=$(date +%s) || return 1
+    for install_file in "$install_root"/*/*/*; do
+        [ -f "$install_file" ] || continue
+        install_node=$(basename "$(dirname "$install_file")")
+        install_stream=$(basename "$(dirname "$(dirname "$install_file")")")
+        install_id=$(basename "$install_file")
+        if ! valid_name "$install_stream" || ! valid_name "$install_node" || \
+            ! validate_stream_file "$install_file" "$install_stream" "$install_node"; then
+            quarantine_stream_file "$install_file" "$install_stream" "$install_node" \
+                "$install_id" "잘못된 pull stream 항목" || return 1
+            continue
+        fi
+        install_epoch=$(normalize_integer "${install_id%%.*}")
+        if [ "$install_epoch" -gt "$((install_now + 86400))" ]; then
+            quarantine_stream_file "$install_file" "$install_stream" "$install_node" \
+                "$install_id" "하루를 넘는 미래 epoch" || return 1
+            continue
+        fi
+        install_destination_dir=$KHALA_ROOT/streams/$install_stream/$install_node
+        install_destination=$install_destination_dir/$install_id
+        if ! mkdir -p "$install_destination_dir"; then
+            return 1
+        fi
+        if [ -f "$install_destination" ]; then
+            if ! cmp -s "$install_file" "$install_destination"; then
+                quarantine_stream_file "$install_file" "$install_stream" "$install_node" \
+                    "$install_id" "같은 Id의 digest 불일치" || return 1
+            fi
+            continue
+        fi
+        if ! atomic_copy "$install_file" "$install_destination"; then
+            return 1
+        fi
+        if ! cmp -s "$install_file" "$install_destination"; then
+            quarantine_stream_file "$install_file" "$install_stream" "$install_node" \
+                "$install_id" "설치 경주 중 같은 Id의 digest 불일치" || return 1
+        fi
+    done
+    return 0
+}
+
+pull_streams_from_endpoint() {
+    stream_endpoint=$1
+    stream_stage=$(mktemp -d "$TMP_DIR/streams-pull.XXXXXX") || return 1
+    if ! mailbox_rsync "$stream_endpoint" pull "$stream_stage/" streams/ 0; then
+        rm -rf -- "$stream_stage"
+        return 1
+    fi
+    if ! install_pulled_streams "$stream_stage"; then
+        rm -rf -- "$stream_stage"
+        return 1
+    fi
+    rm -rf -- "$stream_stage"
+    return 0
+}
+
+push_owned_streams() {
+    stream_endpoint=$1
+    stream_self=$2
+    for stream_shard in "$KHALA_ROOT"/streams/*/"$stream_self"; do
+        [ -d "$stream_shard" ] || continue
+        stream_name=$(basename "$(dirname "$stream_shard")")
+        spool_has_files "$stream_shard" || continue
+        if ! mailbox_rsync "$stream_endpoint" push "$stream_shard/" \
+            "streams/$stream_name/$stream_self/" 0 1 1; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 spool_has_files() {
@@ -614,6 +919,13 @@ exchange_with_endpoint() {
     if ! mailbox_rsync "$exchange_endpoint" pull \
         "$KHALA_ROOT/spool/for/$exchange_self/" \
         "spool/for/$exchange_self/" 1; then
+        return 1
+    fi
+
+    if ! pull_streams_from_endpoint "$exchange_endpoint"; then
+        return 1
+    fi
+    if ! push_owned_streams "$exchange_endpoint" "$exchange_self"; then
         return 1
     fi
 
@@ -976,6 +1288,114 @@ prune_delivered_log() {
     fi
 }
 
+prune_stream_entries() {
+    prune_stream_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    prune_stream_days=$(retain_days) || {
+        sync_error "stream retention 설정을 읽지 못했습니다"
+        return
+    }
+    prune_stream_seconds=$((prune_stream_days * 86400))
+    for prune_stream_file in "$KHALA_ROOT"/streams/*/*/*; do
+        [ -f "$prune_stream_file" ] || continue
+        prune_stream_node=$(basename "$(dirname "$prune_stream_file")")
+        prune_stream_name=$(basename "$(dirname "$(dirname "$prune_stream_file")")")
+        prune_stream_id=$(basename "$prune_stream_file")
+        if ! valid_name "$prune_stream_name" || ! valid_name "$prune_stream_node" || \
+            ! validate_stream_file "$prune_stream_file" "$prune_stream_name" "$prune_stream_node"; then
+            quarantine_stream_file "$prune_stream_file" "$prune_stream_name" \
+                "$prune_stream_node" "$prune_stream_id" "잘못된 stream 항목" || \
+                sync_error "$prune_stream_file: 잘못된 stream 항목 격리에 실패했습니다"
+            continue
+        fi
+        prune_stream_epoch=$(normalize_integer "${prune_stream_id%%.*}")
+        if [ "$prune_stream_epoch" -gt "$((prune_stream_now + 86400))" ]; then
+            quarantine_stream_file "$prune_stream_file" "$prune_stream_name" \
+                "$prune_stream_node" "$prune_stream_id" "하루를 넘는 미래 epoch" || \
+                sync_error "$prune_stream_file: 미래 stream 항목 격리에 실패했습니다"
+            continue
+        fi
+        if [ "$((prune_stream_epoch + prune_stream_seconds))" -lt "$prune_stream_now" ]; then
+            if ! rm -f "$prune_stream_file"; then
+                sync_error "$prune_stream_file: retention 지난 stream 항목을 지우지 못했습니다"
+            fi
+        fi
+    done
+}
+
+presence_record_epoch() {
+    presence_record_file=$1
+    IFS=' ' read -r presence_record_first presence_record_second presence_record_extra \
+        < "$presence_record_file"
+    if [ "$presence_record_first" = retired ]; then
+        presence_record_value=$presence_record_second
+        [ -z "${presence_record_extra-}" ] || return 1
+    else
+        presence_record_value=$presence_record_first
+        [ -z "${presence_record_second-}" ] && [ -z "${presence_record_extra-}" ] || return 1
+    fi
+    positive_or_zero_integer "$presence_record_value" || return 1
+    normalize_integer "$presence_record_value"
+}
+
+prune_presence() {
+    prune_presence_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    prune_presence_days=$(retain_days) || {
+        sync_error "presence retention 설정을 읽지 못했습니다"
+        return
+    }
+    prune_presence_seconds=$((prune_presence_days * 86400))
+    for prune_presence_file in "$KHALA_ROOT"/presence/*; do
+        [ -f "$prune_presence_file" ] || continue
+        case "$prune_presence_file" in
+            *.watching) continue ;;
+        esac
+        if ! prune_presence_epoch=$(presence_record_epoch "$prune_presence_file"); then
+            sync_error "$prune_presence_file: 잘못된 heartbeat"
+            continue
+        fi
+        if [ "$((prune_presence_epoch + prune_presence_seconds))" -lt "$prune_presence_now" ]; then
+            if ! rm -f "$prune_presence_file"; then
+                sync_error "$prune_presence_file: retention 지난 heartbeat를 지우지 못했습니다"
+            fi
+        fi
+    done
+}
+
+prune_session_stream_state() {
+    state_self=$1
+    for state_family in join cursor; do
+        for state_session_dir in "$KHALA_ROOT/$state_family"/*; do
+            [ -d "$state_session_dir" ] || continue
+            state_session=$(basename "$state_session_dir")
+            state_presence=$KHALA_ROOT/presence/$state_session@$state_self
+            state_collect=0
+            if [ ! -f "$state_presence" ]; then
+                state_collect=1
+            else
+                IFS=' ' read -r state_presence_kind state_presence_epoch state_presence_extra \
+                    < "$state_presence"
+                if [ "$state_presence_kind" = retired ]; then
+                    state_collect=1
+                fi
+            fi
+            [ "$state_collect" -eq 1 ] || continue
+            for state_file in "$state_session_dir"/*; do
+                [ -f "$state_file" ] || continue
+                if ! rm -f "$state_file"; then
+                    sync_error "$state_file: 죽은 세션의 stream 상태를 지우지 못했습니다"
+                fi
+            done
+            rmdir "$state_session_dir" 2>/dev/null || :
+        done
+    done
+}
+
 reconcile_cycle() {
     reconcile_lock=$KHALA_ROOT/run/brain.lock.d
     if ! acquire_lock "$reconcile_lock" 300 reconcile; then
@@ -996,6 +1416,9 @@ reconcile_cycle() {
         fi
         expire_outbox "$reconcile_self"
         prune_delivered_log
+        prune_stream_entries
+        prune_presence
+        prune_session_stream_state "$reconcile_self"
     fi
     if ! release_lock "$reconcile_lock"; then
         sync_error "brain lock을 해제하지 못했습니다"
@@ -1073,6 +1496,9 @@ cmd_init() {
         "$KHALA_ROOT/spool/for/$init_node" \
         "$KHALA_ROOT/inbox" \
         "$KHALA_ROOT/presence" \
+        "$KHALA_ROOT/streams" \
+        "$KHALA_ROOT/join" \
+        "$KHALA_ROOT/cursor" \
         "$KHALA_ROOT/log" \
         "$KHALA_ROOT/run" \
         "$KHALA_ROOT/tmp"; then
@@ -1093,6 +1519,7 @@ cmd_init() {
         printf 'peer %s %s\n' "$init_node" "$init_node"
         printf 'mailbox %s\n' "$init_node"
         printf 'ttl 120\n'
+        printf 'retain 30\n'
     } > "$init_config"; then
         rm -f "$init_config"
         error "config를 쓰지 못했습니다"
@@ -1229,6 +1656,349 @@ cmd_send() {
     return 0
 }
 
+cmd_say() {
+    require_config || return 1
+    say_stream=khala
+    if [ "$#" -gt 0 ]; then
+        case "$1" in
+            -*) ;;
+            *) say_stream=$1; shift ;;
+        esac
+    fi
+    if ! valid_name "$say_stream"; then
+        error "잘못된 stream 이름: $say_stream"
+        return 1
+    fi
+    say_subject=
+    say_ref=
+    say_body=
+    say_body_set=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -s)
+                [ "$#" -ge 2 ] || { error "-s 값이 없습니다"; return 1; }
+                say_subject=$2
+                shift 2
+                ;;
+            -r)
+                [ "$#" -ge 2 ] || { error "-r 값이 없습니다"; return 1; }
+                say_ref=$2
+                shift 2
+                ;;
+            -m)
+                [ "$#" -ge 2 ] || { error "-m 값이 없습니다"; return 1; }
+                say_body=$2
+                say_body_set=1
+                shift 2
+                ;;
+            *) error "알 수 없는 say 옵션: $1"; return 1 ;;
+        esac
+    done
+    case "$say_subject" in
+        *'
+'*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
+    esac
+    if [ -n "$say_ref" ] && ! valid_message_id "$say_ref"; then
+        error "잘못된 ref Id: $say_ref"
+        return 1
+    fi
+    say_node=$(self_node) || return 1
+    say_session=$(session_name "" 0) || return 1
+    say_from=$say_session@$say_node
+    say_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    say_id=$(new_message_id "$say_from") || return 1
+    say_tmp=$(mktemp "$TMP_DIR/stream-entry.XXXXXX") || return 1
+    if ! {
+        printf 'Khala: 0.1\n'
+        printf 'Id: %s\n' "$say_id"
+        printf 'From: %s\n' "$say_from"
+        printf 'Stream: %s\n' "$say_stream"
+        printf 'Date: %s\n' "$say_date"
+        printf 'Type: entry\n'
+        if [ -n "$say_ref" ]; then
+            printf 'Refs: %s\n' "$say_ref"
+        fi
+        if [ -n "$say_subject" ]; then
+            printf 'Subject: %s\n' "$say_subject"
+        fi
+        printf '\n'
+        if [ "$say_body_set" -eq 1 ]; then
+            printf '%s\n' "$say_body"
+        else
+            cat
+        fi
+    } > "$say_tmp"; then
+        rm -f "$say_tmp"
+        error "stream 항목을 쓰지 못했습니다"
+        return 1
+    fi
+    say_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$say_lock" 300 say; then
+        rm -f "$say_tmp"
+        error "say용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    say_status=0
+    say_shard=$KHALA_ROOT/streams/$say_stream/$say_node
+    if ! heartbeat "$say_session"; then
+        error "heartbeat를 갱신하지 못했습니다"
+        say_status=1
+    elif ! mkdir -p "$say_shard"; then
+        error "$say_shard: stream shard를 만들지 못했습니다"
+        say_status=1
+    elif [ -e "$say_shard/$say_id" ]; then
+        error "$say_id: 이미 존재하는 Id라 stream 항목을 덮어쓰지 않습니다"
+        say_status=1
+    elif ! mv "$say_tmp" "$say_shard/$say_id"; then
+        error "$say_id: 자기 stream shard에 원자 안착시키지 못했습니다"
+        say_status=1
+    fi
+    rm -f "$say_tmp"
+    if ! release_lock "$say_lock"; then
+        error "say용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    [ "$say_status" -eq 0 ] || return 1
+    printf '%s\n' "$say_id"
+    return 0
+}
+
+cmd_join() {
+    require_config || return 1
+    [ "$#" -ge 1 ] || { usage; return 1; }
+    join_stream=$1
+    shift
+    if ! valid_name "$join_stream"; then
+        error "잘못된 stream 이름: $join_stream"
+        return 1
+    fi
+    join_from_start=0
+    join_state=joined
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --from-start) join_from_start=1 ;;
+            --quiet) join_state=quiet ;;
+            *) error "알 수 없는 join 옵션: $1"; return 1 ;;
+        esac
+        shift
+    done
+    join_session=$(session_name "" 0) || return 1
+    join_now=$(date +%s) || return 1
+    join_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$join_lock" 300 join; then
+        error "join용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    join_status=0
+    join_cursor=$KHALA_ROOT/cursor/$join_session/$join_stream
+    if [ "$join_from_start" -eq 1 ]; then
+        # AMBIGUOUS: D13 gives join files one epoch and no separate from-start
+        # marker. Epoch zero is the literal start boundary without inventing a
+        # second on-disk fact.
+        join_boundary=0
+        if ! rm -f "$join_cursor"; then
+            join_status=1
+        fi
+    else
+        join_boundary=$join_now
+        if ! join_latest=$(latest_stream_id "$join_stream"); then
+            join_status=1
+        elif [ -n "$join_latest" ]; then
+            if ! atomic_line "$join_cursor" "$join_latest" cursor; then
+                join_status=1
+            fi
+        elif ! rm -f "$join_cursor"; then
+            join_status=1
+        fi
+    fi
+    if [ "$join_status" -eq 0 ] && ! atomic_line \
+        "$KHALA_ROOT/join/$join_session/$join_stream" "$join_state $join_boundary" join; then
+        join_status=1
+    fi
+    if ! release_lock "$join_lock"; then
+        error "join용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    if [ "$join_status" -ne 0 ]; then
+        error "$join_stream: join 상태를 원자적으로 기록하지 못했습니다"
+        return 1
+    fi
+    printf '%s %s\n' "$join_state" "$join_stream"
+    return 0
+}
+
+cmd_leave() {
+    require_config || return 1
+    [ "$#" -eq 1 ] || { usage; return 1; }
+    leave_stream=$1
+    if ! valid_name "$leave_stream"; then
+        error "잘못된 stream 이름: $leave_stream"
+        return 1
+    fi
+    leave_session=$(session_name "" 0) || return 1
+    leave_now=$(date +%s) || return 1
+    leave_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$leave_lock" 300 leave; then
+        error "leave용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    leave_status=0
+    atomic_line "$KHALA_ROOT/join/$leave_session/$leave_stream" "left $leave_now" join || \
+        leave_status=1
+    if ! release_lock "$leave_lock"; then
+        error "leave용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    if [ "$leave_status" -ne 0 ]; then
+        error "$leave_stream: leave 상태를 원자적으로 기록하지 못했습니다"
+        return 1
+    fi
+    printf 'left %s\n' "$leave_stream"
+    return 0
+}
+
+cmd_retire() {
+    require_config || return 1
+    [ "$#" -eq 1 ] || { usage; return 1; }
+    retire_wanted=$1
+    retire_self=$(self_node) || return 1
+    case "$retire_wanted" in
+        *@*)
+            if ! valid_address "$retire_wanted"; then
+                error "잘못된 세션 명의: $retire_wanted"
+                return 1
+            fi
+            retire_session=${retire_wanted%@*}
+            retire_node=${retire_wanted#*@}
+            if [ "$retire_node" != "$retire_self" ]; then
+                error "타 노드 명의는 retire할 수 없습니다: $retire_wanted"
+                return 1
+            fi
+            ;;
+        *)
+            retire_session=$retire_wanted
+            if ! valid_name "$retire_session"; then
+                error "잘못된 세션 이름: $retire_session"
+                return 1
+            fi
+            ;;
+    esac
+    retire_now=$(date +%s) || return 1
+    retire_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$retire_lock" 300 retire; then
+        error "retire용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    retire_status=0
+    atomic_line "$KHALA_ROOT/presence/$retire_session@$retire_self" \
+        "retired $retire_now" heartbeat || retire_status=1
+    if ! release_lock "$retire_lock"; then
+        error "retire용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    if [ "$retire_status" -ne 0 ]; then
+        error "$retire_session@$retire_self: retire 상태를 기록하지 못했습니다"
+        return 1
+    fi
+    printf 'retired %s@%s\n' "$retire_session" "$retire_self"
+    return 0
+}
+
+cmd_streams() {
+    require_config || return 1
+    [ "$#" -eq 0 ] || { usage; return 1; }
+    streams_session=$(session_name "" 0) || return 1
+    streams_names=$(mktemp "$TMP_DIR/streams-names.XXXXXX") || return 1
+    streams_sorted=$(mktemp "$TMP_DIR/streams-sorted.XXXXXX") || {
+        rm -f "$streams_names"
+        return 1
+    }
+    : > "$streams_names"
+    for streams_dir in "$KHALA_ROOT"/streams/*; do
+        [ -d "$streams_dir" ] || continue
+        basename "$streams_dir" >> "$streams_names"
+    done
+    for streams_state_file in "$KHALA_ROOT/join/$streams_session"/*; do
+        [ -f "$streams_state_file" ] || continue
+        basename "$streams_state_file" >> "$streams_names"
+    done
+    sort -u "$streams_names" > "$streams_sorted"
+    printf 'STREAM\tJOINED\tENTRIES\tLATEST\n'
+    while IFS= read -r streams_name; do
+        [ -n "$streams_name" ] || continue
+        streams_state=-
+        if [ -f "$KHALA_ROOT/join/$streams_session/$streams_name" ]; then
+            streams_state=$(sed -n '1s/ .*//p' "$KHALA_ROOT/join/$streams_session/$streams_name")
+        fi
+        streams_list=$(mktemp "$TMP_DIR/streams-row.XXXXXX") || {
+            rm -f "$streams_names" "$streams_sorted"
+            return 1
+        }
+        if ! collect_stream_entries "$streams_name" "$streams_list"; then
+            rm -f "$streams_names" "$streams_sorted" "$streams_list"
+            return 1
+        fi
+        streams_count=$(wc -l < "$streams_list" | tr -d ' ')
+        streams_latest=$(tail -n 1 "$streams_list" | cut -f 2)
+        [ -n "$streams_latest" ] || streams_latest=-
+        printf '%s\t%s\t%s\t%s\n' "$streams_name" "$streams_state" \
+            "$streams_count" "$streams_latest"
+        rm -f "$streams_list"
+    done < "$streams_sorted"
+    rm -f "$streams_names" "$streams_sorted"
+    return 0
+}
+
+cmd_stream() {
+    require_config || return 1
+    [ "$#" -ge 2 ] || { usage; return 1; }
+    [ "$1" = cat ] || { error "알 수 없는 stream 하위 명령: $1"; return 1; }
+    shift
+    cat_stream=$1
+    shift
+    if ! valid_name "$cat_stream"; then
+        error "잘못된 stream 이름: $cat_stream"
+        return 1
+    fi
+    cat_n=20
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -n)
+                [ "$#" -ge 2 ] || { error "-n 값이 없습니다"; return 1; }
+                cat_n=$2
+                shift 2
+                ;;
+            *) error "알 수 없는 stream cat 옵션: $1"; return 1 ;;
+        esac
+    done
+    if ! positive_or_zero_integer "$cat_n"; then
+        error "stream cat 개수는 0 이상의 정수여야 합니다"
+        return 1
+    fi
+    cat_n=$(normalize_integer "$cat_n")
+    cat_list=$(mktemp "$TMP_DIR/stream-cat.XXXXXX") || return 1
+    cat_selected=$(mktemp "$TMP_DIR/stream-cat-selected.XXXXXX") || {
+        rm -f "$cat_list"
+        return 1
+    }
+    if ! collect_stream_entries "$cat_stream" "$cat_list" || \
+        ! tail -n "$cat_n" "$cat_list" > "$cat_selected"; then
+        rm -f "$cat_list" "$cat_selected"
+        return 1
+    fi
+    while IFS="$TAB" read -r cat_epoch cat_id cat_path; do
+        [ -n "${cat_epoch-}" ] || continue
+        printf '%s\n' "--- stream $cat_stream $cat_id ---"
+        if ! cat "$cat_path"; then
+            rm -f "$cat_list" "$cat_selected"
+            return 1
+        fi
+        printf '\n'
+    done < "$cat_selected"
+    rm -f "$cat_list" "$cat_selected"
+    return 0
+}
+
 cmd_reconcile() {
     require_config || return 1
     if [ "$#" -ne 0 ]; then
@@ -1267,6 +2037,36 @@ cmd_link() {
     fi
     export KHALA_BRAIN=$link_brain
     exec "$link_binary" "$@"
+}
+
+collect_watch_stream_rows() {
+    watch_rows_session=$1
+    watch_rows_output=$2
+    : > "$watch_rows_output" || return 1
+    for watch_rows_state_file in "$KHALA_ROOT/join/$watch_rows_session"/*; do
+        [ -f "$watch_rows_state_file" ] || continue
+        IFS=' ' read -r watch_rows_state watch_rows_epoch watch_rows_extra \
+            < "$watch_rows_state_file"
+        [ "$watch_rows_state" = joined ] || continue
+        watch_rows_stream=$(basename "$watch_rows_state_file")
+        watch_rows_unread=$(mktemp "$TMP_DIR/watch-stream.XXXXXX") || return 1
+        if ! build_unread_stream_entries "$watch_rows_session" "$watch_rows_stream" \
+            "$watch_rows_unread"; then
+            rm -f "$watch_rows_unread"
+            return 1
+        fi
+        while IFS="$TAB" read -r watch_rows_item_epoch watch_rows_id watch_rows_path; do
+            [ -n "${watch_rows_item_epoch-}" ] || continue
+            watch_rows_from=$(header_value From "$watch_rows_path")
+            printf '%s\t%s\tstream:%s\n' "$watch_rows_id" "$watch_rows_from" \
+                "$watch_rows_stream" >> "$watch_rows_output" || {
+                rm -f "$watch_rows_unread"
+                return 1
+            }
+        done < "$watch_rows_unread"
+        rm -f "$watch_rows_unread"
+    done
+    return 0
 }
 
 cmd_watch() {
@@ -1396,16 +2196,30 @@ cmd_watch() {
             [ -f "$watch_file" ] || continue
             watch_count=$((watch_count + 1))
         done
-        if [ "$watch_count" -gt 0 ]; then
-            printf '%s\n' "$watch_count"
+        watch_stream_rows=$(mktemp "$TMP_DIR/watch-rows.XXXXXX") || {
+            error "watch stream 목록 임시 파일을 만들지 못했습니다"
+            return 1
+        }
+        if ! collect_watch_stream_rows "$watch_session" "$watch_stream_rows"; then
+            rm -f "$watch_stream_rows"
+            error "watch stream 목록을 만들지 못했습니다"
+            return 1
+        fi
+        watch_stream_count=$(wc -l < "$watch_stream_rows" | tr -d ' ')
+        watch_total=$((watch_count + watch_stream_count))
+        if [ "$watch_total" -gt 0 ]; then
+            printf '%s\n' "$watch_total"
             for watch_file in "$watch_inbox_dir"/*; do
                 [ -f "$watch_file" ] || continue
                 watch_id=$(header_value Id "$watch_file")
                 watch_from=$(header_value From "$watch_file")
                 printf '%s\t%s\n' "$watch_id" "$watch_from"
             done
+            cat "$watch_stream_rows"
+            rm -f "$watch_stream_rows"
             return 0
         fi
+        rm -f "$watch_stream_rows"
 
         if [ "$watch_link_fresh" -eq 1 ]; then
             watch_sleep=1
@@ -1491,6 +2305,7 @@ cmd_inbox() {
         return 1
     fi
     inbox_drain_status=0
+    prune_stream_entries
     drained_n=0
     drained_bytes=0
     remaining_n=0
@@ -1532,6 +2347,79 @@ cmd_inbox() {
     if [ "$remaining_n" -gt 0 ]; then
         printf '%s건 더 (%s)\n' "$remaining_n" "$remaining_senders"
     fi
+    inbox_retain_days=$(retain_days) || inbox_drain_status=1
+    inbox_now=$(date +%s) || inbox_drain_status=1
+    if [ "$inbox_drain_status" -eq 0 ]; then
+        inbox_retain_seconds=$((inbox_retain_days * 86400))
+        for inbox_join_file in "$KHALA_ROOT/join/$inbox_session"/*; do
+            [ -f "$inbox_join_file" ] || continue
+            inbox_stream=$(basename "$inbox_join_file")
+            IFS=' ' read -r inbox_join_state inbox_join_epoch inbox_join_extra \
+                < "$inbox_join_file"
+            case "$inbox_join_state" in
+                joined|quiet) ;;
+                *) continue ;;
+            esac
+            if ! positive_or_zero_integer "$inbox_join_epoch" || \
+                [ -n "${inbox_join_extra-}" ]; then
+                error "$inbox_join_file: 잘못된 join 상태"
+                inbox_drain_status=1
+                break
+            fi
+            inbox_cursor_file=$KHALA_ROOT/cursor/$inbox_session/$inbox_stream
+            if [ -f "$inbox_cursor_file" ]; then
+                inbox_cursor_id=$(sed -n '1p' "$inbox_cursor_file")
+                if ! valid_message_id "$inbox_cursor_id"; then
+                    error "$inbox_cursor_file: 잘못된 stream cursor"
+                    inbox_drain_status=1
+                    break
+                fi
+                inbox_cursor_epoch=$(normalize_integer "${inbox_cursor_id%%.*}")
+                if [ "$((inbox_cursor_epoch + inbox_retain_seconds))" -lt "$inbox_now" ]; then
+                    printf 'stream %s: 커서 이전 항목들이 retention을 지나 소멸했습니다\n' \
+                        "$inbox_stream"
+                fi
+            fi
+            inbox_unread=$(mktemp "$TMP_DIR/inbox-stream.XXXXXX") || {
+                inbox_drain_status=1
+                break
+            }
+            if ! build_unread_stream_entries "$inbox_session" "$inbox_stream" "$inbox_unread"; then
+                rm -f "$inbox_unread"
+                inbox_drain_status=1
+                break
+            fi
+            inbox_stream_remaining=0
+            while IFS="$TAB" read -r inbox_stream_epoch inbox_stream_id inbox_stream_path; do
+                [ -n "${inbox_stream_epoch-}" ] || continue
+                file_bytes=$(wc -c < "$inbox_stream_path" | tr -d ' ')
+                if [ "$drained_n" -lt "$max_n" ] && \
+                    [ "$((drained_bytes + file_bytes))" -le "$max_bytes" ]; then
+                    printf '%s\n' "--- stream $inbox_stream $inbox_stream_id ---"
+                    if ! cat "$inbox_stream_path"; then
+                        error "$inbox_stream_path: 읽기에 실패했습니다"
+                        inbox_drain_status=1
+                        break
+                    fi
+                    printf '\n'
+                    if ! atomic_line "$inbox_cursor_file" "$inbox_stream_id" cursor; then
+                        error "$inbox_cursor_file: stream cursor 전진에 실패했습니다"
+                        inbox_drain_status=1
+                        break
+                    fi
+                    drained_n=$((drained_n + 1))
+                    drained_bytes=$((drained_bytes + file_bytes))
+                else
+                    inbox_stream_remaining=$((inbox_stream_remaining + 1))
+                fi
+            done < "$inbox_unread"
+            rm -f "$inbox_unread"
+            if [ "$inbox_stream_remaining" -gt 0 ]; then
+                printf 'stream %s: %s건 더\n' "$inbox_stream" "$inbox_stream_remaining"
+            fi
+            [ "$inbox_drain_status" -eq 0 ] || break
+        done
+    fi
     if ! release_lock "$inbox_lock"; then
         error "inbox drain용 brain lock을 해제하지 못했습니다"
         return 1
@@ -1569,11 +2457,21 @@ cmd_presence() {
         fi
         presence_session=${presence_address%@*}
         presence_node=${presence_address#*@}
-        presence_epoch=$(sed -n '1p' "$presence_file")
-        if ! positive_or_zero_integer "$presence_epoch"; then
+        IFS=' ' read -r presence_first presence_second presence_extra < "$presence_file"
+        if [ "$presence_first" = retired ]; then
+            if ! positive_or_zero_integer "$presence_second" || [ -n "${presence_extra-}" ]; then
+                error "$presence_file: 잘못된 retired heartbeat"
+                return 1
+            fi
+            continue
+        fi
+        presence_epoch=$presence_first
+        if ! positive_or_zero_integer "$presence_epoch" || \
+            [ -n "${presence_second-}" ] || [ -n "${presence_extra-}" ]; then
             error "$presence_file: 잘못된 heartbeat"
             return 1
         fi
+        presence_epoch=$(normalize_integer "$presence_epoch")
         if [ "$((presence_now - presence_epoch))" -le "$presence_ttl" ]; then
             if [ "$presence_node" = "$presence_self" ]; then
                 presence_state=alive-here
@@ -1612,8 +2510,18 @@ fi
 command_name=$1
 shift
 case "$command_name" in
+    version)
+        [ "$#" -eq 0 ] || { usage; exit 1; }
+        printf 'khala %s\n' "$KHALA_VERSION"
+        ;;
     init) cmd_init "$@" ;;
     send) cmd_send "$@" ;;
+    say) cmd_say "$@" ;;
+    join) cmd_join "$@" ;;
+    leave) cmd_leave "$@" ;;
+    streams) cmd_streams "$@" ;;
+    stream) cmd_stream "$@" ;;
+    retire) cmd_retire "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     sync) cmd_sync "$@" ;;
     link) cmd_link "$@" ;;
