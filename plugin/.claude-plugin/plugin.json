@@ -1,7 +1,7 @@
 {
   "name": "khala",
-  "version": "0.1.0",
-  "description": "Khala last mile: inbox drain on session start, watch armament repair on stop, khala usage skill.",
+  "version": "0.2.0",
+  "description": "Khala last mile: bundled CLI self-install, inbox drain on session start, watch armament repair on stop, khala usage skill.",
   "author": { "name": "Dev-Jahn" },
   "hooks": "./hooks/hooks.json"
 }

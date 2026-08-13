@@ -6,8 +6,10 @@ set -u
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
 . "$HOOK_DIR/lib.sh"
 
+khala_ensure_cli "$HOOK_DIR/.."
+
 if ! khala_discover; then
-    printf '%s\n' 'khala: 미설치/미초기화 — 이 노드는 칼라 밖입니다'
+    printf '%s\n' 'khala: 노드 미초기화 — 이 노드는 칼라 밖입니다 (참여하려면: khala init <노드별칭> 후 ~/.khala/config에 함대 선언)'
     exit 0
 fi
 
