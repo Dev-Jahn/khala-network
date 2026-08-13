@@ -1,0 +1,1624 @@
+#!/usr/bin/env bash
+set -u
+
+umask 077
+
+if [ "${KHALA_HOME+x}" = x ]; then
+    if [ -z "$KHALA_HOME" ]; then
+        printf '%s\n' 'khala: KHALA_HOME is empty' >&2
+        exit 1
+    fi
+    KHALA_ROOT=$KHALA_HOME
+else
+    if [ -z "${HOME-}" ]; then
+        printf '%s\n' 'khala: HOME is not set' >&2
+        exit 1
+    fi
+    KHALA_ROOT=$HOME/.khala
+fi
+
+CONFIG=$KHALA_ROOT/config
+TMP_DIR=$KHALA_ROOT/tmp
+SYNC_FAILED=0
+EPOCH_DATE_STYLE=
+TTL_LINK=12
+
+error() {
+    printf 'khala: %s\n' "$*" >&2
+}
+
+usage() {
+    cat >&2 <<'EOF'
+usage:
+  khala init <node>
+  khala send <session@node> [-s subject] [-e seconds] [-m message] [--as session]
+  khala reconcile
+  khala sync
+  khala link [restart] [--max-object-bytes bytes]
+  khala link --serve [--max-object-bytes bytes]
+  khala watch [--session session] [--interval seconds] [--max-wait seconds]
+  khala inbox [--drain [--max-n N] [--max-bytes B]]
+  khala presence
+EOF
+}
+
+require_config() {
+    if [ ! -f "$CONFIG" ]; then
+        error "설정이 없습니다. khala init 먼저 실행하세요."
+        return 1
+    fi
+    return 0
+}
+
+valid_name() {
+    printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*$'
+}
+
+valid_address() {
+    printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$'
+}
+
+positive_or_zero_integer() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+positive_integer() {
+    positive_or_zero_integer "$1" || return 1
+    [ "$1" -gt 0 ] 2>/dev/null
+}
+
+normalize_integer() {
+    normalized=$(printf '%s\n' "$1" | sed 's/^0*//')
+    if [ -z "$normalized" ]; then
+        normalized=0
+    fi
+    printf '%s\n' "$normalized"
+}
+
+file_mtime() {
+    mtime_path=$1
+    mtime_value=$(stat -c %Y "$mtime_path" 2>/dev/null) || mtime_value=
+    if positive_or_zero_integer "$mtime_value"; then
+        printf '%s\n' "$mtime_value"
+        return 0
+    fi
+    mtime_value=$(stat -f %m "$mtime_path" 2>/dev/null) || mtime_value=
+    if positive_or_zero_integer "$mtime_value"; then
+        printf '%s\n' "$mtime_value"
+        return 0
+    fi
+    return 1
+}
+
+self_node() {
+    node=$(sed -n 's/^self //p' "$CONFIG")
+    if ! valid_name "$node"; then
+        error "config의 self 항목이 없거나 잘못되었습니다"
+        return 1
+    fi
+    printf '%s\n' "$node"
+}
+
+session_name() {
+    explicit=${1-}
+    explicit_set=${2-0}
+    if [ "$explicit_set" -eq 1 ]; then
+        session=$explicit
+    elif [ "${KHALA_SESSION+x}" = x ]; then
+        session=$KHALA_SESSION
+    else
+        if [ -z "${PWD-}" ]; then
+            error "발신 세션 이름을 정할 수 없습니다; --as를 지정하세요"
+            return 1
+        fi
+        session=$(basename "$PWD")
+    fi
+    if ! valid_name "$session"; then
+        error "잘못된 세션 이름: $session"
+        return 1
+    fi
+    printf '%s\n' "$session"
+}
+
+header_value() {
+    key=$1
+    file=$2
+    sed -n "s/^$key: //p" "$file"
+}
+
+atomic_copy() {
+    source_file=$1
+    destination_file=$2
+    copy_tmp=$(mktemp "$TMP_DIR/copy.XXXXXX") || return 1
+    if ! cp "$source_file" "$copy_tmp"; then
+        rm -f "$copy_tmp"
+        return 1
+    fi
+    if ln "$copy_tmp" "$destination_file" 2>/dev/null; then
+        rm -f "$copy_tmp"
+        return 0
+    fi
+    if [ -e "$destination_file" ]; then
+        rm -f "$copy_tmp"
+        return 0
+    fi
+    rm -f "$copy_tmp"
+    error "$destination_file: 원자 no-clobber 설치에 실패했습니다"
+    return 1
+}
+
+detect_epoch_date_style() {
+    [ -z "$EPOCH_DATE_STYLE" ] || return 0
+    epoch_probe=$(date -u -r 0 '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || epoch_probe=
+    if [ "$epoch_probe" = 1970-01-01T00:00:00Z ]; then
+        EPOCH_DATE_STYLE=bsd
+        return 0
+    fi
+    epoch_probe=$(date -u -d @0 '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null) || epoch_probe=
+    if [ "$epoch_probe" = 1970-01-01T00:00:00Z ]; then
+        EPOCH_DATE_STYLE=gnu
+        return 0
+    fi
+    error "date가 epoch→ISO8601 변환의 BSD/GNU 형식을 지원하지 않습니다"
+    return 1
+}
+
+epoch_to_iso() {
+    epoch_value=$1
+    case "$EPOCH_DATE_STYLE" in
+        bsd) date -u -r "$epoch_value" '+%Y-%m-%dT%H:%M:%SZ' ;;
+        gnu) date -u -d "@$epoch_value" '+%Y-%m-%dT%H:%M:%SZ' ;;
+        *) error "epoch→ISO8601 플랫폼 형식을 먼저 감지하지 않았습니다"; return 1 ;;
+    esac
+}
+
+acquire_lock() {
+    lock_path=$1
+    lock_stale_after=$2
+    lock_what=$3
+    if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
+        error "$KHALA_ROOT/run: lock 디렉터리를 준비하지 못했습니다"
+        return 1
+    fi
+    lock_attempt=0
+    while [ "$lock_attempt" -lt 60 ]; do
+        if mkdir "$lock_path" 2>/dev/null; then
+            lock_now=$(date +%s) || {
+                rmdir "$lock_path" 2>/dev/null || :
+                return 1
+            }
+            lock_owner_tmp=$lock_path/owner.tmp.$$
+            if ! printf '%s\npid %s %s\n' "$lock_now" "$$" "$lock_what" \
+                > "$lock_owner_tmp" || ! mv "$lock_owner_tmp" "$lock_path/owner"; then
+                rm -f "$lock_owner_tmp"
+                rmdir "$lock_path" 2>/dev/null || :
+                error "$lock_path: lock owner를 기록하지 못했습니다"
+                return 1
+            fi
+            return 0
+        fi
+        lock_now=$(date +%s) || return 1
+        lock_owner_epoch=$(sed -n '1p' "$lock_path/owner" 2>/dev/null)
+        lock_owner_line=$(sed -n '2p' "$lock_path/owner" 2>/dev/null)
+        set -- $lock_owner_line
+        lock_owner_pid=${2-unknown}
+        if positive_or_zero_integer "$lock_owner_epoch" && \
+            [ "$((lock_now - lock_owner_epoch))" -gt "$lock_stale_after" ]; then
+            if ! rm -rf -- "$lock_path"; then
+                error "$lock_path: stale lock을 회수하지 못했습니다"
+                return 1
+            fi
+            error "reclaimed stale lock from pid $lock_owner_pid"
+            continue
+        fi
+        lock_attempt=$((lock_attempt + 1))
+        [ "$lock_attempt" -lt 60 ] || break
+        sleep 1
+    done
+    error "$lock_path: 60회 시도 후에도 lock을 얻지 못했습니다"
+    return 1
+}
+
+release_lock() {
+    release_path=$1
+    if ! rm -f "$release_path/owner" || ! rmdir "$release_path"; then
+        error "$release_path: lock을 해제하지 못했습니다"
+        return 1
+    fi
+    return 0
+}
+
+heartbeat() {
+    heartbeat_session=$1
+    heartbeat_node=$(self_node) || return 1
+    heartbeat_tmp=$(mktemp "$TMP_DIR/heartbeat.XXXXXX") || return 1
+    if ! date +%s > "$heartbeat_tmp"; then
+        rm -f "$heartbeat_tmp"
+        return 1
+    fi
+    if ! mv "$heartbeat_tmp" "$KHALA_ROOT/presence/$heartbeat_session@$heartbeat_node"; then
+        rm -f "$heartbeat_tmp"
+        return 1
+    fi
+    return 0
+}
+
+refresh_watching_marker() {
+    watching_tmp=$(mktemp "$TMP_DIR/watching.XXXXXX") || return 1
+    watching_epoch=$(date +%s) || {
+        rm -f "$watching_tmp"
+        return 1
+    }
+    if ! printf '%s\n%s\n' "$watching_epoch" "$watch_interval" > "$watching_tmp"; then
+        rm -f "$watching_tmp"
+        return 1
+    fi
+    if ! mv "$watching_tmp" "$watch_marker"; then
+        rm -f "$watching_tmp"
+        return 1
+    fi
+    return 0
+}
+
+refresh_watch_lock() {
+    watch_lock_now=$(date +%s) || return 1
+    watch_lock_tmp=$watch_lock/owner.tmp.$$
+    if ! printf '%s\npid %s watch\n%s\n' "$watch_lock_now" "$$" \
+        "$watch_interval" > "$watch_lock_tmp"; then
+        rm -f "$watch_lock_tmp"
+        return 1
+    fi
+    if ! mv "$watch_lock_tmp" "$watch_lock/owner"; then
+        rm -f "$watch_lock_tmp"
+        return 1
+    fi
+    return 0
+}
+
+acquire_watch_lock() {
+    if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
+        error "$KHALA_ROOT/run: watch lock 디렉터리를 준비하지 못했습니다"
+        return 1
+    fi
+    watch_lock_attempt=0
+    while [ "$watch_lock_attempt" -lt 3 ]; do
+        if mkdir "$watch_lock" 2>/dev/null; then
+            if ! refresh_watch_lock; then
+                rm -f "$watch_lock/owner"
+                rmdir "$watch_lock" 2>/dev/null || :
+                error "$watch_lock: watch lock owner를 기록하지 못했습니다"
+                return 1
+            fi
+            return 0
+        fi
+        watch_owner_epoch=$(sed -n '1p' "$watch_lock/owner" 2>/dev/null)
+        watch_owner_line=$(sed -n '2p' "$watch_lock/owner" 2>/dev/null)
+        watch_owner_interval=$(sed -n '3p' "$watch_lock/owner" 2>/dev/null)
+        set -- $watch_owner_line
+        watch_owner_pid=${2-}
+        if ! positive_or_zero_integer "$watch_owner_epoch" || \
+            ! positive_or_zero_integer "$watch_owner_pid" || \
+            ! positive_integer "$watch_owner_interval"; then
+            error "$watch_lock: 잘못된 watch lock owner"
+            return 1
+        fi
+        watch_lock_now=$(date +%s) || return 1
+        watch_stale_after=$((2 * (watch_owner_interval + watch_ttl)))
+        if [ "$((watch_lock_now - watch_owner_epoch))" -gt "$watch_stale_after" ]; then
+            if ! rm -rf -- "$watch_lock"; then
+                error "$watch_lock: stale watch lock을 회수하지 못했습니다"
+                return 1
+            fi
+            error "reclaimed stale watch lock from pid $watch_owner_pid"
+            watch_lock_attempt=$((watch_lock_attempt + 1))
+            continue
+        fi
+        printf '이미 감시 중: %s (pid %s)\n' "$watch_session" "$watch_owner_pid"
+        return 2
+    done
+    error "$watch_lock: watch lock 획득 경쟁에서 이기지 못했습니다"
+    return 1
+}
+
+watch_marker_cleanup() {
+    watch_cleanup_status=$?
+    watch_cleanup_event=$1
+    trap - EXIT INT TERM
+    if ! rm -f "$watch_marker"; then
+        error "$watch_marker: watching marker를 지우지 못했습니다"
+    fi
+    if ! rm -f "$watch_lock/owner" || ! rmdir "$watch_lock"; then
+        error "$watch_lock: watch lock을 지우지 못했습니다"
+    fi
+    case "$watch_cleanup_event" in
+        INT) exit 130 ;;
+        TERM) exit 143 ;;
+    esac
+    return "$watch_cleanup_status"
+}
+
+watching_status() {
+    watching_file=$1
+    watching_now=$2
+    watching_ttl=$3
+    if [ ! -f "$watching_file" ]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    watching_marker_epoch=$(sed -n '1p' "$watching_file")
+    watching_marker_interval=$(sed -n '2p' "$watching_file")
+    if ! positive_or_zero_integer "$watching_marker_epoch" || \
+        ! positive_integer "$watching_marker_interval"; then
+        error "$watching_file: 잘못된 watching marker"
+        printf '%s\n' '-'
+        return 0
+    fi
+    watching_marker_epoch=$(normalize_integer "$watching_marker_epoch")
+    watching_marker_interval=$(normalize_integer "$watching_marker_interval")
+    if [ "$((watching_now - watching_marker_epoch))" -le \
+        "$((watching_marker_interval + watching_ttl))" ]; then
+        printf '%s\n' yes
+    else
+        printf '%s\n' '-'
+    fi
+    return 0
+}
+
+new_message_id() {
+    id_from=$1
+    id_now=$(date +%s) || return 1
+    printf '%s.%s.%s.%s\n' "$id_now" "$$" "$RANDOM" "$id_from"
+}
+
+infrastructure_message_id() {
+    infra_id_type=$1
+    infra_id_ref=$2
+    infra_id_from=$3
+    infra_id_epoch=${infra_id_ref%%.*}
+    infra_id_rest=${infra_id_ref#*.}
+    infra_id_pid=${infra_id_rest%%.*}
+    infra_id_checksum=$(printf '%s' "$infra_id_type:$infra_id_ref" | cksum) || return 1
+    infra_id_rand=${infra_id_checksum%% *}
+    if ! positive_or_zero_integer "$infra_id_epoch" || \
+        ! positive_or_zero_integer "$infra_id_pid"; then
+        return 1
+    fi
+    printf '%s.%s.%s.%s\n' "$infra_id_epoch" "$infra_id_pid" \
+        "$infra_id_rand" "$infra_id_from"
+}
+
+write_generated_message() {
+    generated_type=$1
+    generated_from=$2
+    generated_to=$3
+    generated_ref=$4
+    generated_body=$5
+    generated_destination=$6
+    generated_id=$7
+    generated_ref_epoch=${generated_ref%%.*}
+    if ! positive_or_zero_integer "$generated_ref_epoch"; then
+        error "$generated_ref: infra Refs의 epoch가 잘못되었습니다"
+        return 1
+    fi
+    generated_expires=$((generated_ref_epoch + 2592000))
+    detect_epoch_date_style || return 1
+    generated_date=$(epoch_to_iso "$generated_ref_epoch") || return 1
+    generated_tmp=$(mktemp "$TMP_DIR/message.XXXXXX") || return 1
+    if ! {
+        printf 'Khala: 0.1\n'
+        printf 'Id: %s\n' "$generated_id"
+        printf 'From: %s\n' "$generated_from"
+        printf 'To: %s\n' "$generated_to"
+        printf 'Date: %s\n' "$generated_date"
+        printf 'Type: %s\n' "$generated_type"
+        printf 'Refs: %s\n' "$generated_ref"
+        printf 'Expires: %s\n' "$generated_expires"
+        printf '\n%s\n' "$generated_body"
+    } > "$generated_tmp"; then
+        rm -f "$generated_tmp"
+        return 1
+    fi
+    if ln "$generated_tmp" "$generated_destination" 2>/dev/null; then
+        rm -f "$generated_tmp"
+        return 0
+    fi
+    if [ -e "$generated_destination" ]; then
+        rm -f "$generated_tmp"
+        return 0
+    fi
+    rm -f "$generated_tmp"
+    error "$generated_destination: infra 메시지 원자 설치에 실패했습니다"
+    return 1
+}
+
+queue_infrastructure_message() {
+    infra_type=$1
+    infra_from=$2
+    infra_to=$3
+    infra_ref=$4
+    infra_body=$5
+    infra_id=$(infrastructure_message_id "$infra_type" "$infra_ref" "$infra_from") || return 1
+    infra_node=${infra_to#*@}
+    infra_dir=$KHALA_ROOT/spool/for/$infra_node
+    if ! mkdir -p "$infra_dir"; then
+        return 1
+    fi
+    write_generated_message "$infra_type" "$infra_from" "$infra_to" \
+        "$infra_ref" "$infra_body" "$infra_dir/$infra_id" "$infra_id"
+}
+
+delivered_before() {
+    wanted_id=$1
+    while IFS=' ' read -r dedup_read_epoch dedup_read_id dedup_read_extra; do
+        if [ "${dedup_read_id-}" = "$wanted_id" ]; then
+            return 0
+        fi
+    done < "$KHALA_ROOT/log/delivered"
+    return 1
+}
+
+record_delivered() {
+    delivered_id=$1
+    if delivered_before "$delivered_id"; then
+        return 0
+    fi
+    delivered_now=$(date +%s) || return 1
+    delivered_tmp=$(mktemp "$TMP_DIR/delivered.XXXXXX") || return 1
+    if ! cp "$KHALA_ROOT/log/delivered" "$delivered_tmp"; then
+        rm -f "$delivered_tmp"
+        return 1
+    fi
+    if ! printf '%s %s\n' "$delivered_now" "$delivered_id" >> "$delivered_tmp"; then
+        rm -f "$delivered_tmp"
+        return 1
+    fi
+    if ! mv "$delivered_tmp" "$KHALA_ROOT/log/delivered"; then
+        rm -f "$delivered_tmp"
+        return 1
+    fi
+    return 0
+}
+
+delivered_or_inbox() {
+    delivered_session=$1
+    delivered_id=$2
+    if delivered_before "$delivered_id"; then
+        return 0
+    fi
+    if [ -f "$KHALA_ROOT/inbox/$delivered_session/new/$delivered_id" ] || \
+        [ -f "$KHALA_ROOT/inbox/$delivered_session/cur/$delivered_id" ]; then
+        if ! record_delivered "$delivered_id"; then
+            sync_error "$delivered_id: inbox에 있는 배달의 dedup 로그를 수리하지 못했습니다"
+            return 2
+        fi
+        error "$delivered_id: inbox에서 기존 배달을 찾아 dedup 로그를 수리했습니다"
+        return 0
+    fi
+    return 1
+}
+
+sync_error() {
+    SYNC_FAILED=1
+    error "$*"
+}
+
+mailbox_rsync() {
+    rsync_endpoint=$1
+    rsync_direction=$2
+    rsync_local_path=$3
+    rsync_mailbox_path=$4
+    rsync_remove_source=$5
+
+    case "$rsync_endpoint" in
+        /*)
+            rsync_mailbox_root=$rsync_endpoint
+            rsync_remote=0
+            ;;
+        *)
+            # AMBIGUOUS: §9.6 gives only an SSH destination, not a remote
+            # KHALA_HOME override, so use the documented default root.
+            rsync_mailbox_root='~/.khala'
+            rsync_remote=1
+            ;;
+    esac
+
+    if [ "$rsync_direction" = push ]; then
+        rsync_source=$rsync_local_path
+        rsync_destination=$rsync_mailbox_root/$rsync_mailbox_path
+        if [ "$rsync_remote" -eq 1 ]; then
+            rsync_destination=$rsync_endpoint:$rsync_destination
+        fi
+    else
+        rsync_source=$rsync_mailbox_root/$rsync_mailbox_path
+        rsync_destination=$rsync_local_path
+        if [ "$rsync_remote" -eq 1 ]; then
+            rsync_source=$rsync_endpoint:$rsync_source
+        fi
+        if [ "$rsync_remote" -eq 1 ]; then
+            if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$rsync_endpoint" \
+                "test -d $rsync_mailbox_root && mkdir -p $rsync_mailbox_root/$rsync_mailbox_path"; then
+                return 1
+            fi
+        else
+            [ -d "$rsync_mailbox_root" ] || return 1
+            if ! mkdir -p "$rsync_mailbox_root/$rsync_mailbox_path"; then
+                return 1
+            fi
+        fi
+    fi
+
+    set -- --timeout=20 -a
+    if [ "$rsync_remove_source" -eq 1 ]; then
+        set -- "$@" --remove-source-files
+    fi
+    if [ "$rsync_remote" -eq 1 ]; then
+        set -- "$@" -e "ssh -o ConnectTimeout=5 -o BatchMode=yes"
+    fi
+    rsync "$@" "$rsync_source" "$rsync_destination"
+}
+
+spool_has_files() {
+    spool_check_dir=$1
+    for spool_check_file in "$spool_check_dir"/*; do
+        [ -f "$spool_check_file" ] || continue
+        return 0
+    done
+    return 1
+}
+
+remove_pushed_infrastructure() {
+    pushed_dir=$1
+    for pushed_file in "$pushed_dir"/*; do
+        [ -f "$pushed_file" ] || continue
+        pushed_type=$(header_value Type "$pushed_file")
+        case "$pushed_type" in
+            ack|bounce|notice)
+                if ! rm -f "$pushed_file"; then
+                    sync_error "$pushed_file: push한 인프라 사본을 지우지 못했습니다"
+                fi
+                ;;
+        esac
+    done
+}
+
+exchange_with_endpoint() {
+    exchange_endpoint=$1
+    exchange_self=$2
+
+    if ! mailbox_rsync "$exchange_endpoint" pull \
+        "$KHALA_ROOT/spool/for/$exchange_self/" \
+        "spool/for/$exchange_self/" 1; then
+        return 1
+    fi
+    # AMBIGUOUS: the brief requires pull -> settle -> push here, while also
+    # saying exchange is outside the brain lock and ack settlement is a brain
+    # mutation. Keep network I/O outside, but serialize this short settlement.
+    if ! settle_visible_acks "$exchange_self"; then
+        return 1
+    fi
+
+    for exchange_dir in "$KHALA_ROOT"/spool/for/*; do
+        [ -d "$exchange_dir" ] || continue
+        exchange_node=$(basename "$exchange_dir")
+        [ "$exchange_node" != "$exchange_self" ] || continue
+        spool_has_files "$exchange_dir" || continue
+        if ! mailbox_rsync "$exchange_endpoint" push "$exchange_dir/" \
+            "spool/for/$exchange_node/" 0; then
+            return 1
+        fi
+    done
+
+    if ! mailbox_rsync "$exchange_endpoint" pull \
+        "$KHALA_ROOT/spool/for/$exchange_self/" \
+        "spool/for/$exchange_self/" 1; then
+        return 1
+    fi
+
+    # Watching-marker deletion is intentionally not propagated: remote copies
+    # become stale under the display-side freshness rule.
+    for exchange_presence in "$KHALA_ROOT"/presence/*@"$exchange_self" \
+        "$KHALA_ROOT"/presence/*@"$exchange_self".watching; do
+        [ -f "$exchange_presence" ] || continue
+        if ! mailbox_rsync "$exchange_endpoint" push "$exchange_presence" \
+            presence/ 0; then
+            return 1
+        fi
+    done
+    if ! mailbox_rsync "$exchange_endpoint" pull \
+        "$KHALA_ROOT/presence/" presence/ 0; then
+        return 1
+    fi
+    for exchange_dir in "$KHALA_ROOT"/spool/for/*; do
+        [ -d "$exchange_dir" ] || continue
+        exchange_node=$(basename "$exchange_dir")
+        [ "$exchange_node" != "$exchange_self" ] || continue
+        remove_pushed_infrastructure "$exchange_dir"
+    done
+    return 0
+}
+
+exchange_with_mailbox() {
+    exchange_mailbox_self=$1
+    exchange_mailboxes=$(sed -n 's/^mailbox //p' "$CONFIG")
+    exchange_succeeded=0
+
+    for exchange_alias in $exchange_mailboxes; do
+        if ! valid_name "$exchange_alias"; then
+            error "잘못된 mailbox 별칭을 건너뜁니다: $exchange_alias"
+            continue
+        fi
+        exchange_endpoints=$(sed -n "s/^peer $exchange_alias //p" "$CONFIG")
+        if [ -z "$exchange_endpoints" ]; then
+            error "peer 후보가 없는 mailbox를 건너뜁니다: $exchange_alias"
+            continue
+        fi
+        for exchange_candidate in $exchange_endpoints; do
+            if exchange_with_endpoint "$exchange_candidate" "$exchange_mailbox_self"; then
+                exchange_succeeded=1
+                break 2
+            fi
+            error "mailbox $exchange_alias 후보를 건너뜁니다: $exchange_candidate"
+        done
+    done
+
+    if [ "$exchange_succeeded" -ne 1 ]; then
+        sync_error "사용 가능한 mailbox 후보가 없습니다"
+    fi
+}
+
+validate_spool_file() {
+    spool_file=$1
+    spool_id=$(header_value Id "$spool_file")
+    if [ -z "$spool_id" ] || [ "$(basename "$spool_file")" != "$spool_id" ]; then
+        sync_error "$spool_file: filename과 Id가 다릅니다"
+        return 1
+    fi
+    return 0
+}
+
+move_old_invalid_spool_file() {
+    invalid_file=$1
+    if ! invalid_old=$(find "$invalid_file" -mmin +43200 -print); then
+        sync_error "$invalid_file: mtime 나이를 확인하지 못했습니다"
+        return
+    fi
+    [ -n "$invalid_old" ] || return
+    invalid_dead=$KHALA_ROOT/spool/dead
+    if ! mkdir -p "$invalid_dead"; then
+        sync_error "$invalid_file: 파싱 불능 spool 격리 디렉터리를 만들지 못했습니다"
+        return
+    fi
+    if ! mv "$invalid_file" "$invalid_dead/$(basename "$invalid_file")"; then
+        sync_error "$invalid_file: 30일 지난 파싱 불능 spool 파일을 격리하지 못했습니다"
+        return
+    fi
+    error "$invalid_file: 30일 지난 파싱 불능 spool 파일을 spool/dead로 옮겼습니다"
+}
+
+copy_outbox_to_spool() {
+    copy_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    for outbox_file in "$KHALA_ROOT"/outbox/new/*; do
+        [ -f "$outbox_file" ] || continue
+        outbox_id=$(header_value Id "$outbox_file")
+        outbox_type=$(header_value Type "$outbox_file")
+        outbox_to=$(header_value To "$outbox_file")
+        outbox_expires=$(header_value Expires "$outbox_file")
+        if [ -z "$outbox_id" ] || [ "$(basename "$outbox_file")" != "$outbox_id" ]; then
+            sync_error "$outbox_file: filename과 Id가 다릅니다"
+            continue
+        fi
+        if [ "$outbox_type" != message ]; then
+            sync_error "$outbox_file: outbox/new에는 message만 둘 수 있습니다"
+            continue
+        fi
+        if ! valid_address "$outbox_to"; then
+            sync_error "$outbox_file: 잘못된 To 헤더"
+            continue
+        fi
+        if ! positive_or_zero_integer "$outbox_expires"; then
+            sync_error "$outbox_file: 잘못된 Expires 헤더"
+            continue
+        fi
+        if [ "$outbox_expires" -le "$copy_now" ]; then
+            continue
+        fi
+        destination_node=${outbox_to#*@}
+        destination_dir=$KHALA_ROOT/spool/for/$destination_node
+        if ! mkdir -p "$destination_dir"; then
+            sync_error "$outbox_file: spool 디렉터리를 만들지 못했습니다"
+            continue
+        fi
+        if ! atomic_copy "$outbox_file" "$destination_dir/$outbox_id"; then
+            sync_error "$outbox_file: spool 복사에 실패했습니다"
+        fi
+    done
+}
+
+deliver_regular_message() {
+    incoming_file=$1
+    incoming_id=$(header_value Id "$incoming_file")
+    incoming_from=$(header_value From "$incoming_file")
+    incoming_to=$(header_value To "$incoming_file")
+    incoming_expires=$(header_value Expires "$incoming_file")
+    if ! valid_address "$incoming_from" || ! valid_address "$incoming_to"; then
+        sync_error "$incoming_file: 잘못된 주소 헤더"
+        return
+    fi
+    if ! positive_or_zero_integer "$incoming_expires"; then
+        sync_error "$incoming_file: 잘못된 Expires 헤더"
+        return
+    fi
+    incoming_now=$(date +%s) || {
+        sync_error "$incoming_file: 현재 시각을 읽지 못했습니다"
+        return
+    }
+    if [ "$incoming_expires" -le "$incoming_now" ]; then
+        if ! rm -f "$incoming_file"; then
+            sync_error "$incoming_file: 만료된 spool 사본을 지우지 못했습니다"
+        fi
+        return
+    fi
+    incoming_session=${incoming_to%@*}
+    incoming_dir=$KHALA_ROOT/inbox/$incoming_session
+    if ! mkdir -p "$incoming_dir/new" "$incoming_dir/cur"; then
+        sync_error "$incoming_file: inbox 디렉터리를 만들지 못했습니다"
+        return
+    fi
+    if delivered_or_inbox "$incoming_session" "$incoming_id"; then
+        :
+    else
+        delivered_status=$?
+        [ "$delivered_status" -ne 2 ] || return
+        if ! atomic_copy "$incoming_file" "$incoming_dir/new/$incoming_id"; then
+            sync_error "$incoming_file: inbox 배달에 실패했습니다"
+            return
+        fi
+        if ! record_delivered "$incoming_id"; then
+            sync_error "$incoming_file: dedup 기록에 실패했습니다"
+            return
+        fi
+    fi
+    if ! queue_infrastructure_message ack "$incoming_to" "$incoming_from" \
+        "$incoming_id" "Acknowledged $incoming_id"; then
+        sync_error "$incoming_file: ack 생성에 실패했습니다"
+        return
+    fi
+    # AMBIGUOUS: §9.6 does not name who removes a mailbox's delivered message
+    # copy; deletion-free push cannot let the remote sender remove it.
+    if ! rm -f "$incoming_file"; then
+        sync_error "$incoming_file: 배달한 message 사본을 소비하지 못했습니다"
+    fi
+}
+
+deliver_fire_and_forget() {
+    incoming_file=$1
+    incoming_id=$(header_value Id "$incoming_file")
+    incoming_to=$(header_value To "$incoming_file")
+    if ! valid_address "$incoming_to"; then
+        sync_error "$incoming_file: 잘못된 To 헤더"
+        return
+    fi
+    incoming_session=${incoming_to%@*}
+    incoming_dir=$KHALA_ROOT/inbox/$incoming_session
+    if ! mkdir -p "$incoming_dir/new" "$incoming_dir/cur"; then
+        sync_error "$incoming_file: inbox 디렉터리를 만들지 못했습니다"
+        return
+    fi
+    if delivered_or_inbox "$incoming_session" "$incoming_id"; then
+        :
+    else
+        delivered_status=$?
+        [ "$delivered_status" -ne 2 ] || return
+        if ! atomic_copy "$incoming_file" "$incoming_dir/new/$incoming_id"; then
+            sync_error "$incoming_file: inbox 배달에 실패했습니다"
+            return
+        fi
+        if ! record_delivered "$incoming_id"; then
+            sync_error "$incoming_file: dedup 기록에 실패했습니다"
+            return
+        fi
+    fi
+    if ! rm -f "$incoming_file"; then
+        sync_error "$incoming_file: fire-and-forget 사본을 소비하지 못했습니다"
+    fi
+}
+
+deliver_messages() {
+    local_spool=$1
+    for incoming_file in "$local_spool"/*; do
+        [ -f "$incoming_file" ] || continue
+        if ! validate_spool_file "$incoming_file"; then
+            move_old_invalid_spool_file "$incoming_file"
+            continue
+        fi
+        incoming_type=$(header_value Type "$incoming_file")
+        if [ "$incoming_type" = message ]; then
+            deliver_regular_message "$incoming_file"
+        fi
+    done
+}
+
+expire_outbox() {
+    expire_self=$1
+    expire_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    for expired_file in "$KHALA_ROOT"/outbox/new/*; do
+        [ -f "$expired_file" ] || continue
+        expired_id=$(header_value Id "$expired_file")
+        expired_from=$(header_value From "$expired_file")
+        expired_to=$(header_value To "$expired_file")
+        expired_at=$(header_value Expires "$expired_file")
+        if [ -z "$expired_id" ] || [ "$(basename "$expired_file")" != "$expired_id" ]; then
+            sync_error "$expired_file: filename과 Id가 다릅니다"
+            continue
+        fi
+        if ! valid_address "$expired_from" || ! valid_address "$expired_to"; then
+            sync_error "$expired_file: 잘못된 주소 헤더"
+            continue
+        fi
+        if ! positive_or_zero_integer "$expired_at"; then
+            sync_error "$expired_file: 잘못된 Expires 헤더"
+            continue
+        fi
+        if [ "$expired_at" -gt "$expire_now" ]; then
+            continue
+        fi
+        if ! queue_infrastructure_message bounce "khala@$expire_self" "$expired_from" \
+            "$expired_id" "Delivery expired for $expired_to"; then
+            sync_error "$expired_file: bounce 생성에 실패했습니다"
+            continue
+        fi
+        if ! mv "$expired_file" "$KHALA_ROOT/outbox/dead/$expired_id"; then
+            sync_error "$expired_file: dead-letter 이동에 실패했습니다"
+            continue
+        fi
+        expired_node=${expired_to#*@}
+        if ! rm -f "$KHALA_ROOT/spool/for/$expired_node/$expired_id"; then
+            sync_error "$expired_file: spool 사본 삭제에 실패했습니다"
+        fi
+    done
+}
+
+deliver_infrastructure() {
+    local_spool=$1
+    for incoming_file in "$local_spool"/*; do
+        [ -f "$incoming_file" ] || continue
+        if ! validate_spool_file "$incoming_file"; then
+            move_old_invalid_spool_file "$incoming_file"
+            continue
+        fi
+        incoming_type=$(header_value Type "$incoming_file")
+        case "$incoming_type" in
+            bounce|notice) deliver_fire_and_forget "$incoming_file" ;;
+        esac
+    done
+}
+
+settle_acks() {
+    local_spool=$1
+    for ack_file in "$local_spool"/*; do
+        [ -f "$ack_file" ] || continue
+        if ! validate_spool_file "$ack_file"; then
+            move_old_invalid_spool_file "$ack_file"
+            continue
+        fi
+        ack_type=$(header_value Type "$ack_file")
+        [ "$ack_type" = ack ] || continue
+        ack_ref=$(header_value Refs "$ack_file")
+        if [ -z "$ack_ref" ]; then
+            sync_error "$ack_file: Refs 헤더가 없습니다"
+            continue
+        fi
+        original_file=$KHALA_ROOT/outbox/new/$ack_ref
+        archived_file=$KHALA_ROOT/outbox/acked/$ack_ref
+        reference_file=
+        if [ -f "$original_file" ]; then
+            if ! mv "$original_file" "$archived_file"; then
+                sync_error "$ack_file: 원문을 acked로 옮기지 못했습니다"
+                continue
+            fi
+            reference_file=$archived_file
+        elif [ -f "$archived_file" ]; then
+            reference_file=$archived_file
+        elif [ -f "$KHALA_ROOT/outbox/dead/$ack_ref" ]; then
+            reference_file=$KHALA_ROOT/outbox/dead/$ack_ref
+        fi
+        if [ -n "$reference_file" ]; then
+            original_to=$(header_value To "$reference_file")
+            if valid_address "$original_to"; then
+                original_node=${original_to#*@}
+                if ! rm -f "$KHALA_ROOT/spool/for/$original_node/$ack_ref"; then
+                    sync_error "$ack_file: message spool 사본을 지우지 못했습니다"
+                    continue
+                fi
+            fi
+        fi
+        if ! rm -f "$ack_file"; then
+            sync_error "$ack_file: ack를 소비하지 못했습니다"
+        fi
+    done
+}
+
+prune_delivered_log() {
+    prune_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    prune_before=$((prune_now - 5184000))
+    prune_tmp=$(mktemp "$TMP_DIR/prune.XXXXXX") || {
+        sync_error "dedup 로그 임시 파일을 만들지 못했습니다"
+        return
+    }
+    while IFS=' ' read -r prune_epoch prune_id prune_extra; do
+        [ -n "${prune_epoch-}" ] || continue
+        if ! positive_or_zero_integer "$prune_epoch" || [ -z "${prune_id-}" ]; then
+            sync_error "log/delivered에 잘못된 행이 있습니다"
+            printf '%s %s%s\n' "$prune_epoch" "${prune_id-}" "${prune_extra:+ $prune_extra}" >> "$prune_tmp"
+            continue
+        fi
+        if [ "$prune_epoch" -ge "$prune_before" ]; then
+            printf '%s %s\n' "$prune_epoch" "$prune_id" >> "$prune_tmp"
+        fi
+    done < "$KHALA_ROOT/log/delivered"
+    if cmp -s "$prune_tmp" "$KHALA_ROOT/log/delivered"; then
+        rm -f "$prune_tmp"
+    elif ! mv "$prune_tmp" "$KHALA_ROOT/log/delivered"; then
+        rm -f "$prune_tmp"
+        sync_error "dedup 로그 정리에 실패했습니다"
+    fi
+}
+
+reconcile_cycle() {
+    reconcile_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$reconcile_lock" 300 reconcile; then
+        sync_error "brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    if ! reconcile_self=$(self_node); then
+        sync_error "self node를 읽지 못했습니다"
+    else
+        copy_outbox_to_spool
+        reconcile_spool=$KHALA_ROOT/spool/for/$reconcile_self
+        if ! mkdir -p "$reconcile_spool"; then
+            sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
+        else
+            deliver_messages "$reconcile_spool"
+            deliver_infrastructure "$reconcile_spool"
+            settle_acks "$reconcile_spool"
+        fi
+        expire_outbox "$reconcile_self"
+        prune_delivered_log
+    fi
+    if ! release_lock "$reconcile_lock"; then
+        sync_error "brain lock을 해제하지 못했습니다"
+    fi
+    [ "$SYNC_FAILED" -eq 0 ]
+}
+
+settle_visible_acks() {
+    settle_self=$1
+    settle_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$settle_lock" 300 exchange-settle; then
+        sync_error "ack 정산용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    settle_acks "$KHALA_ROOT/spool/for/$settle_self"
+    if ! release_lock "$settle_lock"; then
+        sync_error "ack 정산용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    return 0
+}
+
+exchange_cycle() {
+    exchange_lock=$KHALA_ROOT/run/exchange.lock.d
+    if ! acquire_lock "$exchange_lock" 120 exchange; then
+        sync_error "exchange lock을 얻지 못했습니다"
+        return 1
+    fi
+    if ! exchange_self=$(self_node); then
+        sync_error "self node를 읽지 못했습니다"
+    else
+        exchange_mailbox_line=$(sed -n 's/^mailbox //p' "$CONFIG")
+        exchange_self_is_mailbox=0
+        for exchange_mailbox_node in $exchange_mailbox_line; do
+            if [ "$exchange_mailbox_node" = "$exchange_self" ]; then
+                exchange_self_is_mailbox=1
+            fi
+        done
+        if [ "$exchange_self_is_mailbox" -ne 1 ]; then
+            exchange_with_mailbox "$exchange_self"
+        fi
+    fi
+    if ! release_lock "$exchange_lock"; then
+        sync_error "exchange lock을 해제하지 못했습니다"
+    fi
+    [ "$SYNC_FAILED" -eq 0 ]
+}
+
+run_sync_cycles() {
+    SYNC_FAILED=0
+    reconcile_cycle || :
+    exchange_cycle || :
+    reconcile_cycle || :
+    [ "$SYNC_FAILED" -eq 0 ]
+}
+
+cmd_init() {
+    if [ "$#" -ne 1 ]; then
+        usage
+        return 1
+    fi
+    init_node=$1
+    if ! valid_name "$init_node"; then
+        error "잘못된 노드 별칭: $init_node"
+        return 1
+    fi
+    if [ -e "$CONFIG" ]; then
+        error "이미 초기화되어 있습니다: $KHALA_ROOT"
+        return 1
+    fi
+    if ! mkdir -p \
+        "$KHALA_ROOT/outbox/new" \
+        "$KHALA_ROOT/outbox/acked" \
+        "$KHALA_ROOT/outbox/dead" \
+        "$KHALA_ROOT/spool/for/$init_node" \
+        "$KHALA_ROOT/inbox" \
+        "$KHALA_ROOT/presence" \
+        "$KHALA_ROOT/log" \
+        "$KHALA_ROOT/run" \
+        "$KHALA_ROOT/tmp"; then
+        error "디렉터리 구조를 만들지 못했습니다: $KHALA_ROOT"
+        return 1
+    fi
+    if ! chmod 700 "$KHALA_ROOT"; then
+        error "KHALA_HOME을 0700으로 설정하지 못했습니다"
+        return 1
+    fi
+    if ! chmod 700 "$KHALA_ROOT/run"; then
+        error "run 디렉터리를 0700으로 설정하지 못했습니다"
+        return 1
+    fi
+    init_config=$(mktemp "$TMP_DIR/config.XXXXXX") || return 1
+    if ! {
+        printf 'self %s\n' "$init_node"
+        printf 'peer %s %s\n' "$init_node" "$init_node"
+        printf 'mailbox %s\n' "$init_node"
+        printf 'ttl 120\n'
+    } > "$init_config"; then
+        rm -f "$init_config"
+        error "config를 쓰지 못했습니다"
+        return 1
+    fi
+    init_log=$(mktemp "$TMP_DIR/delivered.XXXXXX") || {
+        rm -f "$init_config"
+        return 1
+    }
+    if ! mv "$init_log" "$KHALA_ROOT/log/delivered"; then
+        rm -f "$init_log" "$init_config"
+        error "dedup 로그를 만들지 못했습니다"
+        return 1
+    fi
+    if ! mv "$init_config" "$CONFIG"; then
+        rm -f "$init_config"
+        error "config를 설치하지 못했습니다"
+        return 1
+    fi
+    printf 'initialized %s at %s\n' "$init_node" "$KHALA_ROOT"
+    return 0
+}
+
+cmd_send() {
+    require_config || return 1
+    if [ "$#" -lt 1 ]; then
+        usage
+        return 1
+    fi
+    send_to=$1
+    shift
+    if ! valid_address "$send_to"; then
+        error "잘못된 주소: $send_to"
+        return 1
+    fi
+    send_subject=
+    send_ttl=2592000
+    send_body=
+    send_body_set=0
+    send_as=
+    send_as_set=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -s)
+                [ "$#" -ge 2 ] || { error "-s 값이 없습니다"; return 1; }
+                send_subject=$2
+                shift 2
+                ;;
+            -e)
+                [ "$#" -ge 2 ] || { error "-e 값이 없습니다"; return 1; }
+                send_ttl=$2
+                shift 2
+                ;;
+            -m)
+                [ "$#" -ge 2 ] || { error "-m 값이 없습니다"; return 1; }
+                send_body=$2
+                send_body_set=1
+                shift 2
+                ;;
+            --as)
+                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
+                send_as=$2
+                send_as_set=1
+                shift 2
+                ;;
+            *)
+                error "알 수 없는 send 옵션: $1"
+                return 1
+                ;;
+        esac
+    done
+    if ! positive_or_zero_integer "$send_ttl"; then
+        error "만료 초는 0 이상의 정수여야 합니다"
+        return 1
+    fi
+    send_ttl=$(normalize_integer "$send_ttl")
+    case "$send_subject" in
+        *'
+'*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
+    esac
+    send_node=$(self_node) || return 1
+    send_session=$(session_name "$send_as" "$send_as_set") || return 1
+    send_from=$send_session@$send_node
+    send_now=$(date +%s) || { error "현재 시각을 읽지 못했습니다"; return 1; }
+    send_expires=$((send_now + send_ttl))
+    send_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    send_id=$(new_message_id "$send_from") || return 1
+    if ! heartbeat "$send_session"; then
+        error "heartbeat를 갱신하지 못했습니다"
+        return 1
+    fi
+    send_tmp=$(mktemp "$TMP_DIR/message.XXXXXX") || return 1
+    if ! {
+        printf 'Khala: 0.1\n'
+        printf 'Id: %s\n' "$send_id"
+        printf 'From: %s\n' "$send_from"
+        printf 'To: %s\n' "$send_to"
+        printf 'Date: %s\n' "$send_date"
+        printf 'Type: message\n'
+        # AMBIGUOUS: §9.6 exposes -s but does not define its on-disk header.
+        if [ -n "$send_subject" ]; then
+            printf 'Subject: %s\n' "$send_subject"
+        fi
+        printf 'Expires: %s\n' "$send_expires"
+        printf '\n'
+        if [ "$send_body_set" -eq 1 ]; then
+            printf '%s\n' "$send_body"
+        else
+            cat
+        fi
+    } > "$send_tmp"; then
+        rm -f "$send_tmp"
+        error "메시지를 쓰지 못했습니다"
+        return 1
+    fi
+    send_destination=$KHALA_ROOT/outbox/new/$send_id
+    if ! ln "$send_tmp" "$send_destination" 2>/dev/null; then
+        rm -f "$send_tmp"
+        if [ -e "$send_destination" ]; then
+            error "$send_id: 이미 존재하는 Id라 발신 큐를 덮어쓰지 않습니다"
+        else
+            error "메시지를 발신 큐에 원자적으로 안착시키지 못했습니다"
+        fi
+        return 1
+    fi
+    rm -f "$send_tmp"
+    send_destination_node=${send_to#*@}
+    send_spool_dir=$KHALA_ROOT/spool/for/$send_destination_node
+    if ! mkdir -p "$send_spool_dir" || \
+        ! atomic_copy "$send_destination" "$send_spool_dir/$send_id"; then
+        error "$send_id: 즉시 spool 물질화에 실패했습니다; 다음 reconcile에서 재시도합니다"
+    fi
+    printf '%s\n' "$send_id"
+    return 0
+}
+
+cmd_reconcile() {
+    require_config || return 1
+    if [ "$#" -ne 0 ]; then
+        usage
+        return 1
+    fi
+    SYNC_FAILED=0
+    reconcile_cycle
+}
+
+cmd_sync() {
+    require_config || return 1
+    if [ "$#" -ne 0 ]; then
+        usage
+        return 1
+    fi
+    run_sync_cycles
+}
+
+cmd_link() {
+    require_config || return 1
+    link_script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || {
+        error "bin/khala의 절대 경로를 확인하지 못했습니다"
+        return 1
+    }
+    link_brain=$link_script_dir/$(basename "$0")
+    link_home_binary=$KHALA_ROOT/bin/khala-link
+    link_sibling_binary=$link_script_dir/khala-link
+    if [ -x "$link_home_binary" ]; then
+        link_binary=$link_home_binary
+    elif [ -x "$link_sibling_binary" ]; then
+        link_binary=$link_sibling_binary
+    else
+        error "khala-link 바이너리가 없습니다; 예상 경로: $link_home_binary 또는 $link_sibling_binary"
+        return 1
+    fi
+    export KHALA_BRAIN=$link_brain
+    exec "$link_binary" "$@"
+}
+
+cmd_watch() {
+    require_config || return 1
+    watch_session=
+    watch_session_set=0
+    watch_interval=30
+    watch_max_wait=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --session)
+                [ "$#" -ge 2 ] || { error "--session 값이 없습니다"; return 1; }
+                watch_session=$2
+                watch_session_set=1
+                shift 2
+                ;;
+            --interval)
+                [ "$#" -ge 2 ] || { error "--interval 값이 없습니다"; return 1; }
+                watch_interval=$2
+                shift 2
+                ;;
+            --max-wait)
+                [ "$#" -ge 2 ] || { error "--max-wait 값이 없습니다"; return 1; }
+                watch_max_wait=$2
+                shift 2
+                ;;
+            *) error "알 수 없는 watch 옵션: $1"; return 1 ;;
+        esac
+    done
+    if ! positive_integer "$watch_interval"; then
+        error "watch 간격은 양의 정수여야 합니다"
+        return 1
+    fi
+    if ! positive_or_zero_integer "$watch_max_wait"; then
+        error "watch 최대 대기는 0 이상의 정수여야 합니다"
+        return 1
+    fi
+    watch_interval=$(normalize_integer "$watch_interval")
+    watch_max_wait=$(normalize_integer "$watch_max_wait")
+    watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
+    watch_self=$(self_node) || {
+        error "설정을 확인하거나 khala init 먼저 실행하세요."
+        return 1
+    }
+    watch_mailboxes=$(sed -n 's/^mailbox //p' "$CONFIG")
+    if [ -z "$watch_mailboxes" ]; then
+        error "config의 mailbox 항목이 없습니다; khala init 먼저 실행하세요."
+        return 1
+    fi
+    for watch_mailbox in $watch_mailboxes; do
+        if ! valid_name "$watch_mailbox"; then
+            error "config의 mailbox 항목이 잘못되었습니다; khala init 먼저 실행하세요."
+            return 1
+        fi
+        watch_endpoints=$(sed -n "s/^peer $watch_mailbox //p" "$CONFIG")
+        if [ -z "$watch_endpoints" ]; then
+            error "mailbox의 peer 후보가 없습니다; khala init 먼저 실행하세요."
+            return 1
+        fi
+    done
+    watch_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
+    if [ -z "$watch_ttl" ]; then
+        watch_ttl=120
+    fi
+    if ! positive_integer "$watch_ttl"; then
+        error "config의 ttl이 양의 정수가 아닙니다"
+        return 1
+    fi
+    watch_ttl=$(normalize_integer "$watch_ttl")
+    watch_started=$(date +%s) || {
+        error "현재 시각을 읽지 못했습니다"
+        return 1
+    }
+    watch_inbox_dir=$KHALA_ROOT/inbox/$watch_session/new
+    watch_marker=$KHALA_ROOT/presence/$watch_session@$watch_self.watching
+    watch_lock=$KHALA_ROOT/run/watch.$watch_session.lock.d
+    if acquire_watch_lock; then
+        :
+    else
+        watch_lock_status=$?
+        [ "$watch_lock_status" -ne 2 ] || return 0
+        return 1
+    fi
+    trap 'watch_marker_cleanup EXIT' EXIT
+    trap 'watch_marker_cleanup INT' INT
+    trap 'watch_marker_cleanup TERM' TERM
+
+    watch_marker_refreshed=0
+    while :; do
+        watch_now=$(date +%s) || {
+            error "현재 시각을 읽지 못했습니다"
+            return 1
+        }
+        # Marker refresh rides interval cadence, not loop cadence: in link
+        # mode the loop runs at 1s and the nerve fans out every content
+        # change fleet-wide (measured 1Hz presence noise, 57/60s). The
+        # freshness rule (interval + ttl) needs one refresh per interval.
+        if [ "$watch_marker_refreshed" -eq 0 ] || \
+            [ "$((watch_now - watch_marker_refreshed))" -ge "$watch_interval" ]; then
+            if refresh_watching_marker; then
+                watch_marker_refreshed=$watch_now
+            else
+                error "$watch_marker: watching marker를 갱신하지 못했습니다; watch를 계속합니다"
+            fi
+        fi
+        if ! refresh_watch_lock; then
+            error "$watch_lock: watch lock owner를 갱신하지 못했습니다; watch를 계속합니다"
+        fi
+        watch_link_fresh=0
+        watch_link_mtime=$(file_mtime "$KHALA_ROOT/run/link.fresh") || watch_link_mtime=
+        if positive_or_zero_integer "$watch_link_mtime" && \
+            [ "$watch_now" -ge "$watch_link_mtime" ] && \
+            [ "$((watch_now - watch_link_mtime))" -lt "$TTL_LINK" ]; then
+            watch_link_fresh=1
+        fi
+        if [ "$watch_link_fresh" -eq 1 ]; then
+            SYNC_FAILED=0
+            if ! reconcile_cycle; then
+                error "reconcile 실패; watch를 계속합니다"
+            fi
+        elif ! run_sync_cycles; then
+            error "sync 실패; watch를 계속합니다"
+        fi
+
+        watch_count=0
+        for watch_file in "$watch_inbox_dir"/*; do
+            [ -f "$watch_file" ] || continue
+            watch_count=$((watch_count + 1))
+        done
+        if [ "$watch_count" -gt 0 ]; then
+            printf '%s\n' "$watch_count"
+            for watch_file in "$watch_inbox_dir"/*; do
+                [ -f "$watch_file" ] || continue
+                watch_id=$(header_value Id "$watch_file")
+                watch_from=$(header_value From "$watch_file")
+                printf '%s\t%s\n' "$watch_id" "$watch_from"
+            done
+            return 0
+        fi
+
+        if [ "$watch_link_fresh" -eq 1 ]; then
+            watch_sleep=1
+        else
+            watch_sleep=$watch_interval
+        fi
+        if [ "$watch_max_wait" -gt 0 ]; then
+            watch_now=$(date +%s) || {
+                error "현재 시각을 읽지 못했습니다"
+                return 1
+            }
+            watch_remaining=$((watch_max_wait - (watch_now - watch_started)))
+            if [ "$watch_remaining" -le 0 ]; then
+                error "기한 내 새 편지 없음"
+                return 3
+            fi
+            if [ "$watch_remaining" -lt "$watch_sleep" ]; then
+                watch_sleep=$watch_remaining
+            fi
+        fi
+        sleep "$watch_sleep"
+    done
+}
+
+cmd_inbox() {
+    require_config || return 1
+    drain=0
+    # AMBIGUOUS: §9.6 requires drain bounds but does not specify their defaults.
+    max_n=20
+    max_bytes=65536
+    if [ "$#" -gt 0 ]; then
+        if [ "$1" != --drain ]; then
+            error "inbox 옵션은 --drain부터 시작해야 합니다"
+            return 1
+        fi
+        drain=1
+        shift
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --max-n)
+                    [ "$#" -ge 2 ] || { error "--max-n 값이 없습니다"; return 1; }
+                    max_n=$2
+                    shift 2
+                    ;;
+                --max-bytes)
+                    [ "$#" -ge 2 ] || { error "--max-bytes 값이 없습니다"; return 1; }
+                    max_bytes=$2
+                    shift 2
+                    ;;
+                *) error "알 수 없는 inbox 옵션: $1"; return 1 ;;
+            esac
+        done
+    fi
+    if ! positive_integer "$max_n" || ! positive_integer "$max_bytes"; then
+        error "drain 상한은 양의 정수여야 합니다"
+        return 1
+    fi
+    max_n=$(normalize_integer "$max_n")
+    max_bytes=$(normalize_integer "$max_bytes")
+    inbox_session=$(session_name "" 0) || return 1
+    if ! heartbeat "$inbox_session"; then
+        error "heartbeat를 갱신하지 못했습니다"
+        return 1
+    fi
+    inbox_dir=$KHALA_ROOT/inbox/$inbox_session
+    if ! mkdir -p "$inbox_dir/new" "$inbox_dir/cur"; then
+        error "inbox 디렉터리를 만들지 못했습니다"
+        return 1
+    fi
+    if [ "$drain" -eq 0 ]; then
+        for inbox_file in "$inbox_dir"/new/*; do
+            [ -f "$inbox_file" ] || continue
+            list_id=$(header_value Id "$inbox_file")
+            list_from=$(header_value From "$inbox_file")
+            list_type=$(header_value Type "$inbox_file")
+            printf '%s\t%s\t%s\n' "$list_id" "$list_from" "$list_type"
+        done
+        return 0
+    fi
+    inbox_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$inbox_lock" 300 inbox-drain; then
+        error "inbox drain용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    inbox_drain_status=0
+    drained_n=0
+    drained_bytes=0
+    remaining_n=0
+    remaining_senders=
+    for inbox_file in "$inbox_dir"/new/*; do
+        [ -f "$inbox_file" ] || continue
+        file_bytes=$(wc -c < "$inbox_file" | tr -d ' ')
+        if [ "$drained_n" -lt "$max_n" ] && \
+            [ "$((drained_bytes + file_bytes))" -le "$max_bytes" ]; then
+            printf '%s\n' "--- $(basename "$inbox_file") ---"
+            if ! cat "$inbox_file"; then
+                error "$inbox_file: 읽기에 실패했습니다"
+                inbox_drain_status=1
+                break
+            fi
+            printf '\n'
+            if ! mv "$inbox_file" "$inbox_dir/cur/$(basename "$inbox_file")"; then
+                error "$inbox_file: cur 이동에 실패했습니다"
+                inbox_drain_status=1
+                break
+            fi
+            drained_n=$((drained_n + 1))
+            drained_bytes=$((drained_bytes + file_bytes))
+        else
+            remaining_n=$((remaining_n + 1))
+            remaining_from=$(header_value From "$inbox_file")
+            case " $remaining_senders " in
+                *" $remaining_from "*) ;;
+                *)
+                    if [ -n "$remaining_senders" ]; then
+                        remaining_senders="$remaining_senders, $remaining_from"
+                    else
+                        remaining_senders=$remaining_from
+                    fi
+                    ;;
+            esac
+        fi
+    done
+    if [ "$remaining_n" -gt 0 ]; then
+        printf '%s건 더 (%s)\n' "$remaining_n" "$remaining_senders"
+    fi
+    if ! release_lock "$inbox_lock"; then
+        error "inbox drain용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    return "$inbox_drain_status"
+}
+
+cmd_presence() {
+    require_config || return 1
+    if [ "$#" -ne 0 ]; then
+        usage
+        return 1
+    fi
+    presence_self=$(self_node) || return 1
+    presence_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
+    if [ -z "$presence_ttl" ]; then
+        presence_ttl=120
+    fi
+    if ! positive_integer "$presence_ttl"; then
+        error "config의 ttl이 양의 정수가 아닙니다"
+        return 1
+    fi
+    presence_ttl=$(normalize_integer "$presence_ttl")
+    presence_now=$(date +%s) || return 1
+    printf 'ADDRESS\tSTATE\tLAST_SEEN\tWATCHING\n'
+    for presence_file in "$KHALA_ROOT"/presence/*; do
+        [ -f "$presence_file" ] || continue
+        presence_address=$(basename "$presence_file")
+        case "$presence_address" in
+            *.watching) continue ;;
+        esac
+        if ! valid_address "$presence_address"; then
+            error "$presence_file: 잘못된 heartbeat 파일명"
+            return 1
+        fi
+        presence_session=${presence_address%@*}
+        presence_node=${presence_address#*@}
+        presence_epoch=$(sed -n '1p' "$presence_file")
+        if ! positive_or_zero_integer "$presence_epoch"; then
+            error "$presence_file: 잘못된 heartbeat"
+            return 1
+        fi
+        if [ "$((presence_now - presence_epoch))" -le "$presence_ttl" ]; then
+            if [ "$presence_node" = "$presence_self" ]; then
+                presence_state=alive-here
+            else
+                presence_state=alive-elsewhere
+            fi
+        else
+            presence_state=asleep
+        fi
+        presence_watching=$(watching_status "$presence_file.watching" \
+            "$presence_now" "$presence_ttl")
+        printf '%s@%s\t%s\t%s\t%s\n' "$presence_session" "$presence_node" \
+            "$presence_state" "$presence_epoch" "$presence_watching"
+    done
+    for presence_marker in "$KHALA_ROOT"/presence/*.watching; do
+        [ -f "$presence_marker" ] || continue
+        presence_address=$(basename "$presence_marker" .watching)
+        if ! valid_address "$presence_address"; then
+            error "$presence_marker: 잘못된 watching marker 파일명"
+            continue
+        fi
+        [ ! -f "$KHALA_ROOT/presence/$presence_address" ] || continue
+        presence_watching=$(watching_status "$presence_marker" \
+            "$presence_now" "$presence_ttl")
+        printf '%s\tunknown\t-\t%s\n' "$presence_address" "$presence_watching"
+    done
+    printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch)'
+    return 0
+}
+
+if [ "$#" -lt 1 ]; then
+    usage
+    exit 1
+fi
+
+command_name=$1
+shift
+case "$command_name" in
+    init) cmd_init "$@" ;;
+    send) cmd_send "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
+    sync) cmd_sync "$@" ;;
+    link) cmd_link "$@" ;;
+    watch) cmd_watch "$@" ;;
+    inbox) cmd_inbox "$@" ;;
+    presence) cmd_presence "$@" ;;
+    *) usage; exit 1 ;;
+esac

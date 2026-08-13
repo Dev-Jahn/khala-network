@@ -40,6 +40,60 @@ khala_file_mtime() {
     return 1
 }
 
+# Ensure the bundled CLI lives at ~/.local/bin/khala. Ownership rules: a fresh
+# slot is installed with a receipt; a byte-identical copy is adopted; a
+# receipted copy that diverged is updated loudly; a symlink or an unreceipted
+# divergent copy is never touched — one honest line instead. $1: plugin root.
+khala_ensure_cli() {
+    khala_bundled=$1/bin/khala
+    [ -f "$khala_bundled" ] || return 0
+    [ -n "${HOME-}" ] || return 0
+    khala_cli_dir=$HOME/.local/bin
+    khala_cli_target=$khala_cli_dir/khala
+    khala_cli_receipt=$khala_cli_dir/.khala.plugin-receipt
+
+    if [ -L "$khala_cli_target" ]; then
+        if ! cmp -s "$khala_bundled" "$khala_cli_target"; then
+            printf '%s\n' 'khala: ~/.local/bin/khala는 심링크(수동 관리) — 플러그인 동봉본과 내용이 다릅니다. 갱신은 손으로.'
+        fi
+        return 0
+    fi
+    if [ -f "$khala_cli_target" ]; then
+        if cmp -s "$khala_bundled" "$khala_cli_target"; then
+            if [ ! -f "$khala_cli_receipt" ]; then
+                printf 'khala-plugin\n' > "$khala_cli_receipt" 2>/dev/null || :
+            fi
+            return 0
+        fi
+        if [ ! -f "$khala_cli_receipt" ]; then
+            printf '%s\n' 'khala: ~/.local/bin/khala가 플러그인 동봉본과 다릅니다 — 수동 설치본으로 보고 건드리지 않습니다. 플러그인 관리로 넘기려면 그 파일을 지우세요.'
+            return 0
+        fi
+        khala_cli_update=1
+    else
+        khala_cli_update=0
+    fi
+    if ! mkdir -p "$khala_cli_dir" 2>/dev/null; then
+        printf 'khala: CLI 설치 실패 — %s를 만들 수 없습니다\n' "$khala_cli_dir"
+        return 0
+    fi
+    khala_cli_tmp=$khala_cli_dir/.khala.install.$$
+    if cp "$khala_bundled" "$khala_cli_tmp" 2>/dev/null && \
+        chmod 755 "$khala_cli_tmp" 2>/dev/null && \
+        mv -f "$khala_cli_tmp" "$khala_cli_target" 2>/dev/null; then
+        printf 'khala-plugin\n' > "$khala_cli_receipt" 2>/dev/null || :
+        if [ "$khala_cli_update" -eq 1 ]; then
+            printf '%s\n' 'khala: CLI 갱신됨 — ~/.local/bin/khala ← 플러그인 동봉본'
+        else
+            printf '%s\n' 'khala: CLI 설치됨 — ~/.local/bin/khala (플러그인 동봉본)'
+        fi
+    else
+        rm -f "$khala_cli_tmp" 2>/dev/null
+        printf 'khala: CLI 설치 실패 — %s에 쓸 수 없습니다\n' "$khala_cli_dir"
+    fi
+    return 0
+}
+
 khala_discover() {
     if [ "${KHALA_HOME+x}" = x ]; then
         KHALA_ROOT=$KHALA_HOME

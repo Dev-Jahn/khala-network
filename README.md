@@ -32,15 +32,26 @@ in a dead-letter box, never retried forever. Khala never types into a
 session's input line — the input line is the user's identity; delivery is by
 mailbox only.
 
-## Install the CLI
+## Install
 
 ```sh
-mkdir -p ~/.local/bin
-cp bin/khala ~/.local/bin/khala && chmod +x ~/.local/bin/khala
+claude plugin marketplace add Dev-Jahn/jahns-cc-marketplace
+claude plugin install khala@jahns-cc-marketplace
+```
+
+That is the whole install. The plugin bundles the `khala` CLI and its
+SessionStart hook keeps `~/.local/bin/khala` installed and up to date (it
+never touches a symlink or a manually installed copy — it says so instead).
+The CLI still needs the fixed path because ssh remote commands and cron
+entries on other machines refer to it by that name.
+
+Then, once per machine, join the fleet:
+
+```sh
 khala init laptop        # your node alias: [a-z0-9][a-z0-9-]*
 ```
 
-Then declare your fleet in `~/.khala/config` (one line = one fact; endpoint
+and declare your fleet in `~/.khala/config` (one line = one fact; endpoint
 candidates may be ssh aliases from `~/.ssh/config`, host coordinates, or
 absolute paths for same-machine testing):
 
@@ -75,15 +86,10 @@ One link per node; a flock singleton makes repeat starts harmless. It
 reconnects by itself with jitter after sleep or network loss. If it is down,
 sync/watch carry the mail at minute-scale — the link only lowers latency.
 
-## Claude Code plugin (the last mile)
+## What the plugin does (the last mile)
 
-```sh
-claude plugin marketplace add Dev-Jahn/jahns-cc-marketplace
-claude plugin install khala@jahns-cc-marketplace
-```
-
-- **SessionStart** drains the session inbox into context (capped) and ensures
-  the node link is up.
+- **SessionStart** installs/updates the bundled CLI, drains the session inbox
+  into context (capped), and ensures the node link is up.
 - **Stop** re-arms the mail watch for sessions that opted in, so an idle
   session is always wakeable by mail.
 - The **khala skill** teaches the session safe usage.
@@ -91,7 +97,10 @@ claude plugin install khala@jahns-cc-marketplace
 Opt a checkout in by writing a single-line `.khala-session` file with the
 session name (or export `KHALA_SESSION`). The full address is
 `session@node`; the mailbox belongs to the name, and a restarted session
-inherits its mail. The plugin requires the `khala` CLI installed as above.
+inherits its mail.
+
+Without Claude Code, the CLI works standalone: copy `bin/khala` to
+`~/.local/bin/khala` yourself and use send/sync/inbox directly.
 
 ## Development
 
