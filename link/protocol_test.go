@@ -4,13 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"testing"
 )
 
 func TestProtocolFramesRoundTrip(t *testing.T) {
 	digest := sha256.Sum256([]byte("payload"))
 	want := offer{Class: "spool", Node: "beta", Basename: "1.sender@alpha", Size: 7, Digest: digest}
-	want.ID = transferID(want.Class, want.Node, want.Basename, want.Digest)
+	want.ID = transferID(want.Class, want.Stream, want.Node, want.Basename, want.Digest)
 	var wire bytes.Buffer
 	if err := newFrameWriter(&wire).write(offerFrame(want)); err != nil {
 		t.Fatal(err)
@@ -33,6 +35,52 @@ func TestOfferRejectsForgedTransferID(t *testing.T) {
 	o := offer{ID: "../../tmp", Class: "spool", Node: "beta", Basename: "1.sender@alpha", Size: 7, Digest: digest}
 	if _, err := decodeOffer(offerFrame(o)); err == nil {
 		t.Fatal("forged transfer id was accepted")
+	}
+}
+
+func TestStreamOfferRoundTripAndBindsStreamToTransferID(t *testing.T) {
+	digest := sha256.Sum256([]byte("stream payload"))
+	want := offer{Class: "stream", Stream: "khala", Node: "alpha", Basename: "1.2.3.ear@alpha", Size: 14, Digest: digest}
+	want.ID = transferID(want.Class, want.Stream, want.Node, want.Basename, want.Digest)
+	otherID := transferID(want.Class, "other", want.Node, want.Basename, want.Digest)
+	if want.ID == otherID {
+		t.Fatal("stream name is absent from transfer identity")
+	}
+	got, err := decodeOffer(offerFrame(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("stream offer mismatch: got %#v want %#v", got, want)
+	}
+}
+
+func TestLegacyOfferEncodingRemainsByteIdentical(t *testing.T) {
+	digest := sha256.Sum256([]byte("legacy payload"))
+	for _, class := range []string{"spool", "presence"} {
+		o := offer{Class: class, Node: "alpha", Basename: "1.2.3.ear@alpha", Size: 14, Digest: digest}
+		o.ID = transferID(o.Class, o.Stream, o.Node, o.Basename, o.Digest)
+		legacyIDHash := sha256.New()
+		_, _ = io.WriteString(legacyIDHash, o.Class)
+		_, _ = io.WriteString(legacyIDHash, "\x00")
+		_, _ = io.WriteString(legacyIDHash, o.Node)
+		_, _ = io.WriteString(legacyIDHash, "\x00")
+		_, _ = io.WriteString(legacyIDHash, o.Basename)
+		_, _ = legacyIDHash.Write(o.Digest[:])
+		legacyID := hex.EncodeToString(legacyIDHash.Sum(nil))
+		if o.ID != legacyID {
+			t.Fatalf("%s transfer ID changed from v1.0: got %s want %s", class, o.ID, legacyID)
+		}
+		var legacy encoder
+		legacy.str(o.ID)
+		legacy.str(o.Class)
+		legacy.str(o.Node)
+		legacy.str(o.Basename)
+		legacy.u64(o.Size)
+		legacy.str(hex.EncodeToString(o.Digest[:]))
+		if got := offerFrame(o).payload; !bytes.Equal(got, legacy.b) {
+			t.Fatalf("%s OFFER changed from v1.0: got %x want %x", class, got, legacy.b)
+		}
 	}
 }
 

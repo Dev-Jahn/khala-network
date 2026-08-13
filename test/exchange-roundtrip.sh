@@ -120,9 +120,19 @@ fi
 [ "$(count_files "$HOME_A/spool/for/b200")" -eq 0 ] || fail 3 "alpha outgoing spool was not settled"
 pass 3 "ack pull settles the sender and empties both ack spools"
 
-# 4. Another pair of cycles must not alter either recursive listing.
-ls -laR "$HOME_A" >"$TEST_DIR/alpha-tree-before"
-ls -laR "$HOME_M" >"$TEST_DIR/mailbox-tree-before"
+# 4. Another pair of cycles must not alter semantic state. run/ (lock
+# scratch) and tmp/ (staging scratch) are volatile by design and every sync
+# touches their directory mtimes, so an ls -laR comparison flakes whenever
+# the two snapshots straddle a minute boundary under load; compare the file
+# set and contents of the semantic paths instead.
+semantic_snapshot() {
+    (cd "$1" && find . -path ./run -prune -o -path ./tmp -prune -o -type f -print | sort | \
+        while IFS= read -r snapshot_file; do
+            printf '%s %s\n' "$snapshot_file" "$(cksum < "$snapshot_file")"
+        done)
+}
+semantic_snapshot "$HOME_A" >"$TEST_DIR/alpha-tree-before"
+semantic_snapshot "$HOME_M" >"$TEST_DIR/mailbox-tree-before"
 if ! KHALA_HOME="$HOME_A" "$KHALA" sync \
     >"$TEST_DIR/alpha-sync-idempotent.out" 2>"$TEST_DIR/alpha-sync-idempotent.err"; then
     fail 4 "idempotent alpha sync failed: $(tr '\n' ' ' < "$TEST_DIR/alpha-sync-idempotent.err")"
@@ -131,8 +141,8 @@ if ! KHALA_HOME="$HOME_M" "$KHALA" sync \
     >"$TEST_DIR/mailbox-sync-idempotent.out" 2>"$TEST_DIR/mailbox-sync-idempotent.err"; then
     fail 4 "idempotent b200 sync failed: $(tr '\n' ' ' < "$TEST_DIR/mailbox-sync-idempotent.err")"
 fi
-ls -laR "$HOME_A" >"$TEST_DIR/alpha-tree-after"
-ls -laR "$HOME_M" >"$TEST_DIR/mailbox-tree-after"
+semantic_snapshot "$HOME_A" >"$TEST_DIR/alpha-tree-after"
+semantic_snapshot "$HOME_M" >"$TEST_DIR/mailbox-tree-after"
 cmp -s "$TEST_DIR/alpha-tree-before" "$TEST_DIR/alpha-tree-after" || fail 4 "alpha listing changed"
 cmp -s "$TEST_DIR/mailbox-tree-before" "$TEST_DIR/mailbox-tree-after" || fail 4 "mailbox listing changed"
 pass 4 "the settled pair is idempotent"

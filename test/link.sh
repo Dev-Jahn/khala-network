@@ -121,7 +121,7 @@ if [ ! -x "$GO" ]; then
 fi
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
-    "$GO" build -trimpath -ldflags '-X main.implVersion=0.2.0-test' -o "$BIN" .) \
+    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.0-test' -o "$BIN" .) \
     >"$RIG/go.out" 2>"$RIG/go.err"; then
     fail 0 "Go tests/build failed: $(tr '\n' ' ' < "$RIG/go.err")"
 fi

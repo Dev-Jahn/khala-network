@@ -49,6 +49,20 @@ func TestProtocolMajorMismatchSendsFatalErrorAndBye(t *testing.T) {
 	}
 }
 
+func TestNegotiatedMinorIsMinimum(t *testing.T) {
+	for _, tc := range []struct {
+		local, remote, want uint64
+	}{
+		{1, 0, 0},
+		{1, 1, 1},
+		{1, 9, 1},
+	} {
+		if got := minimumMinor(tc.local, tc.remote); got != tc.want {
+			t.Errorf("minimumMinor(%d, %d)=%d want %d", tc.local, tc.remote, got, tc.want)
+		}
+	}
+}
+
 func TestServeDefaultQuietTimeout(t *testing.T) {
 	if os.Getenv("KHALA_LINK_LONG_TEST") != "1" {
 		t.Skip("set KHALA_LINK_LONG_TEST=1 for the 60s serve liveness test")

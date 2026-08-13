@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -38,7 +39,12 @@ func testKhalaHome(t *testing.T) string {
 
 func testOffer(class, node, name string, data []byte) offer {
 	digest := sha256.Sum256(data)
-	return offer{ID: transferID(class, node, name, digest), Class: class, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
+	return offer{ID: transferID(class, "", node, name, digest), Class: class, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
+}
+
+func testStreamOffer(stream, node, name string, data []byte) offer {
+	digest := sha256.Sum256(data)
+	return offer{ID: transferID("stream", stream, node, name, digest), Class: "stream", Stream: stream, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
 }
 
 func TestInstallFsyncRenameAndNoClobber(t *testing.T) {
@@ -119,6 +125,60 @@ func TestRoleOwnershipRejectsReflectionAndTraversal(t *testing.T) {
 		if _, err := i.destination(o); err == nil {
 			t.Errorf("accepted forbidden offer %#v", o)
 		}
+	}
+}
+
+func TestStreamDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T) {
+	home := testKhalaHome(t)
+	name := "1.2.3.ear@alpha"
+	dial := installer{home: home, role: "dial", peer: "beta", logger: testLogger{t}}
+	o := testStreamOffer("khala", "alpha", name, []byte("x"))
+	dest, err := dial.destination(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "streams", "khala", "alpha", name)
+	if dest != want {
+		t.Fatalf("destination=%q want %q", dest, want)
+	}
+	for _, bad := range []offer{
+		testStreamOffer("Bad", "alpha", name, []byte("x")),
+		testStreamOffer("khala", "alpha", "not-an-id", []byte("x")),
+		testStreamOffer("khala", "beta", "1.2.3.ear@beta", []byte("x")),
+	} {
+		if _, err := dial.destination(bad); err == nil {
+			t.Errorf("dial accepted invalid/reflected stream offer %#v", bad)
+		}
+	}
+	serve := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	if _, err := serve.destination(o); err != nil {
+		t.Fatalf("serve rejected connected spoke shard: %v", err)
+	}
+	if _, err := serve.destination(testStreamOffer("khala", "gamma", "1.2.3.ear@gamma", []byte("x"))); err == nil {
+		t.Fatal("serve accepted a shard not owned by its connected spoke")
+	}
+}
+
+func TestFutureStreamInstallMovesToBrainQuarantineEncoding(t *testing.T) {
+	home := testKhalaHome(t)
+	name := fmt.Sprintf("%d.2.3.ear@alpha", time.Now().Unix()+86401)
+	data := []byte("future stream bytes")
+	o := testStreamOffer("khala", "alpha", name, data)
+	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	result, path, err := i.receive(o, data)
+	if err == nil || result != quarantined {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	want := filepath.Join(home, "spool", "dead", "stream.khala.alpha."+name)
+	if path != want {
+		t.Fatalf("quarantine=%q want %q", path, want)
+	}
+	got, readErr := os.ReadFile(want)
+	if readErr != nil || string(got) != string(data) {
+		t.Fatalf("quarantine bytes=%q err=%v", got, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "streams", "khala", "alpha", name)); !os.IsNotExist(statErr) {
+		t.Fatalf("future entry polluted live tree: %v", statErr)
 	}
 }
 
