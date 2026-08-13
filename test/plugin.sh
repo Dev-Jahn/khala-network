@@ -110,7 +110,11 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/hooks/hooks.json" || fail 1 "hooks.json is invalid"
 cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || \
     fail 1 "plugin/bin/khala drifted from bin/khala"
-pass 1 "plugin manifests are valid JSON and bundled CLI matches bin/khala"
+# CC auto-loads hooks/hooks.json; a manifest "hooks" key naming it again is a
+# duplicate that fails the whole plugin load (fleet-observed, 2026-08-13).
+grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && \
+    fail 1 "plugin.json references hooks (auto-loaded path must not be repeated)"
+pass 1 "plugin manifests are valid JSON, no duplicate hooks ref, bundled CLI matches bin/khala"
 
 UNINIT=$RIG/uninitialized
 UNINIT_PROJECT=$RIG/uninit-session
