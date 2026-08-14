@@ -11,9 +11,10 @@ import (
 )
 
 var (
-	nodePattern      = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-	basePattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.\-@]*$`)
-	messageIDPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$`)
+	nodePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	basePattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.\-@]*$`)
+	messageIDPattern  = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+\.[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$`)
+	generationPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 )
 
 type config struct {
@@ -105,6 +106,8 @@ func validBasename(s string) bool {
 }
 
 func validMessageID(s string) bool { return messageIDPattern.MatchString(s) }
+
+func validGeneration(s string) bool { return generationPattern.MatchString(s) }
 
 func presenceNode(name string) (string, bool) {
 	base := strings.TrimSuffix(name, ".watching")

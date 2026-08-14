@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-var implVersion = "0.3.1"
+var implVersion = "0.4.0"
 
 type options struct {
 	serve    bool

@@ -68,6 +68,17 @@ func (i *installer) destination(o offer) (string, error) {
 			return "", fmt.Errorf("serve accepts stream only from connected spoke %q", i.peer)
 		}
 		return filepath.Join(i.home, "streams", o.Stream, o.Node, o.Basename), nil
+	case "mind":
+		if !validNode(o.Session) || !validGeneration(o.Basename) {
+			return "", fmt.Errorf("invalid mind session or generation")
+		}
+		if i.role == "dial" && o.Node == i.peer {
+			return "", fmt.Errorf("dial refuses reflected mind shard for self %q", i.peer)
+		}
+		if i.role == "serve" && o.Node != i.peer {
+			return "", fmt.Errorf("serve accepts mind only from connected spoke %q", i.peer)
+		}
+		return filepath.Join(i.home, "minds", o.Node, o.Session, o.Basename), nil
 	default:
 		return "", fmt.Errorf("unknown object class %q", o.Class)
 	}
@@ -182,26 +193,26 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	if err != nil {
 		return quarantined, tmp, err
 	}
-	if o.Class == "stream" {
-		epoch, epochErr := streamEpoch(o.Basename)
+	if o.Class == "stream" || o.Class == "mind" {
+		epoch, epochErr := offerEpoch(o.Class, o.Basename)
 		if epochErr != nil || epoch > uint64(time.Now().Unix()+86400) {
-			quarantine, quarantineErr := i.quarantineFutureStream(tmp, o)
+			quarantine, quarantineErr := i.quarantineFuture(tmp, o)
 			if quarantineErr != nil {
 				return quarantined, tmp, quarantineErr
 			}
-			i.logger.Printf("future stream epoch refused and quarantined at %s", quarantine)
-			return quarantined, quarantine, fmt.Errorf("stream Id epoch exceeds now+86400")
+			i.logger.Printf("future %s epoch refused and quarantined at %s", o.Class, quarantine)
+			return quarantined, quarantine, fmt.Errorf("%s epoch exceeds now+86400", o.Class)
 		}
-		expired, expiredErr := streamExpiredAt(o.Basename, i.retainDays, 1, time.Now())
+		expired, expiredErr := offerExpiredAt(o.Class, o.Basename, i.retainDays, 1, time.Now())
 		if expiredErr != nil {
 			return quarantined, tmp, expiredErr
 		}
 		if expired {
 			committed := filepath.Join(i.home, "tmp", "link.committed")
 			if err := os.Rename(tmp, committed); err != nil {
-				return quarantined, tmp, fmt.Errorf("compact expired stream staging file: %w", err)
+				return quarantined, tmp, fmt.Errorf("compact expired %s staging file: %w", o.Class, err)
 			}
-			i.logger.Printf("expired stream skipped without install or quarantine: %s", o.Basename)
+			i.logger.Printf("expired %s skipped without install or quarantine: %s", o.Class, o.Basename)
 			return expiredSkipped, committed, nil
 		}
 	}
@@ -305,8 +316,31 @@ func streamEpoch(id string) (uint64, error) {
 	return strconv.ParseUint(epoch, 10, 64)
 }
 
+func mindEpoch(generation string) (uint64, error) {
+	if !validGeneration(generation) {
+		return 0, fmt.Errorf("invalid mind generation")
+	}
+	epoch, _, _ := strings.Cut(generation, ".")
+	return strconv.ParseUint(epoch, 10, 64)
+}
+
+func offerEpoch(class, basename string) (uint64, error) {
+	switch class {
+	case "stream":
+		return streamEpoch(basename)
+	case "mind":
+		return mindEpoch(basename)
+	default:
+		return 0, fmt.Errorf("class %q has no epoch", class)
+	}
+}
+
 func streamExpiredAt(id string, retainDays, slackDays uint64, now time.Time) (bool, error) {
-	epoch, err := streamEpoch(id)
+	return offerExpiredAt("stream", id, retainDays, slackDays, now)
+}
+
+func offerExpiredAt(class, basename string, retainDays, slackDays uint64, now time.Time) (bool, error) {
+	epoch, err := offerEpoch(class, basename)
 	if err != nil {
 		return false, err
 	}
@@ -324,7 +358,7 @@ func streamExpiredAt(id string, retainDays, slackDays uint64, now time.Time) (bo
 	return nowEpoch-epoch > days*86400, nil
 }
 
-func (i *installer) quarantineFutureStream(tmp string, o offer) (string, error) {
+func (i *installer) quarantineFuture(tmp string, o offer) (string, error) {
 	dir := filepath.Join(i.home, "spool", "dead")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -332,7 +366,16 @@ func (i *installer) quarantineFutureStream(tmp string, o offer) (string, error) 
 	if err := os.Chmod(dir, 0700); err != nil {
 		return "", err
 	}
-	dest := filepath.Join(dir, "stream."+o.Stream+"."+o.Node+"."+o.Basename)
+	var encoded string
+	switch o.Class {
+	case "stream":
+		encoded = "stream." + o.Stream + "." + o.Node + "." + o.Basename
+	case "mind":
+		encoded = "mind." + o.Node + "." + o.Session + "." + o.Basename
+	default:
+		return "", fmt.Errorf("class %q has no future quarantine encoding", o.Class)
+	}
+	dest := filepath.Join(dir, encoded)
 	installErr := renameNoReplace(tmp, dest)
 	linkedInstall := false
 	if unsupportedNoReplace(installErr) {
@@ -352,7 +395,7 @@ func (i *installer) quarantineFutureStream(tmp string, o offer) (string, error) 
 		return dest, nil
 	}
 	if !os.IsExist(installErr) {
-		return "", fmt.Errorf("atomic future-stream quarantine: %w", installErr)
+		return "", fmt.Errorf("atomic future-%s quarantine: %w", o.Class, installErr)
 	}
 	equal, digestErr := sameDigest(dest, o.Digest)
 	if digestErr == nil && equal {

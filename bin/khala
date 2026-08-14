@@ -22,10 +22,19 @@ TMP_DIR=$KHALA_ROOT/tmp
 SYNC_FAILED=0
 EPOCH_DATE_STYLE=
 TTL_LINK=12
-KHALA_VERSION=0.3.1
+# Display-only semantic freshness; storage lifetime remains config retain.
+MIND_FRESH_SECONDS=3600
+KHALA_VERSION=0.4.0
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
+PRESERVE_CONFIG_LOADED=0
+PRESERVER_ENABLED=0
+PRESERVE_CONFIG_INVALID=0
+PRESERVE_STREAMS=
+PRESERVER_DEGRADED=0
+PRESERVER_READY=0
+SYNC_DIR_STYLE=
 
 error() {
     printf 'khala: %s\n' "$*" >&2
@@ -42,6 +51,9 @@ usage:
   khala leave <stream>
   khala streams
   khala stream cat <stream> [-n N]
+  khala mind (-m focus [--stance stance] | --clear)
+  khala profile [--model model] [--effort effort] [--role role] [--charge charge]
+  khala minds
   khala retire <session>
   khala reconcile
   khala sync
@@ -433,6 +445,551 @@ new_message_id() {
     printf '%s.%s.%s.%s\n' "$id_now" "$$" "$RANDOM" "$id_from"
 }
 
+valid_generation() {
+    printf '%s\n' "$1" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+}
+
+valid_mind_value() {
+    case "$1" in
+        *'
+'*|*''*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+validate_mind_file() {
+    mind_file=$1
+    mind_expected_node=$2
+    mind_expected_session=$3
+    mind_expected_generation=$4
+    if ! valid_name "$mind_expected_node" || ! valid_name "$mind_expected_session" || \
+        ! valid_generation "$mind_expected_generation"; then
+        return 1
+    fi
+    for mind_header in Generation Session Node State Model Effort Role Charge Focus Stance \
+        Declared-State Declared-Model Declared-Effort Declared-Role Declared-Charge \
+        Declared-Focus Declared-Stance; do
+        [ "$(grep -c "^$mind_header: " "$mind_file")" -eq 1 ] || return 1
+    done
+    [ "$(header_value Generation "$mind_file")" = "$mind_expected_generation" ] || return 1
+    [ "$(header_value Session "$mind_file")" = "$mind_expected_session" ] || return 1
+    [ "$(header_value Node "$mind_file")" = "$mind_expected_node" ] || return 1
+    mind_state=$(header_value State "$mind_file")
+    case "$mind_state" in
+        active|cleared) ;;
+        *) return 1 ;;
+    esac
+    for mind_field in State Model Effort Role Charge Focus Stance; do
+        mind_declared=$(header_value "Declared-$mind_field" "$mind_file")
+        positive_or_zero_integer "$mind_declared" || return 1
+    done
+    return 0
+}
+
+current_mind_generation() {
+    current_mind_node=$1
+    current_mind_session=$2
+    current_mind_dir=$KHALA_ROOT/minds/$current_mind_node/$current_mind_session
+    current_mind_found=0
+    current_mind_epoch=0
+    current_mind_counter=0
+    current_mind_path=
+    for current_candidate in "$current_mind_dir"/*; do
+        [ -f "$current_candidate" ] || continue
+        current_generation=$(basename "$current_candidate")
+        if ! valid_generation "$current_generation" || \
+            ! validate_mind_file "$current_candidate" "$current_mind_node" \
+                "$current_mind_session" "$current_generation"; then
+            error "$current_candidate: 잘못된 mind generation"
+            return 1
+        fi
+        current_epoch=$(normalize_integer "${current_generation%%.*}")
+        current_counter=$(normalize_integer "${current_generation#*.}")
+        if [ "$current_mind_found" -eq 0 ] || [ "$current_epoch" -gt "$current_mind_epoch" ] || \
+            { [ "$current_epoch" -eq "$current_mind_epoch" ] && \
+                [ "$current_counter" -gt "$current_mind_counter" ]; }; then
+            current_mind_found=1
+            current_mind_epoch=$current_epoch
+            current_mind_counter=$current_counter
+            current_mind_path=$current_candidate
+        fi
+    done
+    printf '%s\n' "$current_mind_path"
+}
+
+reset_mind_update() {
+    MIND_SET_STATE=0
+    MIND_STATE=
+    MIND_SET_MODEL=0
+    MIND_MODEL=
+    MIND_SET_EFFORT=0
+    MIND_EFFORT=
+    MIND_SET_ROLE=0
+    MIND_ROLE=
+    MIND_SET_CHARGE=0
+    MIND_CHARGE=
+    MIND_SET_FOCUS=0
+    MIND_FOCUS=
+    MIND_SET_STANCE=0
+    MIND_STANCE=
+}
+
+write_mind_generation() {
+    write_mind_session=$1
+    write_mind_node=$2
+    write_mind_dir=$KHALA_ROOT/minds/$write_mind_node/$write_mind_session
+    if ! mkdir -p "$write_mind_dir"; then
+        error "$write_mind_dir: mind shard를 만들지 못했습니다"
+        return 1
+    fi
+    write_mind_current=$(current_mind_generation "$write_mind_node" "$write_mind_session") || return 1
+    write_mind_now=$(date +%s) || {
+        error "현재 시각을 읽지 못했습니다"
+        return 1
+    }
+    if [ -n "$write_mind_current" ]; then
+        write_mind_previous=$(basename "$write_mind_current")
+        write_mind_previous_epoch=$(normalize_integer "${write_mind_previous%%.*}")
+        write_mind_previous_counter=$(normalize_integer "${write_mind_previous#*.}")
+    else
+        write_mind_previous_epoch=0
+        write_mind_previous_counter=0
+    fi
+    if [ -n "$write_mind_current" ] && [ "$write_mind_now" -le "$write_mind_previous_epoch" ]; then
+        write_mind_epoch=$write_mind_previous_epoch
+        write_mind_counter=$((write_mind_previous_counter + 1))
+    else
+        write_mind_epoch=$write_mind_now
+        write_mind_counter=0
+    fi
+    write_mind_generation=$write_mind_epoch.$write_mind_counter
+
+    write_state=active
+    write_model=
+    write_effort=
+    write_role=
+    write_charge=
+    write_focus=
+    write_stance=
+    write_declared_state=0
+    write_declared_model=0
+    write_declared_effort=0
+    write_declared_role=0
+    write_declared_charge=0
+    write_declared_focus=0
+    write_declared_stance=0
+    # AMBIGUOUS: Which epoch represents a field never declared before the
+    # first family-specific generation? Epoch 0 means "not yet declared".
+    if [ -n "$write_mind_current" ]; then
+        write_state=$(header_value State "$write_mind_current")
+        write_model=$(header_value Model "$write_mind_current")
+        write_effort=$(header_value Effort "$write_mind_current")
+        write_role=$(header_value Role "$write_mind_current")
+        write_charge=$(header_value Charge "$write_mind_current")
+        write_focus=$(header_value Focus "$write_mind_current")
+        write_stance=$(header_value Stance "$write_mind_current")
+        write_declared_state=$(header_value Declared-State "$write_mind_current")
+        write_declared_model=$(header_value Declared-Model "$write_mind_current")
+        write_declared_effort=$(header_value Declared-Effort "$write_mind_current")
+        write_declared_role=$(header_value Declared-Role "$write_mind_current")
+        write_declared_charge=$(header_value Declared-Charge "$write_mind_current")
+        write_declared_focus=$(header_value Declared-Focus "$write_mind_current")
+        write_declared_stance=$(header_value Declared-Stance "$write_mind_current")
+    fi
+    if [ "$MIND_SET_STATE" -eq 1 ]; then
+        write_state=$MIND_STATE
+        write_declared_state=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_MODEL" -eq 1 ]; then
+        write_model=$MIND_MODEL
+        write_declared_model=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_EFFORT" -eq 1 ]; then
+        write_effort=$MIND_EFFORT
+        write_declared_effort=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_ROLE" -eq 1 ]; then
+        write_role=$MIND_ROLE
+        write_declared_role=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_CHARGE" -eq 1 ]; then
+        write_charge=$MIND_CHARGE
+        write_declared_charge=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_FOCUS" -eq 1 ]; then
+        write_focus=$MIND_FOCUS
+        write_declared_focus=$write_mind_epoch
+    fi
+    if [ "$MIND_SET_STANCE" -eq 1 ]; then
+        write_stance=$MIND_STANCE
+        write_declared_stance=$write_mind_epoch
+    fi
+
+    write_mind_tmp=$(mktemp "$TMP_DIR/mind.XXXXXX") || return 1
+    if ! {
+        printf 'Generation: %s\n' "$write_mind_generation"
+        printf 'Session: %s\n' "$write_mind_session"
+        printf 'Node: %s\n' "$write_mind_node"
+        printf 'State: %s\n' "$write_state"
+        printf 'Model: %s\n' "$write_model"
+        printf 'Effort: %s\n' "$write_effort"
+        printf 'Role: %s\n' "$write_role"
+        printf 'Charge: %s\n' "$write_charge"
+        printf 'Focus: %s\n' "$write_focus"
+        printf 'Stance: %s\n' "$write_stance"
+        printf 'Declared-State: %s\n' "$write_declared_state"
+        printf 'Declared-Model: %s\n' "$write_declared_model"
+        printf 'Declared-Effort: %s\n' "$write_declared_effort"
+        printf 'Declared-Role: %s\n' "$write_declared_role"
+        printf 'Declared-Charge: %s\n' "$write_declared_charge"
+        printf 'Declared-Focus: %s\n' "$write_declared_focus"
+        printf 'Declared-Stance: %s\n\n' "$write_declared_stance"
+    } > "$write_mind_tmp"; then
+        rm -f "$write_mind_tmp"
+        return 1
+    fi
+    write_mind_destination=$write_mind_dir/$write_mind_generation
+    if ! ln "$write_mind_tmp" "$write_mind_destination" 2>/dev/null; then
+        rm -f "$write_mind_tmp"
+        error "$write_mind_destination: mind generation을 no-clobber 설치하지 못했습니다"
+        return 1
+    fi
+    rm -f "$write_mind_tmp"
+    printf '%s\n' "$write_mind_generation"
+    return 0
+}
+
+quarantine_mind_file() {
+    quarantine_mind_file_path=$1
+    quarantine_mind_node=$2
+    quarantine_mind_session=$3
+    quarantine_mind_generation=$4
+    quarantine_mind_reason=$5
+    quarantine_mind_dir=$KHALA_ROOT/spool/dead
+    if ! mkdir -p "$quarantine_mind_dir"; then
+        error "$quarantine_mind_file_path: mind quarantine 디렉터리를 만들지 못했습니다"
+        return 1
+    fi
+    quarantine_mind_destination=$quarantine_mind_dir/mind.$quarantine_mind_node.$quarantine_mind_session.$quarantine_mind_generation
+    if [ -e "$quarantine_mind_destination" ] && \
+        ! cmp -s "$quarantine_mind_file_path" "$quarantine_mind_destination"; then
+        quarantine_mind_destination=$quarantine_mind_destination.$$.conflict
+    fi
+    if [ -e "$quarantine_mind_destination" ]; then
+        rm -f "$quarantine_mind_file_path" || return 1
+    elif ! mv "$quarantine_mind_file_path" "$quarantine_mind_destination"; then
+        error "$quarantine_mind_file_path: mind generation을 quarantine으로 옮기지 못했습니다"
+        return 1
+    fi
+    error "$quarantine_mind_generation: $quarantine_mind_reason — spool/dead로 격리했습니다"
+    return 0
+}
+
+install_pulled_minds() {
+    install_minds_root=$1
+    install_minds_now=$(date +%s) || return 1
+    install_minds_days=$(retain_days) || return 1
+    install_minds_seconds=$((install_minds_days * 86400))
+    install_minds_failed=0
+    for install_mind_file in "$install_minds_root"/*/*/*; do
+        [ -f "$install_mind_file" ] || continue
+        install_mind_node=$(basename "$(dirname "$(dirname "$install_mind_file")")")
+        install_mind_session=$(basename "$(dirname "$install_mind_file")")
+        install_mind_generation=$(basename "$install_mind_file")
+        if ! valid_name "$install_mind_node" || ! valid_name "$install_mind_session" || \
+            ! valid_generation "$install_mind_generation" || \
+            ! validate_mind_file "$install_mind_file" "$install_mind_node" \
+                "$install_mind_session" "$install_mind_generation"; then
+            quarantine_mind_file "$install_mind_file" "$install_mind_node" \
+                "$install_mind_session" "$install_mind_generation" \
+                "잘못된 pull mind generation" || return 1
+            install_minds_failed=1
+            continue
+        fi
+        install_mind_epoch=$(normalize_integer "${install_mind_generation%%.*}")
+        if [ "$install_mind_epoch" -gt "$((install_minds_now + 86400))" ]; then
+            quarantine_mind_file "$install_mind_file" "$install_mind_node" \
+                "$install_mind_session" "$install_mind_generation" \
+                "하루를 넘는 미래 epoch" || return 1
+            install_minds_failed=1
+            continue
+        fi
+        # Minds are age-governed alongside streams and presence: an expired
+        # generation is not eligible for installation even before local GC.
+        if [ "$((install_mind_epoch + install_minds_seconds))" -lt "$install_minds_now" ]; then
+            rm -f "$install_mind_file" || return 1
+            continue
+        fi
+        install_mind_dir=$KHALA_ROOT/minds/$install_mind_node/$install_mind_session
+        install_mind_destination=$install_mind_dir/$install_mind_generation
+        mkdir -p "$install_mind_dir" || return 1
+        if [ -f "$install_mind_destination" ]; then
+            if ! cmp -s "$install_mind_file" "$install_mind_destination"; then
+                quarantine_mind_file "$install_mind_file" "$install_mind_node" \
+                    "$install_mind_session" "$install_mind_generation" \
+                    "같은 generation의 digest 불일치" || return 1
+                install_minds_failed=1
+            fi
+            continue
+        fi
+        if ! atomic_copy "$install_mind_file" "$install_mind_destination"; then
+            return 1
+        fi
+        if ! cmp -s "$install_mind_file" "$install_mind_destination"; then
+            quarantine_mind_file "$install_mind_file" "$install_mind_node" \
+                "$install_mind_session" "$install_mind_generation" \
+                "설치 경주 중 같은 generation의 digest 불일치" || return 1
+            install_minds_failed=1
+        fi
+    done
+    [ "$install_minds_failed" -eq 0 ]
+}
+
+pull_minds_from_endpoint() {
+    mind_endpoint=$1
+    mind_stage=$(mktemp -d "$TMP_DIR/minds-pull.XXXXXX") || return 1
+    if ! mailbox_rsync "$mind_endpoint" pull "$mind_stage/" minds/ 0; then
+        rm -rf -- "$mind_stage"
+        return 1
+    fi
+    if ! install_pulled_minds "$mind_stage"; then
+        rm -rf -- "$mind_stage"
+        return 1
+    fi
+    rm -rf -- "$mind_stage"
+    return 0
+}
+
+push_owned_minds() {
+    mind_endpoint=$1
+    mind_self=$2
+    mind_shard=$KHALA_ROOT/minds/$mind_self
+    [ -d "$mind_shard" ] || return 0
+    mailbox_rsync "$mind_endpoint" push "$mind_shard/" "minds/$mind_self/" 0 1 1
+}
+
+load_preserve_config() {
+    if [ "$PRESERVE_CONFIG_LOADED" -eq 1 ]; then
+        [ "$PRESERVE_CONFIG_INVALID" -eq 0 ]
+        return
+    fi
+    PRESERVE_CONFIG_LOADED=1
+    PRESERVER_ENABLED=0
+    PRESERVE_CONFIG_INVALID=0
+    PRESERVE_STREAMS=
+    preserve_line_count=0
+    while IFS= read -r preserve_line || [ -n "$preserve_line" ]; do
+        case "$preserve_line" in
+            preserve|preserve[[:space:]]*) ;;
+            *) continue ;;
+        esac
+        preserve_line_count=$((preserve_line_count + 1))
+        case $- in
+            *f*) preserve_restore_glob=0 ;;
+            *) preserve_restore_glob=1; set -f ;;
+        esac
+        set -- $preserve_line
+        [ "$preserve_restore_glob" -eq 0 ] || set +f
+        shift
+        if [ "$#" -eq 0 ]; then
+            error "config의 preserve에 stream이 없습니다"
+            PRESERVE_CONFIG_INVALID=1
+            continue
+        fi
+        for preserve_name in "$@"; do
+            if [ "$preserve_name" != all ] && ! valid_name "$preserve_name"; then
+                error "config의 preserve stream 이름이 잘못되었습니다: $preserve_name"
+                PRESERVE_CONFIG_INVALID=1
+                continue
+            fi
+            case " $PRESERVE_STREAMS " in
+                *" $preserve_name "*) ;;
+                *) PRESERVE_STREAMS="$PRESERVE_STREAMS $preserve_name" ;;
+            esac
+        done
+    done < "$CONFIG"
+    if [ "$preserve_line_count" -gt 1 ]; then
+        error "config에는 preserve 줄을 하나만 둘 수 있습니다"
+        PRESERVE_CONFIG_INVALID=1
+    fi
+    if [ "$preserve_line_count" -eq 1 ] && [ "$PRESERVE_CONFIG_INVALID" -eq 0 ]; then
+        PRESERVER_ENABLED=1
+    fi
+    [ "$PRESERVE_CONFIG_INVALID" -eq 0 ]
+}
+
+preserve_stream_selected() {
+    preserve_wanted=$1
+    [ "$PRESERVER_ENABLED" -eq 1 ] || return 1
+    case " $PRESERVE_STREAMS " in
+        *' all '*) return 0 ;;
+        *" $preserve_wanted "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+file_device() {
+    device_path=$1
+    device_value=$(stat -c %d "$device_path" 2>/dev/null) || device_value=
+    if positive_or_zero_integer "$device_value"; then
+        printf '%s\n' "$device_value"
+        return 0
+    fi
+    device_value=$(stat -f %d "$device_path" 2>/dev/null) || device_value=
+    if positive_or_zero_integer "$device_value"; then
+        printf '%s\n' "$device_value"
+        return 0
+    fi
+    return 1
+}
+
+sync_directory() {
+    sync_dir=$1
+    case "$SYNC_DIR_STYLE" in
+        dash-d) sync -d "$sync_dir" ;;
+        global) sync ;;
+        *)
+            if sync -d "$sync_dir" 2>/dev/null; then
+                SYNC_DIR_STYLE=dash-d
+                return 0
+            fi
+            SYNC_DIR_STYLE=global
+            sync
+            ;;
+    esac
+}
+
+archive_path_for() {
+    archive_stream=$1
+    archive_node=$2
+    archive_id=$3
+    archive_epoch=$(normalize_integer "${archive_id%%.*}")
+    detect_epoch_date_style || return 1
+    case "$EPOCH_DATE_STYLE" in
+        bsd) archive_month=$(date -u -r "$archive_epoch" '+%Y/%m') || return 1 ;;
+        gnu) archive_month=$(date -u -d "@$archive_epoch" '+%Y/%m') || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s/archive/streams/%s/%s/%s/%s\n' \
+        "$KHALA_ROOT" "$archive_stream" "$archive_node" "$archive_month" "$archive_id"
+}
+
+prepare_preserver() {
+    [ "$PRESERVER_ENABLED" -eq 1 ] || return 0
+    PRESERVER_READY=0
+    if ! mkdir -p "$KHALA_ROOT/archive/streams"; then
+        error "preserver degraded: $KHALA_ROOT/archive/streams를 만들지 못했습니다"
+        PRESERVER_DEGRADED=1
+        return 1
+    fi
+    if ! preserve_live_device=$(file_device "$KHALA_ROOT/streams") || \
+        ! preserve_archive_device=$(file_device "$KHALA_ROOT/archive/streams"); then
+        error "preserver degraded: live/archive filesystem을 확인하지 못했습니다"
+        PRESERVER_DEGRADED=1
+        return 1
+    fi
+    if [ "$preserve_live_device" != "$preserve_archive_device" ]; then
+        error "preserver degraded: live와 archive가 다른 filesystem입니다; cross-FS는 v1 범위 밖입니다"
+        PRESERVER_DEGRADED=1
+        return 1
+    fi
+    PRESERVER_READY=1
+    return 0
+}
+
+quarantine_preserver_conflict() {
+    preserve_conflict_file=$1
+    preserve_conflict_stream=$2
+    preserve_conflict_node=$3
+    preserve_conflict_id=$4
+    preserve_conflict_dir=$KHALA_ROOT/spool/dead
+    # AMBIGUOUS: Which immutable side should move on a live/archive digest
+    # conflict? Keep both paths fail-closed and quarantine a live-byte copy.
+    preserve_conflict_destination=$preserve_conflict_dir/preserver.$preserve_conflict_stream.$preserve_conflict_node.$preserve_conflict_id
+    if ! mkdir -p "$preserve_conflict_dir"; then
+        error "preserver degraded: conflict quarantine 디렉터리를 만들지 못했습니다"
+        return 1
+    fi
+    if [ -e "$preserve_conflict_destination" ]; then
+        cmp -s "$preserve_conflict_file" "$preserve_conflict_destination" || {
+            preserve_conflict_destination=$preserve_conflict_destination.$$.conflict
+            atomic_copy "$preserve_conflict_file" "$preserve_conflict_destination" || return 1
+        }
+    elif ! atomic_copy "$preserve_conflict_file" "$preserve_conflict_destination"; then
+        return 1
+    fi
+    error "preserver degraded: $preserve_conflict_id live/archive digest 불일치 — live를 보존하고 conflict를 격리했습니다"
+    return 0
+}
+
+archive_stream_file() {
+    archive_live=$1
+    archive_stream_name=$2
+    archive_node_name=$3
+    archive_stream_id=$4
+    archive_destination=$(archive_path_for "$archive_stream_name" "$archive_node_name" \
+        "$archive_stream_id") || return 1
+    archive_destination_dir=$(dirname "$archive_destination")
+    if ! mkdir -p "$archive_destination_dir"; then
+        error "preserver degraded: $archive_destination_dir를 만들지 못했습니다"
+        return 1
+    fi
+    if [ -e "$archive_destination" ]; then
+        if ! cmp -s "$archive_live" "$archive_destination"; then
+            quarantine_preserver_conflict "$archive_live" "$archive_stream_name" \
+                "$archive_node_name" "$archive_stream_id" || :
+            return 1
+        fi
+    elif ! ln "$archive_live" "$archive_destination" 2>/dev/null; then
+        if [ -e "$archive_destination" ]; then
+            if ! cmp -s "$archive_live" "$archive_destination"; then
+                quarantine_preserver_conflict "$archive_live" "$archive_stream_name" \
+                    "$archive_node_name" "$archive_stream_id" || :
+                return 1
+            fi
+        else
+            error "preserver degraded: $archive_stream_id archive hardlink 정착에 실패했습니다"
+            return 1
+        fi
+    fi
+    if ! sync_directory "$archive_destination_dir"; then
+        error "preserver degraded: $archive_destination_dir directory sync에 실패했습니다"
+        return 1
+    fi
+    return 0
+}
+
+capture_preserved_streams() {
+    [ "$PRESERVER_ENABLED" -eq 1 ] || return 0
+    prepare_preserver || return 1
+    capture_failed=0
+    capture_now=$(date +%s) || return 1
+    for capture_file in "$KHALA_ROOT"/streams/*/*/*; do
+        [ -f "$capture_file" ] || continue
+        capture_node=$(basename "$(dirname "$capture_file")")
+        capture_stream=$(basename "$(dirname "$(dirname "$capture_file")")")
+        capture_id=$(basename "$capture_file")
+        preserve_stream_selected "$capture_stream" || continue
+        if ! valid_name "$capture_stream" || ! valid_name "$capture_node" || \
+            ! validate_stream_file "$capture_file" "$capture_stream" "$capture_node"; then
+            quarantine_stream_file "$capture_file" "$capture_stream" "$capture_node" \
+                "$capture_id" "잘못된 preserve 대상 stream 항목" || capture_failed=1
+            continue
+        fi
+        capture_epoch=$(normalize_integer "${capture_id%%.*}")
+        if [ "$capture_epoch" -gt "$((capture_now + 86400))" ]; then
+            quarantine_stream_file "$capture_file" "$capture_stream" "$capture_node" \
+                "$capture_id" "하루를 넘는 미래 epoch" || capture_failed=1
+            continue
+        fi
+        if ! archive_stream_file "$capture_file" "$capture_stream" "$capture_node" "$capture_id"; then
+            capture_failed=1
+            PRESERVER_DEGRADED=1
+        fi
+    done
+    [ "$capture_failed" -eq 0 ]
+}
+
 validate_stream_file() {
     stream_file=$1
     stream_expected=$2
@@ -522,6 +1079,79 @@ collect_stream_entries() {
         return 1
     fi
     rm -f "$collect_unsorted"
+    return 0
+}
+
+collect_cat_stream_entries() {
+    cat_collect_stream=$1
+    cat_collect_output=$2
+    cat_collect_unsorted=$(mktemp "$TMP_DIR/stream-cat-list.XXXXXX") || return 1
+    cat_collect_sorted=$(mktemp "$TMP_DIR/stream-cat-sorted.XXXXXX") || {
+        rm -f "$cat_collect_unsorted"
+        return 1
+    }
+    : > "$cat_collect_unsorted" || {
+        rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+        return 1
+    }
+    for cat_collect_file in "$KHALA_ROOT/streams/$cat_collect_stream"/*/* \
+        "$KHALA_ROOT/archive/streams/$cat_collect_stream"/*/*/*/*; do
+        [ -f "$cat_collect_file" ] || continue
+        cat_collect_id=$(basename "$cat_collect_file")
+        cat_collect_epoch=${cat_collect_id%%.*}
+        case "$cat_collect_file" in
+            "$KHALA_ROOT"/streams/*)
+                cat_collect_node=$(basename "$(dirname "$cat_collect_file")")
+                ;;
+            "$KHALA_ROOT"/archive/streams/*)
+                cat_collect_node=$(basename "$(dirname "$(dirname "$(dirname "$cat_collect_file")")")")
+                ;;
+            *) continue ;;
+        esac
+        if ! positive_or_zero_integer "$cat_collect_epoch" || \
+            ! valid_name "$cat_collect_node" || \
+            ! validate_stream_file "$cat_collect_file" "$cat_collect_stream" "$cat_collect_node"; then
+            error "$cat_collect_file: 잘못된 live/archive stream 항목"
+            rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+            return 1
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$cat_collect_epoch" "$cat_collect_id" \
+            "$cat_collect_node" "$cat_collect_file" >> "$cat_collect_unsorted" || {
+            rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+            return 1
+        }
+    done
+    if ! sort -k1,1n -k2,2 -k3,3 "$cat_collect_unsorted" > "$cat_collect_sorted"; then
+        rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+        return 1
+    fi
+    : > "$cat_collect_output" || {
+        rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+        return 1
+    }
+    cat_collect_previous_key=
+    cat_collect_previous_path=
+    while IFS="$TAB" read -r cat_collect_epoch cat_collect_id cat_collect_node cat_collect_path; do
+        [ -n "${cat_collect_epoch-}" ] || continue
+        cat_collect_key=$cat_collect_node/$cat_collect_id
+        if [ "$cat_collect_key" = "$cat_collect_previous_key" ]; then
+            if ! cmp -s "$cat_collect_previous_path" "$cat_collect_path"; then
+                error "preserver degraded: $cat_collect_stream/$cat_collect_key live/archive digest 불일치"
+                : > "$cat_collect_output"
+                rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+                return 1
+            fi
+            continue
+        fi
+        printf '%s\t%s\t%s\n' "$cat_collect_epoch" "$cat_collect_id" \
+            "$cat_collect_path" >> "$cat_collect_output" || {
+            rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
+            return 1
+        }
+        cat_collect_previous_key=$cat_collect_key
+        cat_collect_previous_path=$cat_collect_path
+    done < "$cat_collect_sorted"
+    rm -f "$cat_collect_unsorted" "$cat_collect_sorted"
     return 0
 }
 
@@ -942,6 +1572,12 @@ exchange_with_endpoint() {
     if ! push_owned_streams "$exchange_endpoint" "$exchange_self"; then
         return 1
     fi
+    if ! pull_minds_from_endpoint "$exchange_endpoint"; then
+        return 1
+    fi
+    if ! push_owned_minds "$exchange_endpoint" "$exchange_self"; then
+        return 1
+    fi
 
     # Watching-marker deletion is intentionally not propagated: remote copies
     # become stale under the display-side freshness rule.
@@ -1332,10 +1968,93 @@ prune_stream_entries() {
             continue
         fi
         if [ "$((prune_stream_epoch + prune_stream_seconds))" -lt "$prune_stream_now" ]; then
+            if [ "$PRESERVE_CONFIG_INVALID" -eq 1 ]; then
+                PRESERVER_DEGRADED=1
+                sync_error "preserver degraded: preserve config 오류 때문에 만료 stream을 보존합니다"
+                continue
+            fi
+            if preserve_stream_selected "$prune_stream_name"; then
+                if [ "$PRESERVER_READY" -ne 1 ]; then
+                    PRESERVER_DEGRADED=1
+                    sync_error "preserver degraded: archive 기질이 준비되지 않아 $prune_stream_id live를 지우지 않습니다"
+                    continue
+                fi
+                if ! archive_stream_file "$prune_stream_file" "$prune_stream_name" \
+                    "$prune_stream_node" "$prune_stream_id"; then
+                    PRESERVER_DEGRADED=1
+                    sync_error "preserver degraded: $prune_stream_id 미정착 — live를 지우지 않습니다"
+                    continue
+                fi
+            fi
             if ! rm -f "$prune_stream_file"; then
                 sync_error "$prune_stream_file: retention 지난 stream 항목을 지우지 못했습니다"
             fi
         fi
+    done
+}
+
+prune_mind_generations() {
+    prune_mind_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    prune_mind_days=$(retain_days) || {
+        sync_error "mind retention 설정을 읽지 못했습니다"
+        return
+    }
+    prune_mind_seconds=$((prune_mind_days * 86400))
+    for prune_mind_session_dir in "$KHALA_ROOT"/minds/*/*; do
+        [ -d "$prune_mind_session_dir" ] || continue
+        prune_mind_node=$(basename "$(dirname "$prune_mind_session_dir")")
+        prune_mind_session=$(basename "$prune_mind_session_dir")
+        for prune_mind_file in "$prune_mind_session_dir"/*; do
+            [ -f "$prune_mind_file" ] || continue
+            prune_mind_generation=$(basename "$prune_mind_file")
+            if ! validate_mind_file "$prune_mind_file" "$prune_mind_node" \
+                "$prune_mind_session" "$prune_mind_generation"; then
+                quarantine_mind_file "$prune_mind_file" "$prune_mind_node" \
+                    "$prune_mind_session" "$prune_mind_generation" \
+                    "잘못된 mind generation" || \
+                    sync_error "$prune_mind_file: mind quarantine에 실패했습니다"
+                continue
+            fi
+            prune_mind_epoch=$(normalize_integer "${prune_mind_generation%%.*}")
+            if [ "$prune_mind_epoch" -gt "$((prune_mind_now + 86400))" ]; then
+                quarantine_mind_file "$prune_mind_file" "$prune_mind_node" \
+                    "$prune_mind_session" "$prune_mind_generation" \
+                    "하루를 넘는 미래 epoch" || \
+                    sync_error "$prune_mind_file: 미래 mind quarantine에 실패했습니다"
+            fi
+        done
+        if ! prune_mind_current=$(current_mind_generation "$prune_mind_node" \
+            "$prune_mind_session"); then
+            sync_error "$prune_mind_session_dir: 현재 mind generation을 정하지 못했습니다"
+            continue
+        fi
+        [ -n "$prune_mind_current" ] || {
+            rmdir "$prune_mind_session_dir" 2>/dev/null || :
+            continue
+        }
+        for prune_mind_file in "$prune_mind_session_dir"/*; do
+            [ -f "$prune_mind_file" ] || continue
+            if [ "$prune_mind_file" != "$prune_mind_current" ]; then
+                if ! rm -f "$prune_mind_file"; then
+                    sync_error "$prune_mind_file: 낮은 mind generation을 GC하지 못했습니다"
+                fi
+            fi
+        done
+        prune_mind_generation=$(basename "$prune_mind_current")
+        prune_mind_epoch=$(normalize_integer "${prune_mind_generation%%.*}")
+        if [ "$((prune_mind_epoch + prune_mind_seconds))" -lt "$prune_mind_now" ]; then
+            if ! rm -f "$prune_mind_current"; then
+                sync_error "$prune_mind_current: retention 지난 최대 mind generation을 지우지 못했습니다"
+            fi
+        fi
+        rmdir "$prune_mind_session_dir" 2>/dev/null || :
+    done
+    for prune_mind_node_dir in "$KHALA_ROOT"/minds/*; do
+        [ -d "$prune_mind_node_dir" ] || continue
+        rmdir "$prune_mind_node_dir" 2>/dev/null || :
     done
 }
 
@@ -1430,7 +2149,13 @@ reconcile_cycle() {
         fi
         expire_outbox "$reconcile_self"
         prune_delivered_log
+        if ! load_preserve_config; then
+            sync_error "preserver degraded: preserve config를 읽지 못했습니다"
+        elif ! capture_preserved_streams; then
+            sync_error "preserver degraded: 하나 이상의 live stream을 정착시키지 못했습니다"
+        fi
         prune_stream_entries
+        prune_mind_generations
         prune_presence
         prune_session_stream_state "$reconcile_self"
     fi
@@ -1511,6 +2236,7 @@ cmd_init() {
         "$KHALA_ROOT/inbox" \
         "$KHALA_ROOT/presence" \
         "$KHALA_ROOT/streams" \
+        "$KHALA_ROOT/minds" \
         "$KHALA_ROOT/join" \
         "$KHALA_ROOT/cursor" \
         "$KHALA_ROOT/log" \
@@ -1871,6 +2597,292 @@ cmd_leave() {
     return 0
 }
 
+cmd_mind() {
+    require_config || return 1
+    mind_clear=0
+    mind_focus=
+    mind_focus_set=0
+    mind_stance=
+    mind_stance_set=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -m)
+                [ "$#" -ge 2 ] || { error "-m 값이 없습니다"; return 1; }
+                mind_focus=$2
+                mind_focus_set=1
+                shift 2
+                ;;
+            --stance)
+                [ "$#" -ge 2 ] || { error "--stance 값이 없습니다"; return 1; }
+                mind_stance=$2
+                mind_stance_set=1
+                shift 2
+                ;;
+            --clear)
+                mind_clear=1
+                shift
+                ;;
+            *) error "알 수 없는 mind 옵션: $1"; return 1 ;;
+        esac
+    done
+    if [ "$mind_clear" -eq 1 ]; then
+        if [ "$mind_focus_set" -eq 1 ] || [ "$mind_stance_set" -eq 1 ]; then
+            error "mind --clear는 -m/--stance와 함께 쓸 수 없습니다"
+            return 1
+        fi
+    elif [ "$mind_focus_set" -ne 1 ]; then
+        error "mind에는 -m focus 또는 --clear가 필요합니다"
+        return 1
+    fi
+    if [ "$mind_focus_set" -eq 1 ] && [ -z "$mind_focus" ]; then
+        error "mind focus는 빈 줄일 수 없습니다; 철회하려면 --clear를 쓰세요"
+        return 1
+    fi
+    if [ "$mind_stance_set" -eq 1 ] && [ -z "$mind_stance" ]; then
+        error "mind stance는 빈 줄일 수 없습니다"
+        return 1
+    fi
+    if ! valid_mind_value "$mind_focus" || ! valid_mind_value "$mind_stance"; then
+        error "mind 필드는 한 줄이어야 합니다"
+        return 1
+    fi
+    mind_session=$(session_name "" 0) || return 1
+    mind_node=$(self_node) || return 1
+    mind_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$mind_lock" 300 mind; then
+        error "mind용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    reset_mind_update
+    if [ "$mind_clear" -eq 1 ]; then
+        MIND_SET_STATE=1
+        MIND_STATE=cleared
+        MIND_SET_FOCUS=1
+        MIND_FOCUS=
+        MIND_SET_STANCE=1
+        MIND_STANCE=
+    else
+        MIND_SET_STATE=1
+        MIND_STATE=active
+        MIND_SET_FOCUS=1
+        MIND_FOCUS=$mind_focus
+        if [ "$mind_stance_set" -eq 1 ]; then
+            MIND_SET_STANCE=1
+            MIND_STANCE=$mind_stance
+        fi
+    fi
+    mind_generation=$(write_mind_generation "$mind_session" "$mind_node")
+    mind_status=$?
+    if ! release_lock "$mind_lock"; then
+        error "mind용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    [ "$mind_status" -eq 0 ] || return 1
+    printf '%s\n' "$mind_generation"
+    return 0
+}
+
+cmd_profile() {
+    require_config || return 1
+    reset_mind_update
+    profile_changed=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --model)
+                [ "$#" -ge 2 ] || { error "--model 값이 없습니다"; return 1; }
+                MIND_SET_MODEL=1
+                MIND_MODEL=$2
+                profile_changed=1
+                shift 2
+                ;;
+            --effort)
+                [ "$#" -ge 2 ] || { error "--effort 값이 없습니다"; return 1; }
+                MIND_SET_EFFORT=1
+                MIND_EFFORT=$2
+                profile_changed=1
+                shift 2
+                ;;
+            --role)
+                [ "$#" -ge 2 ] || { error "--role 값이 없습니다"; return 1; }
+                MIND_SET_ROLE=1
+                MIND_ROLE=$2
+                profile_changed=1
+                shift 2
+                ;;
+            --charge)
+                [ "$#" -ge 2 ] || { error "--charge 값이 없습니다"; return 1; }
+                MIND_SET_CHARGE=1
+                MIND_CHARGE=$2
+                profile_changed=1
+                shift 2
+                ;;
+            *) error "알 수 없는 profile 옵션: $1"; return 1 ;;
+        esac
+    done
+    [ "$profile_changed" -eq 1 ] || {
+        error "profile에는 --model/--effort/--role/--charge 중 하나가 필요합니다"
+        return 1
+    }
+    for profile_value in "$MIND_MODEL" "$MIND_EFFORT" "$MIND_ROLE" "$MIND_CHARGE"; do
+        if ! valid_mind_value "$profile_value"; then
+            error "profile 필드는 한 줄이어야 합니다"
+            return 1
+        fi
+    done
+    profile_session=$(session_name "" 0) || return 1
+    profile_node=$(self_node) || return 1
+    profile_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$profile_lock" 300 profile; then
+        error "profile용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    profile_generation=$(write_mind_generation "$profile_session" "$profile_node")
+    profile_status=$?
+    if ! release_lock "$profile_lock"; then
+        error "profile용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    [ "$profile_status" -eq 0 ] || return 1
+    printf '%s\n' "$profile_generation"
+    return 0
+}
+
+relative_age() {
+    relative_declared=$1
+    relative_now=$2
+    if ! positive_or_zero_integer "$relative_declared" || [ "$relative_declared" -eq 0 ]; then
+        printf '%s\n' '-'
+        return 0
+    fi
+    if [ "$relative_declared" -gt "$relative_now" ]; then
+        relative_seconds=0
+    else
+        relative_seconds=$((relative_now - relative_declared))
+    fi
+    if [ "$relative_seconds" -lt 60 ]; then
+        printf '%ss\n' "$relative_seconds"
+    elif [ "$relative_seconds" -lt 3600 ]; then
+        printf '%sm\n' "$((relative_seconds / 60))"
+    elif [ "$relative_seconds" -lt 86400 ]; then
+        printf '%sh\n' "$((relative_seconds / 3600))"
+    else
+        printf '%sd\n' "$((relative_seconds / 86400))"
+    fi
+}
+
+cmd_minds() {
+    require_config || return 1
+    [ "$#" -eq 0 ] || { usage; return 1; }
+    minds_self=$(self_node) || return 1
+    minds_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
+    [ -n "$minds_ttl" ] || minds_ttl=120
+    positive_integer "$minds_ttl" || { error "config의 ttl이 양의 정수가 아닙니다"; return 1; }
+    minds_ttl=$(normalize_integer "$minds_ttl")
+    minds_now=$(date +%s) || return 1
+    minds_addresses=$(mktemp "$TMP_DIR/minds-addresses.XXXXXX") || return 1
+    minds_sorted=$(mktemp "$TMP_DIR/minds-sorted.XXXXXX") || {
+        rm -f "$minds_addresses"
+        return 1
+    }
+    : > "$minds_addresses"
+    for minds_presence in "$KHALA_ROOT"/presence/*; do
+        [ -f "$minds_presence" ] || continue
+        minds_address=$(basename "$minds_presence")
+        case "$minds_address" in
+            *.watching) minds_address=${minds_address%.watching} ;;
+        esac
+        valid_address "$minds_address" && printf '%s\n' "$minds_address" >> "$minds_addresses"
+    done
+    for minds_session_dir in "$KHALA_ROOT"/minds/*/*; do
+        [ -d "$minds_session_dir" ] || continue
+        minds_node=$(basename "$(dirname "$minds_session_dir")")
+        minds_session=$(basename "$minds_session_dir")
+        if valid_name "$minds_node" && valid_name "$minds_session"; then
+            printf '%s@%s\n' "$minds_session" "$minds_node" >> "$minds_addresses"
+        fi
+    done
+    sort -u "$minds_addresses" > "$minds_sorted"
+    printf 'ADDRESS\tSTATE\tWATCHING\tMODEL\tMODEL_AGE\tEFFORT\tEFFORT_AGE\tROLE\tROLE_AGE\tCHARGE\tCHARGE_AGE\tFOCUS\tFOCUS_AGE\tSTANCE\tSTANCE_AGE\tFRESHNESS\n'
+    while IFS= read -r minds_address; do
+        [ -n "$minds_address" ] || continue
+        minds_session=${minds_address%@*}
+        minds_node=${minds_address#*@}
+        minds_presence=$KHALA_ROOT/presence/$minds_address
+        minds_presence_state=unknown
+        minds_watching=$(watching_status "$minds_presence.watching" "$minds_now" "$minds_ttl")
+        minds_retired=0
+        if [ -f "$minds_presence" ]; then
+            IFS=' ' read -r minds_first minds_second minds_extra < "$minds_presence"
+            if [ "$minds_first" = retired ]; then
+                minds_retired=1
+            elif positive_or_zero_integer "$minds_first" && [ -z "${minds_second-}" ] && \
+                [ -z "${minds_extra-}" ]; then
+                minds_presence_epoch=$(normalize_integer "$minds_first")
+                if [ "$((minds_now - minds_presence_epoch))" -le "$minds_ttl" ]; then
+                    if [ "$minds_node" = "$minds_self" ]; then
+                        minds_presence_state=alive-here
+                    else
+                        minds_presence_state=alive-elsewhere
+                    fi
+                else
+                    minds_presence_state=asleep
+                fi
+            else
+                error "$minds_presence: 잘못된 heartbeat"
+                rm -f "$minds_addresses" "$minds_sorted"
+                return 1
+            fi
+        fi
+        [ "$minds_retired" -eq 0 ] || continue
+        minds_current=$(current_mind_generation "$minds_node" "$minds_session") || {
+            rm -f "$minds_addresses" "$minds_sorted"
+            return 1
+        }
+        minds_model=-; minds_effort=-; minds_role=-; minds_charge=-
+        minds_focus=-; minds_stance=-
+        minds_model_age=-; minds_effort_age=-; minds_role_age=-; minds_charge_age=-
+        minds_focus_age=-; minds_stance_age=-; minds_freshness=-
+        if [ -n "$minds_current" ]; then
+            minds_model=$(header_value Model "$minds_current"); [ -n "$minds_model" ] || minds_model=-
+            minds_effort=$(header_value Effort "$minds_current"); [ -n "$minds_effort" ] || minds_effort=-
+            minds_role=$(header_value Role "$minds_current"); [ -n "$minds_role" ] || minds_role=-
+            minds_charge=$(header_value Charge "$minds_current"); [ -n "$minds_charge" ] || minds_charge=-
+            minds_model_declared=$(header_value Declared-Model "$minds_current")
+            minds_effort_declared=$(header_value Declared-Effort "$minds_current")
+            minds_role_declared=$(header_value Declared-Role "$minds_current")
+            minds_charge_declared=$(header_value Declared-Charge "$minds_current")
+            minds_model_age=$(relative_age "$minds_model_declared" "$minds_now")
+            minds_effort_age=$(relative_age "$minds_effort_declared" "$minds_now")
+            minds_role_age=$(relative_age "$minds_role_declared" "$minds_now")
+            minds_charge_age=$(relative_age "$minds_charge_declared" "$minds_now")
+            if [ "$(header_value State "$minds_current")" = active ]; then
+                minds_focus=$(header_value Focus "$minds_current"); [ -n "$minds_focus" ] || minds_focus=-
+                minds_stance=$(header_value Stance "$minds_current"); [ -n "$minds_stance" ] || minds_stance=-
+                minds_focus_declared=$(header_value Declared-Focus "$minds_current")
+                minds_stance_declared=$(header_value Declared-Stance "$minds_current")
+                minds_focus_age=$(relative_age "$minds_focus_declared" "$minds_now")
+                minds_stance_age=$(relative_age "$minds_stance_declared" "$minds_now")
+                if [ "$minds_focus_declared" -gt 0 ] && \
+                    [ "$((minds_now - minds_focus_declared))" -gt "$MIND_FRESH_SECONDS" ]; then
+                    minds_freshness=stale
+                elif [ "$minds_focus_declared" -gt 0 ]; then
+                    minds_freshness=fresh
+                fi
+            else
+                minds_freshness=cleared
+            fi
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$minds_address" "$minds_presence_state" "$minds_watching" \
+            "$minds_model" "$minds_model_age" "$minds_effort" "$minds_effort_age" \
+            "$minds_role" "$minds_role_age" "$minds_charge" "$minds_charge_age" \
+            "$minds_focus" "$minds_focus_age" "$minds_stance" "$minds_stance_age" \
+            "$minds_freshness"
+    done < "$minds_sorted"
+    rm -f "$minds_addresses" "$minds_sorted"
+    return 0
+}
+
 cmd_retire() {
     require_config || return 1
     [ "$#" -eq 1 ] || { usage; return 1; }
@@ -1906,6 +2918,16 @@ cmd_retire() {
     retire_status=0
     atomic_line "$KHALA_ROOT/presence/$retire_session@$retire_self" \
         "retired $retire_now" heartbeat || retire_status=1
+    reset_mind_update
+    MIND_SET_STATE=1
+    MIND_STATE=cleared
+    MIND_SET_FOCUS=1
+    MIND_FOCUS=
+    MIND_SET_STANCE=1
+    MIND_STANCE=
+    if ! write_mind_generation "$retire_session" "$retire_self" >/dev/null; then
+        retire_status=1
+    fi
     if ! release_lock "$retire_lock"; then
         error "retire용 brain lock을 해제하지 못했습니다"
         return 1
@@ -1995,7 +3017,7 @@ cmd_stream() {
         rm -f "$cat_list"
         return 1
     }
-    if ! collect_stream_entries "$cat_stream" "$cat_list" || \
+    if ! collect_cat_stream_entries "$cat_stream" "$cat_list" || \
         ! tail -n "$cat_n" "$cat_list" > "$cat_selected"; then
         rm -f "$cat_list" "$cat_selected"
         return 1
@@ -2535,6 +3557,9 @@ case "$command_name" in
     leave) cmd_leave "$@" ;;
     streams) cmd_streams "$@" ;;
     stream) cmd_stream "$@" ;;
+    mind) cmd_mind "$@" ;;
+    profile) cmd_profile "$@" ;;
+    minds) cmd_minds "$@" ;;
     retire) cmd_retire "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     sync) cmd_sync "$@" ;;
