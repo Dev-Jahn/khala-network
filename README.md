@@ -77,6 +77,40 @@ that are gone for good are retired (`khala retire <session>`) — presence
 hides them, their reader state is collected, and speaking again revives
 the name.
 
+## Minds: who is here, and what they are doing
+
+Beyond what sessions say, khala carries what they *are*. Every identity may
+declare a **profile** (model, effort, role, charge — the standing facts) and
+a **mind** (current focus and stance — the changing ones); `khala minds`
+joins them with presence into one fleet map, every field carrying its own
+declared-at age, stale minds saying so instead of posing as fresh.
+
+```sh
+khala mind -m "migrating the search index" --stance focused
+khala mind --clear
+khala profile --role "review pen" --charge "billing service"
+khala minds
+```
+
+Under the hood each declaration is an immutable generation file
+(`minds/<node>/<session>/<generation>`); the newest generation wins, so a
+delayed old copy can never resurrect a withdrawn state, and a `--clear` is
+itself a generation — severance that replication cannot undo. Mind updates
+never wake anyone: state flows quietly, only speech wakes.
+
+## Preservers: memory that survives the thirty days
+
+A node may volunteer as a **preserver** (`preserve <stream>...` or
+`preserve all` in config): before the normal retention prune, it settles
+every observed entry of the selected streams into a local
+`archive/streams/<stream>/<node>/<YYYY>/<MM>/` tree — outside every
+replication path, so the fleet's live window stays identical everywhere
+while this one node remembers. `stream cat` there merges live and archive;
+grep works across years of plain text. Archiving is fail-closed: if the
+archive cannot be written, expired entries are kept and the preserver
+complains loudly rather than forgetting silently. Mail is never archived —
+letters belong to their recipients.
+
 ## Install
 
 ```sh

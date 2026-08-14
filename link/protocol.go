@@ -26,8 +26,9 @@ const (
 const (
 	protocolMagic  = "KHALA1"
 	protocolMajor  = uint64(1)
-	protocolMinor  = uint64(1)
+	protocolMinor  = uint64(2)
 	streamMinor    = uint64(1)
+	mindMinor      = uint64(2)
 	maxControlSize = 64 << 10
 )
 
@@ -195,6 +196,7 @@ type offer struct {
 	Class    string
 	Stream   string
 	Node     string
+	Session  string
 	Basename string
 	Size     uint64
 	Digest   [sha256.Size]byte
@@ -208,6 +210,9 @@ func offerFrame(o offer) frame {
 		e.str(o.Stream)
 	}
 	e.str(o.Node)
+	if o.Class == "mind" {
+		e.str(o.Session)
+	}
 	e.str(o.Basename)
 	e.u64(o.Size)
 	e.str(hex.EncodeToString(o.Digest[:]))
@@ -233,6 +238,11 @@ func decodeOffer(f frame) (offer, error) {
 	if o.Node, err = d.str(); err != nil {
 		return o, err
 	}
+	if o.Class == "mind" {
+		if o.Session, err = d.str(); err != nil {
+			return o, err
+		}
+	}
 	if o.Basename, err = d.str(); err != nil {
 		return o, err
 	}
@@ -250,7 +260,7 @@ func decodeOffer(f frame) (offer, error) {
 	if err := d.done(); err != nil {
 		return o, err
 	}
-	if o.ID != transferID(o.Class, o.Stream, o.Node, o.Basename, o.Digest) {
+	if o.ID != transferID(o.Class, o.Stream, o.Node, o.Session, o.Basename, o.Digest) {
 		return o, errors.New("OFFER transfer id does not match its object identity")
 	}
 	return o, nil
@@ -341,7 +351,7 @@ func decodeError(f frame) (protocolError, error) {
 	return p, d.done()
 }
 
-func transferID(class, stream, node, basename string, digest [sha256.Size]byte) string {
+func transferID(class, stream, node, session, basename string, digest [sha256.Size]byte) string {
 	h := sha256.New()
 	_, _ = io.WriteString(h, class)
 	_, _ = io.WriteString(h, "\x00")
@@ -355,6 +365,13 @@ func transferID(class, stream, node, basename string, digest [sha256.Size]byte) 
 	}
 	_, _ = io.WriteString(h, node)
 	_, _ = io.WriteString(h, "\x00")
+	// Session is part of a mind generation's path identity. Binding it makes
+	// transfer ID imply both the installed bytes and their quarantine/path
+	// judgment, while omitting it for legacy classes preserves every 1.1 byte.
+	if class == "mind" {
+		_, _ = io.WriteString(h, session)
+		_, _ = io.WriteString(h, "\x00")
+	}
 	_, _ = io.WriteString(h, basename)
 	_, _ = h.Write(digest[:])
 	return hex.EncodeToString(h.Sum(nil))

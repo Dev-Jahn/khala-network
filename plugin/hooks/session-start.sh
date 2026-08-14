@@ -6,6 +6,8 @@ set -u
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
 . "$HOOK_DIR/lib.sh"
 
+khala_start_input=$(cat 2>/dev/null) || khala_start_input=
+
 khala_ensure_cli "$HOOK_DIR/.."
 
 if ! khala_discover; then
@@ -23,6 +25,17 @@ fi
 
 if ! "$KHALA_BIN" reconcile; then
     printf '%s\n' 'khala: 로컬 reconcile 실패 — 상세는 위 오류를 확인하세요' >&2
+fi
+
+# SessionStart input carries the selected model, but no effort field. Declare
+# only facts supplied by the harness; effort remains an explicit self-report.
+khala_start_model=$(printf '%s\n' "$khala_start_input" | tr '\n' ' ' | \
+    sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
+if [ -n "$khala_start_model" ]; then
+    if ! KHALA_SESSION="$KHALA_RESOLVED_SESSION" \
+        "$KHALA_BIN" profile --model "$khala_start_model" >/dev/null; then
+        printf '%s\n' 'khala: SessionStart model profile 선언 실패 — 상세는 위 오류를 확인하세요' >&2
+    fi
 fi
 
 khala_commons_state=$KHALA_ROOT/join/$KHALA_RESOLVED_SESSION/khala

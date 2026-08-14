@@ -70,6 +70,9 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	if p.minor < streamMinor {
 		logger.Printf("negotiated protocol %d.%d; stream offers disabled", protocolMajor, p.minor)
 	}
+	if p.minor < mindMinor {
+		logger.Printf("negotiated protocol %d.%d; mind offers disabled", protocolMajor, p.minor)
+	}
 	if role == "dial" && expectedPeer != "" && remote.Node != expectedPeer {
 		p.fatal("PEER_MISMATCH", fmt.Sprintf("expected peer %q, got %q", expectedPeer, remote.Node))
 		return remote, fmt.Errorf("peer mismatch")
@@ -218,6 +221,14 @@ func (p *pump) readLoop(ctx context.Context) error {
 				}
 				continue
 			}
+			if o.Class == "mind" && p.minor < mindMinor {
+				text := fmt.Sprintf("mind OFFER requires protocol minor %d", mindMinor)
+				p.logger.Printf("refused unnegotiated OFFER: %s", text)
+				if err := p.writer.write(errorFrame("UNNEGOTIATED_CLASS", true, text)); err != nil {
+					return err
+				}
+				continue
+			}
 			if o.Size > uint64(p.maxObject) {
 				text := fmt.Sprintf("%s is %d bytes; max-object-bytes is %d", o.Basename, o.Size, p.maxObject)
 				p.logger.Printf("refused oversized OFFER: %s", text)
@@ -234,10 +245,10 @@ func (p *pump) readLoop(ctx context.Context) error {
 				}
 				continue
 			}
-			if o.Class == "stream" {
-				expired, err := streamExpiredAt(o.Basename, p.retainDays, 1, time.Now())
+			if o.Class == "stream" || o.Class == "mind" {
+				expired, err := offerExpiredAt(o.Class, o.Basename, p.retainDays, 1, time.Now())
 				if err != nil {
-					text := fmt.Sprintf("invalid stream epoch %s: %v", o.Basename, err)
+					text := fmt.Sprintf("invalid %s epoch %s: %v", o.Class, o.Basename, err)
 					p.logger.Printf("%s", text)
 					if err := p.writer.write(errorFrame("INVALID_OFFER", true, text)); err != nil {
 						return err
@@ -245,9 +256,9 @@ func (p *pump) readLoop(ctx context.Context) error {
 					continue
 				}
 				if expired {
-					text := fmt.Sprintf("expired stream skipped without install or quarantine: %s", o.Basename)
+					code, text := expiredOfferError(o.Class, o.Basename)
 					p.logger.Printf("%s", text)
-					if err := p.writer.write(errorFrame("STREAM_EXPIRED", true, text)); err != nil {
+					if err := p.writer.write(errorFrame(code, true, text)); err != nil {
 						return err
 					}
 					continue
@@ -265,8 +276,10 @@ func (p *pump) readLoop(ctx context.Context) error {
 				if err := p.writer.write(idFrame(frameStored, o.ID)); err != nil {
 					return err
 				}
-				if err := p.touchFresh(); err != nil {
-					p.logger.Printf("touch link.fresh after STORED failed: %v", err)
+				if o.Class != "mind" {
+					if err := p.touchFresh(); err != nil {
+						p.logger.Printf("touch link.fresh after STORED failed: %v", err)
+					}
 				}
 				continue
 			}
@@ -363,8 +376,8 @@ func (p *pump) installIncoming(ins *installer, o offer, data []byte, active *ato
 	result, path, installErr := ins.receive(o, data)
 	if result == expiredSkipped && installErr == nil {
 		active.Store(false)
-		text := fmt.Sprintf("expired stream skipped without install or quarantine: %s", o.Basename)
-		if err := p.writer.write(errorFrame("STREAM_EXPIRED", true, text)); err != nil {
+		code, text := expiredOfferError(o.Class, o.Basename)
+		if err := p.writer.write(errorFrame(code, true, text)); err != nil {
 			p.reportAsyncError(err)
 		}
 		return
@@ -387,8 +400,10 @@ func (p *pump) installIncoming(ins *installer, o offer, data []byte, active *ato
 		p.reportAsyncError(err)
 		return
 	}
-	if err := p.touchFresh(); err != nil {
-		p.logger.Printf("touch link.fresh after STORED failed: %v", err)
+	if o.Class != "mind" {
+		if err := p.touchFresh(); err != nil {
+			p.logger.Printf("touch link.fresh after STORED failed: %v", err)
+		}
 	}
 	p.logger.Printf("stored %s/%s at %s", o.Node, o.Basename, path)
 	p.brain.trigger()
@@ -418,15 +433,26 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	if c.class == "stream" && p.minor < streamMinor {
 		return nil
 	}
-	if c.class == "stream" {
-		expired, err := streamExpiredAt(c.basename, p.retainDays, 1, time.Now())
+	if c.class == "mind" && p.minor < mindMinor {
+		return nil
+	}
+	now := time.Now()
+	var epoch uint64
+	if c.class == "stream" || c.class == "mind" {
+		var err error
+		epoch, err = offerEpoch(c.class, c.basename)
 		if err != nil {
-			p.logger.Printf("invalid stream epoch skipped: %s: %v", c.basename, err)
+			p.logger.Printf("invalid %s epoch skipped: %s: %v", c.class, c.basename, err)
+			return nil
+		}
+		expired, err := offerExpiredAt(c.class, c.basename, p.retainDays, 1, now)
+		if err != nil {
+			p.logger.Printf("invalid %s epoch skipped: %s: %v", c.class, c.basename, err)
 			return nil
 		}
 		if expired {
 			if p.expiredOfferLogs == nil || p.expiredOfferLogs.first(c.key()) {
-				p.logger.Printf("expired stream offer skipped: %s", c.basename)
+				p.logger.Printf("expired %s offer skipped: %s", c.class, c.basename)
 			}
 			return nil
 		}
@@ -466,7 +492,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		return nil
 	}
 	digest := sha256.Sum256(data)
-	id := transferID(c.class, c.stream, c.node, c.basename, digest)
+	id := transferID(c.class, c.stream, c.node, c.session, c.basename, digest)
 	if p.origins.has(c.key(), id) {
 		return nil
 	}
@@ -483,7 +509,17 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		}
 		return nil
 	}
-	o := offer{ID: id, Class: c.class, Stream: c.stream, Node: c.node, Basename: c.basename, Size: uint64(len(data)), Digest: digest}
+	o := offer{ID: id, Class: c.class, Stream: c.stream, Node: c.node, Session: c.session, Basename: c.basename, Size: uint64(len(data)), Digest: digest}
+	if (c.class == "stream" || c.class == "mind") && now.Unix() >= 0 && epoch > uint64(now.Unix()+86400) {
+		ins := installer{home: p.home, role: p.role, peer: p.peer, retainDays: p.retainDays, logger: p.logger}
+		quarantine, quarantineErr := ins.quarantineFuture(c.path, o)
+		if quarantineErr != nil {
+			p.logger.Printf("future %s offer refused but quarantine failed for %s: %v", c.class, c.path, quarantineErr)
+			return nil
+		}
+		p.logger.Printf("future %s offer refused and quarantined at %s", c.class, quarantine)
+		return nil
+	}
 	p.activeOut.Store(true)
 	defer p.activeOut.Store(false)
 	if err := p.writer.write(offerFrame(o)); err != nil {
@@ -519,8 +555,10 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		return fmt.Errorf("expected STORED, got frame %d", stored.typ)
 	}
 	p.markKnown(c.key(), id)
-	if err := p.touchFresh(); err != nil {
-		p.logger.Printf("touch link.fresh after received STORED failed: %v", err)
+	if c.class != "mind" {
+		if err := p.touchFresh(); err != nil {
+			p.logger.Printf("touch link.fresh after received STORED failed: %v", err)
+		}
 	}
 	if c.deleteAfterStored {
 		if p.role != "serve" {
@@ -619,7 +657,14 @@ func (p *pump) markRejected(key, id string) {
 }
 
 func offerKey(o offer) string {
-	return o.Class + "\x00" + o.Stream + "\x00" + o.Node + "\x00" + o.Basename
+	return o.Class + "\x00" + o.Stream + "\x00" + o.Node + "\x00" + o.Session + "\x00" + o.Basename
+}
+
+func expiredOfferError(class, basename string) (string, string) {
+	if class == "mind" {
+		return "MIND_EXPIRED", fmt.Sprintf("expired mind skipped without install or quarantine: %s", basename)
+	}
+	return "STREAM_EXPIRED", fmt.Sprintf("expired stream skipped without install or quarantine: %s", basename)
 }
 
 func (p *pump) touchFresh() error {
