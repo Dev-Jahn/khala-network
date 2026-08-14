@@ -120,7 +120,11 @@ run_start() {
     start_project=$2
     start_output=$3
     start_input=$4
+    # A caller shell's exported KHALA_SESSION would beat the fixture's
+    # .khala-session identity file (env > file precedence) and corrupt every
+    # SessionStart property — eddy hit exactly this. Sanitize explicitly.
     printf '%s\n' "$start_input" | \
+        env -u KHALA_SESSION \
         HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
         PATH=$HOOK_SHIM:/usr/bin:/bin "$START" > "$start_output" 2> "$start_output.err"
 }
