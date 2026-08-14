@@ -12,7 +12,7 @@ import (
 func TestProtocolFramesRoundTrip(t *testing.T) {
 	digest := sha256.Sum256([]byte("payload"))
 	want := offer{Class: "spool", Node: "beta", Basename: "1.sender@alpha", Size: 7, Digest: digest}
-	want.ID = transferID(want.Class, want.Stream, want.Node, want.Basename, want.Digest)
+	want.ID = transferID(want.Class, want.Stream, want.Node, want.Session, want.Basename, want.Digest)
 	var wire bytes.Buffer
 	if err := newFrameWriter(&wire).write(offerFrame(want)); err != nil {
 		t.Fatal(err)
@@ -41,8 +41,8 @@ func TestOfferRejectsForgedTransferID(t *testing.T) {
 func TestStreamOfferRoundTripAndBindsStreamToTransferID(t *testing.T) {
 	digest := sha256.Sum256([]byte("stream payload"))
 	want := offer{Class: "stream", Stream: "khala", Node: "alpha", Basename: "1.2.3.ear@alpha", Size: 14, Digest: digest}
-	want.ID = transferID(want.Class, want.Stream, want.Node, want.Basename, want.Digest)
-	otherID := transferID(want.Class, "other", want.Node, want.Basename, want.Digest)
+	want.ID = transferID(want.Class, want.Stream, want.Node, want.Session, want.Basename, want.Digest)
+	otherID := transferID(want.Class, "other", want.Node, want.Session, want.Basename, want.Digest)
 	if want.ID == otherID {
 		t.Fatal("stream name is absent from transfer identity")
 	}
@@ -55,11 +55,28 @@ func TestStreamOfferRoundTripAndBindsStreamToTransferID(t *testing.T) {
 	}
 }
 
+func TestMindOfferRoundTripAndBindsSessionToTransferID(t *testing.T) {
+	digest := sha256.Sum256([]byte("mind payload"))
+	want := offer{Class: "mind", Node: "alpha", Session: "worker", Basename: "123.4", Size: 12, Digest: digest}
+	want.ID = transferID(want.Class, want.Stream, want.Node, want.Session, want.Basename, want.Digest)
+	otherID := transferID(want.Class, want.Stream, want.Node, "other", want.Basename, want.Digest)
+	if want.ID == otherID {
+		t.Fatal("mind session is absent from transfer identity")
+	}
+	got, err := decodeOffer(offerFrame(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("mind offer mismatch: got %#v want %#v", got, want)
+	}
+}
+
 func TestLegacyOfferEncodingRemainsByteIdentical(t *testing.T) {
 	digest := sha256.Sum256([]byte("legacy payload"))
 	for _, class := range []string{"spool", "presence"} {
 		o := offer{Class: class, Node: "alpha", Basename: "1.2.3.ear@alpha", Size: 14, Digest: digest}
-		o.ID = transferID(o.Class, o.Stream, o.Node, o.Basename, o.Digest)
+		o.ID = transferID(o.Class, o.Stream, o.Node, o.Session, o.Basename, o.Digest)
 		legacyIDHash := sha256.New()
 		_, _ = io.WriteString(legacyIDHash, o.Class)
 		_, _ = io.WriteString(legacyIDHash, "\x00")
@@ -81,6 +98,19 @@ func TestLegacyOfferEncodingRemainsByteIdentical(t *testing.T) {
 		if got := offerFrame(o).payload; !bytes.Equal(got, legacy.b) {
 			t.Fatalf("%s OFFER changed from v1.0: got %x want %x", class, got, legacy.b)
 		}
+	}
+	stream := offer{Class: "stream", Stream: "commons", Node: "alpha", Basename: "1.2.3.ear@alpha", Size: 14, Digest: digest}
+	stream.ID = transferID(stream.Class, stream.Stream, stream.Node, stream.Session, stream.Basename, stream.Digest)
+	var legacyStream encoder
+	legacyStream.str(stream.ID)
+	legacyStream.str(stream.Class)
+	legacyStream.str(stream.Stream)
+	legacyStream.str(stream.Node)
+	legacyStream.str(stream.Basename)
+	legacyStream.u64(stream.Size)
+	legacyStream.str(hex.EncodeToString(stream.Digest[:]))
+	if got := offerFrame(stream).payload; !bytes.Equal(got, legacyStream.b) {
+		t.Fatalf("stream OFFER changed from v1.1: got %x want %x", got, legacyStream.b)
 	}
 }
 

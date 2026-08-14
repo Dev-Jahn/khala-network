@@ -314,27 +314,6 @@ grep -R -n 'jq' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude
     fail 11 "plugin runtime references jq: $(tr '\n' ' ' < "$RIG/jq-audit.out")"
 pass 11 "R13, bash 3.2, no-jq, no-/tmp, and bash -n audits pass"
 
-for regression_suite in local-roundtrip exchange-roundtrip hardening concurrency watch; do
-    if ! bash "$ROOT/test/$regression_suite.sh" > "$RIG/$regression_suite.out" 2>&1; then
-        cat "$RIG/$regression_suite.out"
-        fail 12 "$regression_suite failed"
-    fi
-    cat "$RIG/$regression_suite.out"
-    grep -q '^RESULT: PASS$' "$RIG/$regression_suite.out" || \
-        fail 12 "$regression_suite omitted RESULT: PASS"
-done
-if [ -x "$HOME/go-toolchain/bin/go" ]; then
-    if ! bash "$ROOT/test/link.sh" > "$RIG/link.out" 2>&1; then
-        cat "$RIG/link.out"
-        fail 12 "link failed"
-    fi
-    cat "$RIG/link.out"
-    grep -q '^RESULT: PASS$' "$RIG/link.out" || fail 12 "link omitted RESULT: PASS"
-else
-    printf 'SKIP link — Go toolchain missing at %s/go-toolchain/bin/go\n' "$HOME"
-fi
-pass 12 "all available existing suites pass unchanged"
-
 # Property 13 — CLI self-install ownership rules. Each case gets its own HOME.
 run_start_home() {
     run_fake_home=$1
@@ -392,6 +371,37 @@ cp "$ROOT/plugin/bin/khala" "$CLI_LINK/elsewhere"
 run_start_home "$CLI_LINK" "$RIG/cli-symlink-same.out" || fail 13 "identical-symlink run failed"
 grep -q 'CLI' "$RIG/cli-symlink-same.out" && fail 13 "identical symlink still warned"
 pass 13 "CLI self-install: fresh installs, receipt updates, manual copies and symlinks stay untouched"
+
+# An outer driver (minds T1) that has already run every legacy suite once can
+# skip this recursive re-run; nested duplicate load flaked three distinct
+# suites on loaded hosts without ever reproducing standalone.
+if [ "${PLUGIN_SKIP_REGRESSION-}" = 1 ]; then
+    printf 'SKIP 12 — outer driver owns legacy coverage\n'
+    printf 'RESULT: PASS\n'
+    printf 'Claude Code plugin hooks, skill, and armament repair passed (regressions skipped by driver)\n'
+    exit 0
+fi
+for regression_suite in local-roundtrip exchange-roundtrip hardening concurrency watch; do
+    if ! bash "$ROOT/test/$regression_suite.sh" > "$RIG/$regression_suite.out" 2>&1; then
+        cat "$RIG/$regression_suite.out"
+        fail 12 "$regression_suite failed"
+    fi
+    cat "$RIG/$regression_suite.out"
+    grep -q '^RESULT: PASS$' "$RIG/$regression_suite.out" || \
+        fail 12 "$regression_suite omitted RESULT: PASS"
+done
+if [ -x "$HOME/go-toolchain/bin/go" ]; then
+    if ! bash "$ROOT/test/link.sh" > "$RIG/link.out" 2>&1; then
+        cat "$RIG/link.out"
+        fail 12 "link failed"
+    fi
+    cat "$RIG/link.out"
+    grep -q '^RESULT: PASS$' "$RIG/link.out" || fail 12 "link omitted RESULT: PASS"
+else
+    printf 'SKIP link — Go toolchain missing at %s/go-toolchain/bin/go\n' "$HOME"
+fi
+pass 12 "all available existing suites pass unchanged"
+
 
 printf 'RESULT: PASS\n'
 printf 'Claude Code plugin hooks, skill, armament repair, and regressions passed\n'

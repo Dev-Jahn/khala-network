@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,10 +60,117 @@ func TestNegotiatedMinorIsMinimum(t *testing.T) {
 		{1, 0, 0},
 		{1, 1, 1},
 		{1, 9, 1},
+		{2, 1, 1},
+		{2, 2, 2},
 	} {
 		if got := minimumMinor(tc.local, tc.remote); got != tc.want {
 			t.Errorf("minimumMinor(%d, %d)=%d want %d", tc.local, tc.remote, got, tc.want)
 		}
+	}
+}
+
+func TestMindOfferRequiresMinorTwo(t *testing.T) {
+	home := testKhalaHome(t)
+	path := filepath.Join(home, "minds", "alpha", "worker", "1.0")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("mind"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var wire bytes.Buffer
+	p := &pump{
+		role: "dial", minor: 1, retainDays: 30, maxObject: 1 << 20,
+		logger: log.New(io.Discard, "", 0), writer: newFrameWriter(&wire),
+		origins: newOriginSet(), known: make(map[string]string), rejected: make(map[string]string),
+	}
+	c := candidate{class: "mind", node: "alpha", session: "worker", basename: "1.0", path: path}
+	if err := p.sendCandidate(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	if wire.Len() != 0 {
+		t.Fatalf("minor 1 wrote %d mind OFFER bytes", wire.Len())
+	}
+}
+
+func TestMindInstallTriggersBrainWithoutTouchingFreshMarker(t *testing.T) {
+	home := testKhalaHome(t)
+	fresh := filepath.Join(home, "run", "link.fresh")
+	if err := os.MkdirAll(filepath.Dir(fresh), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fresh, old, old); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("mind bytes")
+	o := testMindOffer("alpha", "worker", fmt.Sprintf("%d.0", time.Now().Unix()), data)
+	var wire bytes.Buffer
+	p := &pump{
+		home: home, role: "dial", writer: newFrameWriter(&wire), logger: log.New(io.Discard, "", 0),
+		origins: newOriginSet(), brain: &brain{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
+	}
+	ins := &installer{home: home, role: "dial", peer: "beta", retainDays: 30, logger: p.logger}
+	var active atomic.Bool
+	active.Store(true)
+	p.installIncoming(ins, o, data, &active)
+	select {
+	case <-p.brain.dirty:
+	default:
+		t.Fatal("mind install did not trigger brain reconcile")
+	}
+	info, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().After(old.Add(time.Second)) {
+		t.Fatalf("mind install refreshed link marker: got %s want %s", info.ModTime(), old)
+	}
+}
+
+func TestFutureMindQuarantineDoesNotTriggerBrainOrTouchFreshMarker(t *testing.T) {
+	home := testKhalaHome(t)
+	fresh := filepath.Join(home, "run", "link.fresh")
+	if err := os.MkdirAll(filepath.Dir(fresh), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fresh, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(fresh, old, old); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("future mind bytes")
+	generation := fmt.Sprintf("%d.0", time.Now().Unix()+86401)
+	o := testMindOffer("alpha", "worker", generation, data)
+	var wire bytes.Buffer
+	p := &pump{
+		home: home, role: "dial", writer: newFrameWriter(&wire), logger: log.New(io.Discard, "", 0),
+		origins: newOriginSet(), brain: &brain{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
+	}
+	ins := &installer{home: home, role: "dial", peer: "beta", retainDays: 30, logger: p.logger}
+	var active atomic.Bool
+	active.Store(true)
+	p.installIncoming(ins, o, data, &active)
+	select {
+	case <-p.brain.dirty:
+		t.Fatal("future mind quarantine triggered brain reconcile")
+	default:
+	}
+	info, err := os.Stat(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModTime().After(old.Add(time.Second)) {
+		t.Fatalf("future mind quarantine refreshed link marker: got %s want %s", info.ModTime(), old)
+	}
+	want := filepath.Join(home, "spool", "dead", "mind.alpha.worker."+generation)
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("future mind quarantine missing: %v", err)
 	}
 }
 

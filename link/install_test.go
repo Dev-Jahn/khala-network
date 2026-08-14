@@ -39,12 +39,20 @@ func testKhalaHome(t *testing.T) string {
 
 func testOffer(class, node, name string, data []byte) offer {
 	digest := sha256.Sum256(data)
-	return offer{ID: transferID(class, "", node, name, digest), Class: class, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
+	return offer{ID: transferID(class, "", node, "", name, digest), Class: class, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
 }
 
 func testStreamOffer(stream, node, name string, data []byte) offer {
 	digest := sha256.Sum256(data)
-	return offer{ID: transferID("stream", stream, node, name, digest), Class: "stream", Stream: stream, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
+	return offer{ID: transferID("stream", stream, node, "", name, digest), Class: "stream", Stream: stream, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
+}
+
+func testMindOffer(node, session, generation string, data []byte) offer {
+	digest := sha256.Sum256(data)
+	return offer{
+		ID: transferID("mind", "", node, session, generation, digest), Class: "mind",
+		Node: node, Session: session, Basename: generation, Size: uint64(len(data)), Digest: digest,
+	}
 }
 
 func TestInstallFsyncRenameAndNoClobber(t *testing.T) {
@@ -156,6 +164,74 @@ func TestStreamDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T
 	}
 	if _, err := serve.destination(testStreamOffer("khala", "gamma", "1.2.3.ear@gamma", []byte("x"))); err == nil {
 		t.Fatal("serve accepted a shard not owned by its connected spoke")
+	}
+}
+
+func TestMindDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T) {
+	home := testKhalaHome(t)
+	o := testMindOffer("alpha", "worker", "123.4", []byte("mind"))
+	dial := installer{home: home, role: "dial", peer: "beta", logger: testLogger{t}}
+	dest, err := dial.destination(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "minds", "alpha", "worker", "123.4")
+	if dest != want {
+		t.Fatalf("destination=%q want %q", dest, want)
+	}
+	for _, bad := range []offer{
+		testMindOffer("alpha", "Bad", "123.4", []byte("x")),
+		testMindOffer("alpha", "worker", "01.2", []byte("x")),
+		testMindOffer("beta", "worker", "123.4", []byte("x")),
+	} {
+		if _, err := dial.destination(bad); err == nil {
+			t.Errorf("dial accepted invalid/reflected mind offer %#v", bad)
+		}
+	}
+	serve := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	if _, err := serve.destination(o); err != nil {
+		t.Fatalf("serve rejected connected spoke mind shard: %v", err)
+	}
+	if _, err := serve.destination(testMindOffer("gamma", "worker", "123.4", []byte("x"))); err == nil {
+		t.Fatal("serve accepted a mind shard not owned by its connected spoke")
+	}
+}
+
+func TestFutureMindInstallMovesToBrainQuarantineEncoding(t *testing.T) {
+	home := testKhalaHome(t)
+	generation := fmt.Sprintf("%d.0", time.Now().Unix()+86401)
+	data := []byte("future mind bytes")
+	o := testMindOffer("alpha", "worker", generation, data)
+	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	result, path, err := i.receive(o, data)
+	if err == nil || result != quarantined {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	want := filepath.Join(home, "spool", "dead", "mind.alpha.worker."+generation)
+	if path != want {
+		t.Fatalf("quarantine=%q want %q", path, want)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "minds", "alpha", "worker", generation)); !os.IsNotExist(statErr) {
+		t.Fatalf("future mind polluted live tree: %v", statErr)
+	}
+}
+
+func TestExpiredMindInstallSkipsWithoutLiveOrQuarantineFile(t *testing.T) {
+	home := testKhalaHome(t)
+	generation := fmt.Sprintf("%d.0", time.Now().Unix()-32*86400)
+	data := []byte("expired mind bytes")
+	o := testMindOffer("alpha", "worker", generation, data)
+	i := installer{home: home, role: "serve", peer: "alpha", retainDays: 30, logger: testLogger{t}}
+	result, _, err := i.receive(o, data)
+	if err != nil || result != expiredSkipped {
+		t.Fatalf("result=%v err=%v", result, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, "minds", "alpha", "worker", generation)); !os.IsNotExist(statErr) {
+		t.Fatalf("expired mind polluted live tree: %v", statErr)
+	}
+	matches, globErr := filepath.Glob(filepath.Join(home, "spool", "dead", "*"+generation+"*"))
+	if globErr != nil || len(matches) != 0 {
+		t.Fatalf("expired mind was quarantined: matches=%v err=%v", matches, globErr)
 	}
 }
 

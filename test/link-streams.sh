@@ -167,7 +167,7 @@ trap cleanup EXIT HUP INT TERM
 [ -x "$GO" ] || fail 0 "Go toolchain missing at $GO"
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
-    "$GO" build -trimpath -ldflags '-X main.implVersion=0.3.1-test' -o "$BIN" .) \
+    "$GO" build -trimpath -ldflags '-X main.implVersion=0.4.0-test' -o "$BIN" .) \
     >"$RIG/go.out" 2>"$RIG/go.err"; then
     fail 0 "Go tests/build failed: $(tr '\n' ' ' < "$RIG/go.err")"
 fi

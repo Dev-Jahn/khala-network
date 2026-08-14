@@ -42,3 +42,16 @@ func TestLoadConfigRetainDays(t *testing.T) {
 		})
 	}
 }
+
+func TestGenerationValidationMatchesBrainGrammar(t *testing.T) {
+	for _, generation := range []string{"0.0", "1.0", "1786655513.42"} {
+		if !validGeneration(generation) {
+			t.Errorf("valid generation rejected: %q", generation)
+		}
+	}
+	for _, generation := range []string{"", "1", "1.2.3", "01.2", "1.02", "-1.0", "a.0"} {
+		if validGeneration(generation) {
+			t.Errorf("invalid generation accepted: %q", generation)
+		}
+	}
+}
