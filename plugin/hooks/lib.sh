@@ -44,6 +44,30 @@ khala_file_mtime() {
 # slot is installed with a receipt; a byte-identical copy is adopted; a
 # receipted copy that diverged is updated loudly; a symlink or an unreceipted
 # divergent copy is never touched — one honest line instead. $1: plugin root.
+# Prints the KHALA_VERSION a khala CLI file declares (dotted digits), or
+# nothing when the file carries no readable version line.
+khala_cli_version() {
+    sed -n 's/^KHALA_VERSION=\([0-9][0-9.]*\)$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+
+# 0 when dotted version $1 is strictly newer than $2, 1 otherwise
+# (missing components count as 0: 0.4 == 0.4.0).
+khala_version_newer() {
+    khala_vn_a=$1.
+    khala_vn_b=$2.
+    while [ -n "$khala_vn_a" ] || [ -n "$khala_vn_b" ]; do
+        khala_vn_x=${khala_vn_a%%.*}
+        khala_vn_a=${khala_vn_a#*.}
+        khala_vn_y=${khala_vn_b%%.*}
+        khala_vn_b=${khala_vn_b#*.}
+        [ -n "$khala_vn_x" ] || khala_vn_x=0
+        [ -n "$khala_vn_y" ] || khala_vn_y=0
+        [ "$khala_vn_x" -gt "$khala_vn_y" ] && return 0
+        [ "$khala_vn_x" -lt "$khala_vn_y" ] && return 1
+    done
+    return 1
+}
+
 khala_ensure_cli() {
     khala_bundled=$1/bin/khala
     [ -f "$khala_bundled" ] || return 0
@@ -67,6 +91,21 @@ khala_ensure_cli() {
         fi
         if [ ! -f "$khala_cli_receipt" ]; then
             printf '%s\n' 'khala: ~/.local/bin/khala가 플러그인 동봉본과 다릅니다 — 수동 설치본으로 보고 건드리지 않습니다. 플러그인 관리로 넘기려면 그 파일을 지우세요.'
+            return 0
+        fi
+        # A receipted copy is ours to update, but only forward: a session still
+        # holding an older plugin root must not roll a newer install back.
+        khala_cli_bundled_version=$(khala_cli_version "$khala_bundled")
+        khala_cli_installed_version=$(khala_cli_version "$khala_cli_target")
+        if [ -n "$khala_cli_bundled_version" ] && [ -n "$khala_cli_installed_version" ] && \
+            ! khala_version_newer "$khala_cli_bundled_version" "$khala_cli_installed_version"; then
+            if [ "$khala_cli_bundled_version" = "$khala_cli_installed_version" ]; then
+                printf 'khala: ~/.local/bin/khala(%s)가 같은 버전의 동봉본과 바이트가 다릅니다 — 건드리지 않습니다\n' \
+                    "$khala_cli_installed_version"
+            else
+                printf 'khala: ~/.local/bin/khala(%s)가 이 플러그인의 동봉본(%s)보다 새롭습니다 — 되돌리지 않습니다\n' \
+                    "$khala_cli_installed_version" "$khala_cli_bundled_version"
+            fi
             return 0
         fi
         khala_cli_update=1
