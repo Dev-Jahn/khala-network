@@ -21,10 +21,11 @@ CONFIG=$KHALA_ROOT/config
 TMP_DIR=$KHALA_ROOT/tmp
 SYNC_FAILED=0
 EPOCH_DATE_STYLE=
+LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.4.0
+KHALA_VERSION=0.4.1
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -249,7 +250,7 @@ acquire_lock() {
     lock_what=$3
     lock_attempt_limit=60
     if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ] && [ "$lock_what" = reconcile ]; then
-        lock_attempt_limit=1
+        lock_attempt_limit=3
     fi
     if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
         error "$KHALA_ROOT/run: lock 디렉터리를 준비하지 못했습니다"
@@ -270,6 +271,8 @@ acquire_lock() {
                 error "$lock_path: lock owner를 기록하지 못했습니다"
                 return 1
             fi
+            lock_held_index=${#LOCK_HELD_PATHS[@]}
+            LOCK_HELD_PATHS[$lock_held_index]=$lock_path
             return 0
         fi
         lock_now=$(date +%s) || return 1
@@ -296,12 +299,65 @@ acquire_lock() {
 
 release_lock() {
     release_path=$1
+    release_held_count=${#LOCK_HELD_PATHS[@]}
+    if [ "$release_held_count" -eq 0 ]; then
+        error "$release_path: 소유하지 않은 lock을 해제하려 했습니다"
+        return 1
+    fi
+    release_held_index=$((release_held_count - 1))
+    if [ "${LOCK_HELD_PATHS[$release_held_index]}" != "$release_path" ]; then
+        error "$release_path: 소유하지 않은 lock을 해제하려 했습니다"
+        return 1
+    fi
+    release_owner_line=$(sed -n '2p' "$release_path/owner" 2>/dev/null)
+    set -- $release_owner_line
+    release_owner_pid=${2-}
+    if [ "$release_owner_pid" != "$$" ]; then
+        error "$release_path: 다른 process의 lock은 해제할 수 없습니다"
+        return 1
+    fi
     if ! rm -f "$release_path/owner" || ! rmdir "$release_path"; then
         error "$release_path: lock을 해제하지 못했습니다"
         return 1
     fi
+    unset 'LOCK_HELD_PATHS[release_held_index]'
     return 0
 }
+
+release_held_locks() {
+    lock_cleanup_failed=0
+    while [ "${#LOCK_HELD_PATHS[@]}" -gt 0 ]; do
+        lock_cleanup_index=$((${#LOCK_HELD_PATHS[@]} - 1))
+        lock_cleanup_path=${LOCK_HELD_PATHS[$lock_cleanup_index]}
+        if ! release_lock "$lock_cleanup_path"; then
+            unset 'LOCK_HELD_PATHS[lock_cleanup_index]'
+            lock_cleanup_failed=1
+        fi
+    done
+    [ "$lock_cleanup_failed" -eq 0 ]
+}
+
+lock_exit_cleanup() {
+    lock_cleanup_status=$?
+    release_held_locks || :
+    return "$lock_cleanup_status"
+}
+
+lock_signal_cleanup() {
+    lock_cleanup_signal=$1
+    release_held_locks || :
+    trap - "$lock_cleanup_signal"
+    case "$lock_cleanup_signal" in
+        INT) exit 130 ;;
+        TERM) exit 143 ;;
+        PIPE) exit 141 ;;
+    esac
+}
+
+trap 'lock_exit_cleanup' EXIT
+trap 'lock_signal_cleanup INT' INT
+trap 'lock_signal_cleanup TERM' TERM
+trap 'lock_signal_cleanup PIPE' PIPE
 
 heartbeat() {
     heartbeat_session=$1
@@ -399,6 +455,9 @@ watch_marker_cleanup() {
     watch_cleanup_status=$?
     watch_cleanup_event=$1
     trap - EXIT INT TERM
+    if ! release_held_locks; then
+        error "watch 종료 중 brain lock을 해제하지 못했습니다"
+    fi
     if ! rm -f "$watch_marker"; then
         error "$watch_marker: watching marker를 지우지 못했습니다"
     fi
