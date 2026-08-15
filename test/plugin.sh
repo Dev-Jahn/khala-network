@@ -353,6 +353,43 @@ cmp -s "$ROOT/plugin/bin/khala" "$CLI_UPDATE/.local/bin/khala" || \
     fail 13 "receipted stale copy was not updated"
 grep -q 'CLI 갱신됨' "$RIG/cli-update.out" || fail 13 "receipted update was silent"
 
+# Receipted copies move forward only. Derive the three variants from the real
+# bundled CLI so the version line is the only thing that differs.
+BUNDLED_VERSION=$(sed -n 's/^KHALA_VERSION=\([0-9][0-9.]*\)$/\1/p' "$ROOT/plugin/bin/khala" | head -n 1)
+[ -n "$BUNDLED_VERSION" ] || fail 13 "bundled CLI carries no KHALA_VERSION line"
+BUNDLED_MAJOR=${BUNDLED_VERSION%%.*}
+NEWER_VERSION=$((BUNDLED_MAJOR + 1)).0.0
+
+CLI_NEWER=$RIG/cli-newer
+mkdir -p "$CLI_NEWER/.local/bin"
+sed "s/^KHALA_VERSION=.*/KHALA_VERSION=$NEWER_VERSION/" "$ROOT/plugin/bin/khala" > "$CLI_NEWER/.local/bin/khala"
+chmod 755 "$CLI_NEWER/.local/bin/khala"
+printf 'khala-plugin\n' > "$CLI_NEWER/$RECEIPT_REL"
+run_start_home "$CLI_NEWER" "$RIG/cli-newer.out" || fail 13 "newer-install run failed"
+grep -q "^KHALA_VERSION=$NEWER_VERSION\$" "$CLI_NEWER/.local/bin/khala" || \
+    fail 13 "receipted newer install was rolled back to the bundled version"
+grep -q '되돌리지 않습니다' "$RIG/cli-newer.out" || fail 13 "refused rollback was silent"
+
+CLI_SAME=$RIG/cli-same-version
+mkdir -p "$CLI_SAME/.local/bin"
+{ cat "$ROOT/plugin/bin/khala"; printf '# local patch\n'; } > "$CLI_SAME/.local/bin/khala"
+chmod 755 "$CLI_SAME/.local/bin/khala"
+printf 'khala-plugin\n' > "$CLI_SAME/$RECEIPT_REL"
+run_start_home "$CLI_SAME" "$RIG/cli-same.out" || fail 13 "same-version run failed"
+grep -q '^# local patch$' "$CLI_SAME/.local/bin/khala" || \
+    fail 13 "receipted same-version copy with different bytes was overwritten"
+grep -q '바이트가 다릅니다' "$RIG/cli-same.out" || fail 13 "same-version divergence was silent"
+
+CLI_OLDER=$RIG/cli-older
+mkdir -p "$CLI_OLDER/.local/bin"
+sed "s/^KHALA_VERSION=.*/KHALA_VERSION=0.0.1/" "$ROOT/plugin/bin/khala" > "$CLI_OLDER/.local/bin/khala"
+chmod 755 "$CLI_OLDER/.local/bin/khala"
+printf 'khala-plugin\n' > "$CLI_OLDER/$RECEIPT_REL"
+run_start_home "$CLI_OLDER" "$RIG/cli-older.out" || fail 13 "older-install run failed"
+cmp -s "$ROOT/plugin/bin/khala" "$CLI_OLDER/.local/bin/khala" || \
+    fail 13 "receipted older install was not upgraded"
+grep -q 'CLI 갱신됨' "$RIG/cli-older.out" || fail 13 "older-install upgrade was silent"
+
 CLI_MANUAL=$RIG/cli-manual
 mkdir -p "$CLI_MANUAL/.local/bin"
 printf '#!/bin/sh\nexit 7\n' > "$CLI_MANUAL/.local/bin/khala"
@@ -376,7 +413,7 @@ rm -f "$CLI_LINK/elsewhere"
 cp "$ROOT/plugin/bin/khala" "$CLI_LINK/elsewhere"
 run_start_home "$CLI_LINK" "$RIG/cli-symlink-same.out" || fail 13 "identical-symlink run failed"
 grep -q 'CLI' "$RIG/cli-symlink-same.out" && fail 13 "identical symlink still warned"
-pass 13 "CLI self-install: fresh installs, receipt updates, manual copies and symlinks stay untouched"
+pass 13 "CLI self-install: fresh installs, receipted forward updates only, manual copies and symlinks stay untouched"
 
 # An outer driver (minds T1) that has already run every legacy suite once can
 # skip this recursive re-run; nested duplicate load flaked three distinct
