@@ -75,8 +75,12 @@ run_start_without_env() {
     run_output=$3
     (
         unset KHALA_SESSION
+        # SessionStart reads its hook payload from stdin; Claude Code always
+        # closes it. A suite must not inherit the caller's stdin instead —
+        # an open one (a terminal, or a background shell's pipe) blocks the
+        # hook's `cat` forever. Closed here, at every invocation.
         HOME=$FAKE_HOME KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project \
-            PATH=$SHIM:/usr/bin:/bin "$START"
+            PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null
     ) > "$run_output" 2> "$run_output.err"
 }
 
@@ -172,7 +176,8 @@ stage_letter "$PRE_HOME" env-session env-wins
 stage_letter "$PRE_HOME" file-session file-next
 stage_letter "$PRE_HOME" base-session basename-last
 HOME=$FAKE_HOME KHALA_HOME=$PRE_HOME CLAUDE_PROJECT_DIR=$PRE_PROJECT KHALA_SESSION=env-session \
-    PATH=$SHIM:/usr/bin:/bin "$START" > "$RIG/precedence-env.out" 2> "$RIG/precedence-env.err" || \
+    PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null \
+    > "$RIG/precedence-env.out" 2> "$RIG/precedence-env.err" || \
     fail 5 "environment precedence run failed"
 grep -q 'env-wins' "$RIG/precedence-env.out" || fail 5 "environment identity did not win"
 grep -q 'file-next' "$RIG/precedence-env.out" && fail 5 "file identity beat environment"
@@ -321,7 +326,8 @@ run_start_home() {
     (
         unset KHALA_SESSION
         HOME=$run_fake_home KHALA_HOME=$run_fake_home/absent-khala \
-            CLAUDE_PROJECT_DIR=$RIG/cli-project PATH=$SHIM:/usr/bin:/bin "$START"
+            CLAUDE_PROJECT_DIR=$RIG/cli-project PATH=$SHIM:/usr/bin:/bin \
+            "$START" < /dev/null
     ) > "$run_output" 2> "$run_output.err"
 }
 make_project "$RIG/cli-project" cli-session

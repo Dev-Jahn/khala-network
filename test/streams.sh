@@ -89,8 +89,11 @@ run_start() {
     start_home=$1
     start_project=$2
     start_output=$3
+    # stdin closed: SessionStart reads its payload with `cat`, and an inherited
+    # open stdin (terminal or background-shell pipe) hangs the hook forever.
     HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
-        PATH=$HOOK_SHIM:/usr/bin:/bin "$START" > "$start_output" 2> "$start_output.err"
+        PATH=$HOOK_SHIM:/usr/bin:/bin "$START" < /dev/null \
+        > "$start_output" 2> "$start_output.err"
 }
 
 property_1() {
