@@ -73,6 +73,15 @@ start_link() {
     PIDS="$PIDS $LAST_PID"
 }
 
+start_local_link() {
+    start_home=$1
+    env KHALA_HOME="$start_home" KHALA_BRAIN="$KHALA" \
+        KHALA_LINK_TEST_SCAN_INTERVAL=1s \
+        "$BIN" >"$start_home/local-link.stdout" 2>"$start_home/local-link.stderr" &
+    LAST_PID=$!
+    PIDS="$PIDS $LAST_PID"
+}
+
 stop_link() {
     stop_pid=$1
     kill -TERM "$stop_pid" 2>/dev/null || :
@@ -190,6 +199,12 @@ write_config "$A" alpha "$HUB"
 write_config "$B" beta "$HUB"
 write_config "$OLD_A" oldalpha "$OLD_HUB"
 write_config "$HARD_A" hardalpha "$HARD_HUB"
+start_local_link "$HUB"
+HUB_LOCAL_PID=$LAST_PID
+start_local_link "$OLD_HUB"
+OLD_HUB_LOCAL_PID=$LAST_PID
+start_local_link "$HARD_HUB"
+HARD_HUB_LOCAL_PID=$LAST_PID
 
 HARD_OLD_EPOCH=$(( $(date +%s) - 32 * 86400 ))
 HARD_OLD_ID=$(write_entry "$HARD_A" bounded hardalpha ancient "$HARD_OLD_EPOCH" 'must never be offered') ||
@@ -217,7 +232,8 @@ while [ "$hard_round" -le 3 ]; do
     HARD_REPLAY_ID=$(write_entry "$HARD_A" bounded hardalpha ancient "$HARD_OLD_EPOCH" 'must never be reoffered') ||
         fail H2 "expired reinjection failed in round $hard_round"
     [ "$HARD_REPLAY_ID" = "$HARD_OLD_ID" ] || fail H2 "reinjection changed fixture Id"
-    HARD_CHILD=$(wait_new_child "$HARD_PID" "$HARD_CHILD" 6) ||
+    # Full jitter at the third short-lived reconnect has an 8s cap.
+    HARD_CHILD=$(wait_new_child "$HARD_PID" "$HARD_CHILD" 10) ||
         fail H2 "carrier did not redial in round $hard_round"
     wait_absent "$HARD_A/streams/bounded/hardalpha/$HARD_OLD_ID" 5 ||
         fail H2 "expired entry survived redial reconcile in round $hard_round"

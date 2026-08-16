@@ -63,6 +63,16 @@ start_link() {
     PIDS="$PIDS $LAST_PID"
 }
 
+start_local_link() {
+    start_home=$1
+    env KHALA_HOME="$start_home" \
+        KHALA_BRAIN="$KHALA" \
+        KHALA_LINK_TEST_SCAN_INTERVAL=1s \
+        "$BIN" >"$start_home/link.stdout" 2>"$start_home/link.stderr" &
+    LAST_PID=$!
+    PIDS="$PIDS $LAST_PID"
+}
+
 stop_link() {
     stop_pid=$1
     kill -TERM "$stop_pid" 2>/dev/null || :
@@ -149,6 +159,9 @@ write_config "$D" delta "$HUB"
 write_config "$S" sigma "$HUB"
 write_config "$W" omega "$RIG/unreachable-mailbox"
 
+start_local_link "$HUB"
+HUB_PID=$LAST_PID
+wait_file "$HUB/run/link.status" 5 || fail 0 "hub reconcile singleton did not start"
 start_link "$A" alpha
 A_PID=$LAST_PID
 start_link "$B" beta
@@ -494,7 +507,7 @@ if KHALA_HOME="$MISSING" "$KHALA" link >"$RIG/missing-link.out" 2>"$RIG/missing-
 fi
 grep -q "$MISSING/bin/khala-link" "$RIG/missing-link.err" || fail 18 "missing-binary error omitted expected home path"
 grep -q "$ROOT/bin/khala-link" "$RIG/missing-link.err" || fail 18 "missing-binary error omitted sibling path"
-if env -u KHALA_BRAIN KHALA_HOME="$MISSING" "$BIN" --serve \
+if env -u KHALA_BRAIN KHALA_HOME="$MISSING" "$BIN" --serve --peer alpha \
     >"$RIG/no-brain.out" 2>"$RIG/no-brain.err"; then
     fail 18 "binary started without KHALA_BRAIN"
 fi

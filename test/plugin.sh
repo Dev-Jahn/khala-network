@@ -5,10 +5,23 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 START=$ROOT/plugin/hooks/session-start.sh
 STOP=$ROOT/plugin/hooks/stop.sh
+END=$ROOT/plugin/hooks/session-end.sh
+GO=${GO:-/NHNHOME/jahn/go-toolchain/bin/go}
 RIG=$ROOT/.plugin-test-$$
 SHIM=$RIG/shim
+LINK_BIN=$RIG/khala-link
 
 cleanup() {
+    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_status in "$RIG"/*/run/link.status; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
     rm -rf -- "$RIG"
 }
 
@@ -36,6 +49,8 @@ init_home() {
     init_target=$1
     KHALA_HOME=$init_target "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" || \
         fail setup "khala init failed: $(tr '\n' ' ' < "$RIG/init.err")"
+    mkdir -p "$init_target/bin" || fail setup "could not create fixture bin"
+    cp "$LINK_BIN" "$init_target/bin/khala-link" || fail setup "could not install fixture link"
 }
 
 make_project() {
@@ -55,6 +70,8 @@ stage_letter() {
     KHALA_HOME=$stage_home KHALA_SESSION=sender "$KHALA" send "$stage_to@alpha" \
         -m "$stage_body" >/dev/null 2>"$RIG/send.err" || \
         fail setup "send failed: $(tr '\n' ' ' < "$RIG/send.err")"
+    KHALA_HOME=$stage_home "$KHALA" reconcile >/dev/null 2>>"$RIG/send.err" || \
+        fail setup "reconcile failed: $(tr '\n' ' ' < "$RIG/send.err")"
 }
 
 count_files() {
@@ -80,6 +97,9 @@ run_start_without_env() {
         # an open one (a terminal, or a background shell's pipe) blocks the
         # hook's `cat` forever. Closed here, at every invocation.
         HOME=$FAKE_HOME KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project \
+            XDG_RUNTIME_DIR=$run_home/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+            KHALA_CLAUDE_SESSION_ID=$(basename "$run_project")-test KHALA_SESSION_PID=$$ \
+            KHALA_SESSION_KIND=interactive \
             PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null
     ) > "$run_output" 2> "$run_output.err"
 }
@@ -97,6 +117,9 @@ run_stop_without_env() {
 }
 
 mkdir -p "$RIG" "$SHIM" || fail setup "could not create fixture root"
+mkdir -p "$HOME/.cache/khala-go-tmp" || fail setup "could not create Go tmp"
+(cd "$ROOT/link" && GOTMPDIR=$HOME/.cache/khala-go-tmp CGO_ENABLED=0 "$GO" build -o "$LINK_BIN" .) || \
+    fail setup "could not build fixture khala-link"
 ln -s "$KHALA" "$SHIM/khala" || fail setup "could not create PATH shim"
 # Hooks self-install the bundled CLI into $HOME/.local/bin; every hook run in
 # this suite gets an isolated fake HOME, pre-seeded so ensure stays silent.
@@ -108,9 +131,9 @@ printf 'khala-plugin\n' > "$FAKE_HOME/.local/bin/.khala.plugin-receipt"
 trap cleanup EXIT HUP INT TERM
 
 # Python is a test-rig-only JSON parser; the plugin runtime has no Python dependency.
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+uv run --no-project python -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/.claude-plugin/plugin.json" || fail 1 "plugin.json is invalid"
-python3 -c 'import json,sys; json.load(open(sys.argv[1]))' \
+uv run --no-project python -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/hooks/hooks.json" || fail 1 "hooks.json is invalid"
 cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || \
     fail 1 "plugin/bin/khala drifted from bin/khala"
@@ -176,6 +199,8 @@ stage_letter "$PRE_HOME" env-session env-wins
 stage_letter "$PRE_HOME" file-session file-next
 stage_letter "$PRE_HOME" base-session basename-last
 HOME=$FAKE_HOME KHALA_HOME=$PRE_HOME CLAUDE_PROJECT_DIR=$PRE_PROJECT KHALA_SESSION=env-session \
+    XDG_RUNTIME_DIR=$PRE_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+    KHALA_CLAUDE_SESSION_ID=precedence-env-test KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null \
     > "$RIG/precedence-env.out" 2> "$RIG/precedence-env.err" || \
     fail 5 "environment precedence run failed"
@@ -186,76 +211,60 @@ run_start_without_env "$PRE_HOME" "$PRE_PROJECT" "$RIG/precedence-file.out" || \
 grep -q 'file-next' "$RIG/precedence-file.out" || fail 5 "file identity did not beat basename"
 printf '%s\n' 'UpperCase' > "$PRE_PROJECT/.khala-session"
 run_start_without_env "$PRE_HOME" "$PRE_PROJECT" "$RIG/precedence-fallback.out" || \
-    fail 5 "malformed-file fallback run failed"
+    fail 5 "malformed-file refusal run failed"
 grep -q '.khala-session이 한 줄의 유효한 세션 이름이 아닙니다' "$RIG/precedence-fallback.out" || \
     fail 5 "malformed identity warning missing"
-grep -q 'basename-last' "$RIG/precedence-fallback.out" || fail 5 "malformed file did not fall through"
+grep -q '세션 신원이 없습니다' "$RIG/precedence-fallback.out" || \
+    fail 5 "malformed file did not refuse inference"
+[ "$(count_files "$PRE_HOME/inbox/base-session/new")" -eq 1 ] || \
+    fail 5 "identity refusal consumed basename mail"
 UPPER_PROJECT=$RIG/UpperProject
 make_project "$UPPER_PROJECT"
 run_start_without_env "$PRE_HOME" "$UPPER_PROJECT" "$RIG/uppercase-basename.out" || \
     fail 5 "uppercase basename path exited nonzero"
-grep -q '프로젝트 디렉터리명으로 세션을 정할 수 없습니다: UpperProject' \
-    "$RIG/uppercase-basename.out" || fail 5 "uppercase basename explanation missing"
-pass 5 "identity resolution order and non-mangling rules hold"
+grep -q '세션 신원이 없습니다' "$RIG/uppercase-basename.out" || \
+    fail 5 "missing identity instruction missing"
+pass 5 "identity resolution is env then file and never infers a basename"
 
 ARM_HOME=$RIG/arm-home
 ARM_PROJECT=$RIG/arm-session
 init_home "$ARM_HOME"
 make_project "$ARM_PROJECT" arm-session
-run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/unarmed.out" || fail 6 "unarmed run failed"
-expected_arm='(run_in_background) KHALA_SESSION=arm-session khala watch --session arm-session --interval 30'
-tail -n 1 "$RIG/unarmed.out" | grep -Fq "$expected_arm" || fail 6 "exact arm instruction missing"
-mkdir -p "$ARM_HOME/run/watch.arm-session.lock.d"
-arm_now=$(date +%s) || fail 6 "could not read epoch"
-printf '%s\npid 4242 watch\n30\n' "$arm_now" > "$ARM_HOME/run/watch.arm-session.lock.d/owner"
-run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/armed.out" || fail 6 "armed run failed"
-grep -q 'watch 무장됨 (pid 4242)' "$RIG/armed.out" || fail 6 "armed status missing"
-grep -q 'run_in_background' "$RIG/armed.out" && fail 6 "armed status retained instruction"
-pass 6 "status ends with exact arm command or fresh-lock pid"
+run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/ready.out" || fail 6 "ready run failed"
+grep -q 'registration ready, lease yes' "$RIG/ready.out" || fail 6 "ready/lease status missing"
+grep -R -q '"phase":"ready"' "$ARM_HOME/runtime-root/khala/sessions" || \
+    fail 6 "registration did not reach ready"
+grep -R -q 'run_in_background\|watch --session\|재무장' "$RIG/ready.out" && \
+    fail 6 "SessionStart retained arm/re-arm guidance"
+pass 6 "SessionStart reaches ready lease ownership and emits no arm guidance"
 
 LINK_HOME=$RIG/link-home
 LINK_PROJECT=$RIG/link-session
 init_home "$LINK_HOME"
 make_project "$LINK_PROJECT" link-session
-mkdir -p "$LINK_HOME/bin" "$LINK_HOME/run"
-cat > "$LINK_HOME/bin/khala-link" <<'FAKE_LINK'
-#!/usr/bin/env bash
-set -u
-if ! mkdir "$KHALA_HOME/run/fake-link.lock.d" 2>/dev/null; then
-    exit 0
-fi
-printf '%s\n' "$$" >> "$KHALA_HOME/run/link-proof"
-sleep 2
-touch "$KHALA_HOME/run/link.fresh"
-rmdir "$KHALA_HOME/run/fake-link.lock.d"
-FAKE_LINK
-chmod +x "$LINK_HOME/bin/khala-link"
-touch -t 200001010000 "$LINK_HOME/run/link.fresh"
-run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/link-first.out" || fail 7 "first link ensure failed"
-link_wait=0
-while [ ! -s "$LINK_HOME/run/link-proof" ] && [ "$link_wait" -lt 5 ]; do
-    sleep 1
-    link_wait=$((link_wait + 1))
+run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/node-first.out" || fail 7 "first node ensure failed"
+grep -q 'node ensure started conduit,link' "$RIG/node-first.out" || fail 7 "conduit/link start line missing"
+grep -q 'crossSessionInbound.*accept' "$RIG/node-first.out.err" || fail 7 "accept setting instruction missing"
+[ ! -e "$FAKE_HOME/.claude/settings.json" ] || fail 7 "hook edited user settings"
+node_wait=0
+while ! XDG_RUNTIME_DIR=$LINK_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+    KHALA_HOME=$LINK_HOME "$LINK_HOME/bin/khala-link" runtime daemon-status >/dev/null 2>&1 && \
+    [ "$node_wait" -lt 40 ]; do
+    sleep 0.05
+    node_wait=$((node_wait + 1))
 done
-[ -s "$LINK_HOME/run/link-proof" ] || fail 7 "link shim did not start"
-run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/link-second.out" || fail 7 "second link ensure failed"
-link_wait=0
-while [ "$link_wait" -lt 5 ]; do
-    link_epoch=$(date +%s)
-    link_mtime=$(stat -c %Y "$LINK_HOME/run/link.fresh" 2>/dev/null || stat -f %m "$LINK_HOME/run/link.fresh")
-    if [ "$((link_epoch - link_mtime))" -le 1 ]; then
-        break
-    fi
-    sleep 1
-    link_wait=$((link_wait + 1))
+[ "$node_wait" -lt 40 ] || fail 7 "conduit did not outlive SessionStart"
+node_wait=0
+while [ ! -f "$LINK_HOME/run/link.status" ] && [ "$node_wait" -lt 40 ]; do
+    sleep 0.05
+    node_wait=$((node_wait + 1))
 done
-[ "$(wc -l < "$LINK_HOME/run/link-proof" | tr -d ' ')" -eq 1 ] || \
-    fail 7 "two stale-marker hook runs started link work twice"
-rm -f "$LINK_HOME/run/link-proof"
-run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/link-fresh.out" || fail 7 "fresh link run failed"
-sleep 1
-[ ! -e "$LINK_HOME/run/link-proof" ] || fail 7 "fresh link marker started the shim"
-pass 7 "stale link ensure is singleton and fresh link is untouched"
+[ "$node_wait" -lt 40 ] || fail 7 "link did not outlive SessionStart"
+node_link_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$LINK_HOME/run/link.status")
+kill -0 "$node_link_pid" 2>/dev/null || fail 7 "link status pid is not live"
+run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/node-second.out" || fail 7 "second node ensure failed"
+grep -q 'node ensure started' "$RIG/node-second.out" && fail 7 "idempotent ensure started a duplicate"
+pass 7 "node ensure starts detached conduit/link processes and is idempotent"
 
 STOP_HOME=$RIG/stop-home
 STOP_PROJECT=$RIG/stop-session
@@ -279,28 +288,49 @@ run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "
     fail 8 "fresh-lock Stop exited nonzero"
 [ ! -s "$RIG/stop-fresh.out" ] && [ ! -s "$RIG/stop-fresh.out.err" ] || \
     fail 8 "fresh-lock Stop was not silent"
-pass 8 "Stop silently allows recursion, no identity, and fresh armament"
+pass 8 "Stop is a silent no-op regardless of recursion, identity, or legacy watch state"
 
-rm -rf -- "$STOP_HOME/run/watch.stop-session.lock.d"
-run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-block.out" || \
-    fail 9 "missing-lock Stop exited nonzero"
-[ "$(wc -l < "$RIG/stop-block.out" | tr -d ' ')" -eq 1 ] || fail 9 "block JSON is not one line"
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["decision"] == "block"; assert "KHALA_SESSION=stop-session khala watch --session stop-session --interval 30" in d["reason"]' \
-    "$RIG/stop-block.out" || fail 9 "block output is invalid or lacks arm command"
-pass 9 "missing armament emits one valid block decision"
+END_HOME=$RIG/end-home
+END_PROJECT=$RIG/end-session
+init_home "$END_HOME"
+make_project "$END_PROJECT" end-session
+run_start_without_env "$END_HOME" "$END_PROJECT" "$RIG/end-start.out" || fail 9 "SessionStart for end fixture failed"
+printf '%s\n' '{"session_id":"end-session-test"}' | HOME=$FAKE_HOME KHALA_HOME=$END_HOME \
+    XDG_RUNTIME_DIR=$END_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+    KHALA_CLAUDE_SESSION_ID=end-session-test CLAUDE_PROJECT_DIR=$END_PROJECT \
+    PATH=$SHIM:/usr/bin:/bin "$END" >"$RIG/end.out" 2>"$RIG/end.err" || fail 9 "SessionEnd failed"
+[ -z "$(find "$END_HOME/runtime-root/khala/sessions" -name '*.json' -print -quit)" ] || \
+    fail 9 "SessionEnd left its registration"
+grep -q '"state":"released"' "$END_HOME/runtime-root/khala/identities/end-session.lease" || \
+    fail 9 "SessionEnd did not release the lease"
+pass 9 "SessionEnd removes registration and releases its lease"
 
-mkdir -p "$STOP_HOME/run/watch.stop-session.lock.d"
-printf '%s\npid 6262 watch\n30\n' "$((stop_now - 301))" > "$STOP_HOME/run/watch.stop-session.lock.d/owner"
-run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-stale.out" || \
-    fail 10 "stale-lock Stop exited nonzero"
-python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["decision"] == "block"' \
-    "$RIG/stop-stale.out" || fail 10 "stale lock did not block"
-pass 10 "owner older than 2*(interval+120) is stale"
+COLLIDE_HOME=$RIG/collide-home
+COLLIDE_PROJECT=$RIG/collide-session
+init_home "$COLLIDE_HOME"
+make_project "$COLLIDE_PROJECT" collide
+HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME XDG_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
+    KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=owner-session KHALA_SESSION_PID=$$ \
+    KHALA_SESSION_KIND=interactive \
+    CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" </dev/null \
+    >"$RIG/collide-owner.out" 2>"$RIG/collide-owner.err" || fail 10 "owner hook failed"
+stage_letter "$COLLIDE_HOME" collide collision-body
+HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME XDG_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
+    KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=other-session KHALA_SESSION_PID=$$ \
+    KHALA_SESSION_KIND=interactive \
+    CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" \
+    <<<'{"session_id":"other-session"}' >"$RIG/collide-other.out" 2>"$RIG/collide-other.err" || \
+    fail 10 "second hook failed"
+grep -q 'you are not the receiver of collide' "$RIG/collide-other.out" || \
+    fail 10 "non-receiver warning missing"
+[ "$(count_files "$COLLIDE_HOME/inbox/collide/new")" -eq 1 ] || \
+    fail 10 "non-owner hook drained a letter"
+pass 10 "duplicate identity warns loudly and non-owner drain moves nothing"
 
-for audit_script in "$ROOT/plugin/hooks/lib.sh" "$START" "$STOP"; do
+for audit_script in "$ROOT/plugin/hooks/lib.sh" "$START" "$STOP" "$END"; do
     bash -n "$audit_script" || fail 11 "bash syntax failed: $audit_script"
 done
-if grep -En '^[[:space:]]*(kill|tmux)([[:space:]]|$)|signal-send' "$ROOT"/plugin/hooks/*.sh \
+if grep -En '^[[:space:]]*tmux([[:space:]]|$)|signal-send' "$ROOT"/plugin/hooks/*.sh \
     > "$RIG/r13-audit.out"; then
     fail 11 "R13-forbidden command found: $(tr '\n' ' ' < "$RIG/r13-audit.out")"
 fi
@@ -311,7 +341,8 @@ fi
 # Audit scope is the plugin's own runtime (hooks/skill/manifests); the bundled
 # CLI is a byte copy of bin/khala with its own suites (and its $KHALA_ROOT/tmp
 # usage is not the forbidden system /tmp).
-grep -R -n '/tmp' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
+grep -R -En '(^|[=[:space:]"])/tmp(/|[[:space:]"]|$)' \
+    "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
     > "$RIG/tmp-audit.out" && \
     fail 11 "plugin references /tmp: $(tr '\n' ' ' < "$RIG/tmp-audit.out")"
 grep -R -n 'jq' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
@@ -421,7 +452,7 @@ pass 13 "CLI self-install: fresh installs, receipted forward updates only, manua
 if [ "${PLUGIN_SKIP_REGRESSION-}" = 1 ]; then
     printf 'SKIP 12 — outer driver owns legacy coverage\n'
     printf 'RESULT: PASS\n'
-    printf 'Claude Code plugin hooks, skill, and armament repair passed (regressions skipped by driver)\n'
+    printf 'Claude Code plugin conduit hooks and lease lifecycle passed (regressions skipped by driver)\n'
     exit 0
 fi
 for regression_suite in local-roundtrip exchange-roundtrip hardening concurrency watch; do
@@ -447,4 +478,4 @@ pass 12 "all available existing suites pass unchanged"
 
 
 printf 'RESULT: PASS\n'
-printf 'Claude Code plugin hooks, skill, armament repair, and regressions passed\n'
+printf 'Claude Code plugin conduit hooks, lease lifecycle, and regressions passed\n'

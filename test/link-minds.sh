@@ -69,6 +69,17 @@ start_link() {
     PIDS="$PIDS $LAST_PID"
 }
 
+start_local_link() {
+    start_home=$1
+    start_brain=$2
+    shift 2
+    env KHALA_HOME="$start_home" KHALA_BRAIN="$start_brain" \
+        KHALA_LINK_TEST_SCAN_INTERVAL=1s \
+        "$@" "$BIN" >"$start_home/local-link.stdout" 2>"$start_home/local-link.stderr" &
+    LAST_PID=$!
+    PIDS="$PIDS $LAST_PID"
+}
+
 stop_link() {
     kill -TERM "$1" 2>/dev/null || :
     wait "$1" 2>/dev/null || :
@@ -154,6 +165,8 @@ B=$RIG/m8a-beta
 init_home "$A" alpha
 init_home "$B" beta
 write_config "$A" alpha beta "$B"
+start_local_link "$B" "$KHALA"
+B_LOCAL_PID=$LAST_PID
 start_link "$A" beta "$B" "$KHALA" KHALA_LINK_TEST_PING_INTERVAL=1h
 A_PID=$LAST_PID
 wait_file "$A/run/link.fresh" 5 || fail M8a "direct link did not handshake"
@@ -189,6 +202,8 @@ init_home "$HB" hopbeta
 init_home "$HUB" b200
 write_config "$HA" hopalpha b200 "$HUB"
 write_config "$HB" hopbeta b200 "$HUB"
+start_local_link "$HUB" "$KHALA"
+HUB_LOCAL_PID=$LAST_PID
 start_link "$HA" b200 "$HUB" "$KHALA"
 HA_PID=$LAST_PID
 start_link "$HB" b200 "$HUB" "$KHALA"
@@ -216,6 +231,8 @@ OH=$RIG/m8c-b200
 init_home "$OA" oldalpha
 init_home "$OH" b200
 write_config "$OA" oldalpha b200 "$OH"
+start_local_link "$OH" "$KHALA"
+OH_LOCAL_PID=$LAST_PID
 start_link "$OA" b200 "$OH" "$KHALA" KHALA_LINK_TEST_SERVE_MINOR=1
 OA_PID=$LAST_PID
 wait_file "$OA/run/link.fresh" 5 || fail M8c "minor-1 link did not handshake"
@@ -263,10 +280,18 @@ chmod 755 "$BRAIN_WRAPPER"
 V1=$(KHALA_HOME="$DA" KHALA_SESSION=worker "$KHALA" mind -m 'delayed V1') || fail M8d "V1 failed"
 cp "$DA/minds/delayalpha/worker/$V1" "$RIG/v1.fixture" || fail M8d "V1 fixture failed"
 V2=$(KHALA_HOME="$DA" KHALA_SESSION=worker "$KHALA" mind -m 'current V2') || fail M8d "V2 failed"
+start_local_link "$DB" "$BRAIN_WRAPPER" \
+    KHALA_REAL_BRAIN="$KHALA" KHALA_LINK_TEST_SCAN_INTERVAL=1h
+DB_LOCAL_PID=$LAST_PID
 start_link "$DA" delaybeta "$DB" "$BRAIN_WRAPPER" \
     KHALA_REAL_BRAIN="$KHALA" KHALA_LINK_TEST_SCAN_INTERVAL=1h
 DA_PID=$LAST_PID
 wait_file "$DB/minds/delayalpha/worker/$V2" 5 || fail M8d "V2 did not install"
+# The receiver-side singleton owns reconcile now. Wait for its first
+# data-triggered pass before turning on the wrapper gate; otherwise the fixture
+# can relabel the initially delivered V1 as the deliberately delayed copy.
+wait_absent "$DB/minds/delayalpha/worker/$V1" 3 ||
+    fail M8d "initial V1 was not collected before delayed injection"
 : > "$DB/block-reconcile"
 cp "$RIG/v1.fixture" "$DA/minds/delayalpha/worker/$V1" || fail M8d "late V1 injection failed"
 wait_file "$DB/minds/delayalpha/worker/$V1" 3 || fail M8d "late V1 was not installed"
@@ -286,6 +311,8 @@ RB=$RIG/l5-beta
 init_home "$RA" racealpha
 init_home "$RB" racebeta
 write_config "$RA" racealpha racebeta "$RB"
+start_local_link "$RB" "$KHALA"
+RB_LOCAL_PID=$LAST_PID
 start_link "$RA" racebeta "$RB" "$KHALA" KHALA_LINK_TEST_DATA_INSTALL_DELAY=500ms
 RA_PID=$LAST_PID
 wait_file "$RA/run/link.fresh" 5 || fail L5 "race link did not handshake"
@@ -308,6 +335,8 @@ FB=$RIG/l6-beta
 init_home "$FA" guardalpha
 init_home "$FB" guardbeta
 write_config "$FA" guardalpha guardbeta "$FB"
+start_local_link "$FB" "$KHALA"
+FB_LOCAL_PID=$LAST_PID
 KEEPER_GEN=$(date +%s).0
 write_mind_file "$FA" guardalpha future "$KEEPER_GEN" 'future guard keeper' || fail L6 "future keeper failed"
 write_mind_file "$FA" guardalpha ancient "$KEEPER_GEN" 'old guard keeper' || fail L6 "old keeper failed"
@@ -344,7 +373,8 @@ while [ "$guard_round" -le 3 ]; do
     mkdir -p "$FA/minds/guardalpha/ancient" || fail L6 "old source directory failed in round $guard_round"
     cp "$RIG/minds/guardalpha/ancient/$OLD_GEN" "$FA/minds/guardalpha/ancient/$OLD_GEN" ||
         fail L6 "old reinjection failed in round $guard_round"
-    GUARD_CHILD=$(wait_new_child "$FA_PID" "$GUARD_CHILD" 6) || fail L6 "redial $guard_round did not start"
+    # Full jitter at the third short-lived reconnect has an 8s cap.
+    GUARD_CHILD=$(wait_new_child "$FA_PID" "$GUARD_CHILD" 10) || fail L6 "redial $guard_round did not start"
     wait_absent "$FA/minds/guardalpha/ancient/$OLD_GEN" 4 || fail L6 "scan gate kept old generation in round $guard_round"
     [ ! -e "$FB/minds/guardalpha/ancient/$OLD_GEN" ] || fail L6 "old generation reached receiver"
     guard_round=$((guard_round + 1))

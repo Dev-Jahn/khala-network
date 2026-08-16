@@ -186,7 +186,7 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		_, err := runPump(context.Background(), readWriter{Reader: local, Writer: local},
-			home, "serve", "b200", "", "/bin/true", 1<<20, 30, time.Hour, newLogOnceSet(),
+			home, "serve", "b200", "", "/bin/true", nil, 1<<20, 30, time.Hour, newLogOnceSet(),
 			log.New(io.Discard, "", 0))
 		result <- err
 	}()
@@ -215,19 +215,11 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 	}
 }
 
-func TestPumpShutdownWaitsForAgeScanReconcile(t *testing.T) {
+func TestPumpLeavesReconcileToNodeSingleton(t *testing.T) {
 	home := testKhalaHome(t)
 	brainPath := filepath.Join(home, "fake-brain")
 	brainScript := `#!/bin/sh
-if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ]; then
-    mkdir "$KHALA_HOME/run/brain.lock.d" || exit 1
-    printf '%s\n' "$$" > "$KHALA_HOME/run/brain.lock.d/owner"
-    : > "$KHALA_HOME/gate.started"
-    sleep 1
-    rm -f "$KHALA_HOME/run/brain.lock.d/owner"
-    rmdir "$KHALA_HOME/run/brain.lock.d"
-    : > "$KHALA_HOME/gate.done"
-fi
+: > "$KHALA_HOME/brain-ran"
 `
 	if err := os.WriteFile(brainPath, []byte(brainScript), 0700); err != nil {
 		t.Fatal(err)
@@ -239,8 +231,8 @@ fi
 	defer remote.Close()
 	result := make(chan error, 1)
 	go func() {
-		_, err := runPump(ctx, readWriter{Reader: local, Writer: local}, home, "serve", "b200", "",
-			brainPath, 1<<20, 30, time.Hour, newLogOnceSet(), log.New(io.Discard, "", 0))
+		_, err := runPump(ctx, readWriter{Reader: local, Writer: local}, home, "dial", "b200", "alpha",
+			brainPath, nil, 1<<20, 30, time.Hour, newLogOnceSet(), log.New(io.Discard, "", 0))
 		result <- err
 	}()
 	remoteReader := bufio.NewReader(remote)
@@ -249,32 +241,21 @@ fi
 	}
 	if err := newFrameWriter(remote).write(helloFrame(hello{
 		Magic: protocolMagic, Major: protocolMajor, Minor: protocolMinor,
-		Node: "alpha", Role: "dial", Impl: "shutdown-test-double",
+		Node: "alpha", Role: "serve", Impl: "shutdown-test-double",
 	})); err != nil {
 		t.Fatal(err)
-	}
-	started := filepath.Join(home, "gate.started")
-	deadline := time.Now().Add(time.Second)
-	for {
-		if _, err := os.Stat(started); err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("age-scan reconcile did not start")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	_ = remote.Close()
 	select {
 	case <-result:
-	case <-time.After(2 * time.Second):
-		t.Fatal("pump did not stop after age-scan reconcile completed")
+	case <-time.After(time.Second):
+		t.Fatal("pump did not stop")
 	}
-	if _, err := os.Stat(filepath.Join(home, "gate.done")); err != nil {
-		t.Fatalf("pump returned before age-scan reconcile finished: %v", err)
+	if _, err := os.Stat(filepath.Join(home, "brain-ran")); !os.IsNotExist(err) {
+		t.Fatalf("carrier pump ran reconcile: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(home, "run", "brain.lock.d")); !os.IsNotExist(err) {
-		t.Fatalf("pump stranded brain lock on shutdown: %v", err)
+		t.Fatalf("carrier pump owned brain lock: %v", err)
 	}
 }
 

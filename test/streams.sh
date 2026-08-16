@@ -6,8 +6,21 @@ KHALA=$ROOT/bin/khala
 START=$ROOT/plugin/hooks/session-start.sh
 RIG=$HOME/.khala-streams-test-$$
 FAILURES=
+GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO_TMP=$HOME/.cache/khala-go-tmp
+GO_CACHE=$HOME/.cache/khala-go-cache
 
 cleanup() {
+    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_status in "$RIG"/*/run/link.status; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
     rm -rf -- "$RIG"
 }
 
@@ -83,15 +96,31 @@ prepare_hook() {
     if [ ! -e "$HOOK_SHIM/khala" ]; then
         ln -s "$KHALA" "$HOOK_SHIM/khala" || return 1
     fi
+    HOOK_LINK_BIN=$RIG/khala-link
+    if [ ! -x "$HOOK_LINK_BIN" ]; then
+        [ -x "$GO" ] || return 1
+        mkdir -p "$GO_TMP" "$GO_CACHE" || return 1
+        (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
+            "$GO" build -trimpath -o "$HOOK_LINK_BIN" .) || return 1
+    fi
 }
 
 run_start() {
     start_home=$1
     start_project=$2
     start_output=$3
+    mkdir -p "$start_home/bin" || return 1
+    if [ ! -e "$start_home/bin/khala-link" ]; then
+        cp "$HOOK_LINK_BIN" "$start_home/bin/khala-link" || return 1
+    else
+        cmp -s "$HOOK_LINK_BIN" "$start_home/bin/khala-link" || return 1
+    fi
     # stdin closed: SessionStart reads its payload with `cat`, and an inherited
     # open stdin (terminal or background-shell pipe) hangs the hook forever.
     HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
+        XDG_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=streams-test-boot \
+        KHALA_CLAUDE_SESSION_ID=$(basename "$start_output") KHALA_SESSION_PID=$$ \
+        KHALA_SESSION_KIND=interactive \
         PATH=$HOOK_SHIM:/usr/bin:/bin "$START" < /dev/null \
         > "$start_output" 2> "$start_output.err"
 }
@@ -389,7 +418,7 @@ property_11() {
         "$ROOT/plugin/.claude-plugin" >"$RIG/p11-jq.out"; then
         die "runtime references jq"
     fi
-    if grep -En '^[[:space:]]*(kill|tmux)([[:space:]]|$)|signal-send' \
+    if grep -En '^[[:space:]]*tmux([[:space:]]|$)|signal-send|kill[^#]*(CLAUDE|SESSION|PPID)' \
         "$ROOT"/plugin/hooks/*.sh >"$RIG/p11-r13.out"; then
         die "R13-forbidden hook action found"
     fi

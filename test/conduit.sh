@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+set -u
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+KHALA=$ROOT/bin/khala
+GO=${GO:-/NHNHOME/jahn/go-toolchain/bin/go}
+RIG=${KHALA_TEST_ROOT:-${HOME}/.khala-conduit-test-$$}
+BIN=$RIG/khala-link
+RUNTIME_BASE=$RIG/runtime
+LISTENER=$ROOT/test/conduit-listener.py
+PIDS=
+
+cleanup() {
+    for cleanup_pid in $PIDS; do
+        kill "$cleanup_pid" 2>/dev/null || :
+        wait "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_status in "$RIG"/*/run/link.status; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
+    rm -rf -- "$RIG"
+}
+
+fail() {
+    fail_step=$1
+    shift
+    printf 'FAIL %s — %s\n' "$fail_step" "$*" >&2
+    if [ -d "$RIG" ]; then
+        find "$RIG" -maxdepth 5 -type f -print | sort >&2
+    fi
+    exit 1
+}
+
+pass() {
+    printf 'ok %s — %s\n' "$1" "$2"
+}
+
+wait_file() {
+    wait_path=$1
+    wait_limit=$2
+    wait_i=0
+    while [ ! -e "$wait_path" ] && [ "$wait_i" -lt "$wait_limit" ]; do
+        sleep 0.05
+        wait_i=$((wait_i + 1))
+    done
+    [ -e "$wait_path" ]
+}
+
+line_count() {
+    if [ -f "$1" ]; then
+        wc -l < "$1" | tr -d ' '
+    else
+        printf '0\n'
+    fi
+}
+
+wait_lines() {
+    wait_lines_path=$1
+    wait_lines_count=$2
+    wait_lines_limit=$3
+    wait_lines_i=0
+    while [ "$(line_count "$wait_lines_path")" -lt "$wait_lines_count" ] && \
+        [ "$wait_lines_i" -lt "$wait_lines_limit" ]; do
+        sleep 0.05
+        wait_lines_i=$((wait_lines_i + 1))
+    done
+    [ "$(line_count "$wait_lines_path")" -ge "$wait_lines_count" ]
+}
+
+init_home() {
+    init_target=$1
+    KHALA_HOME=$init_target "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" || \
+        fail setup "khala init failed: $(tr '\n' ' ' < "$RIG/init.err")"
+    mkdir -p "$init_target/bin"
+    cp "$BIN" "$init_target/bin/khala-link"
+}
+
+runtime_env() {
+    env XDG_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
+        KHALA_CLAUDE_SESSIONS_DIR="$RIG/cc-sessions" "$@"
+}
+
+start_listener() {
+    listener_name=$1
+    listener_session=$2
+    listener_socket=$RIG/$listener_name.sock
+    listener_output=$RIG/$listener_name.frames
+    listener_ready=$RIG/$listener_name.ready
+    "$RIG/venv/bin/python" "$LISTENER" "$listener_socket" "$listener_output" \
+        "$listener_ready" >"$RIG/$listener_name.listener.out" \
+        2>"$RIG/$listener_name.listener.err" &
+    LISTENER_PID=$!
+    PIDS="$PIDS $LISTENER_PID"
+    wait_file "$listener_ready" 100 || fail setup "$listener_name listener did not bind"
+    mkdir -p "$RIG/cc-sessions"
+    printf '{"pid":%s,"sessionId":"%s","name":"%s","version":"2.1.233","messagingSocketPath":"%s"}\n' \
+        "$LISTENER_PID" "$listener_session" "$listener_session" "$listener_socket" \
+        > "$RIG/cc-sessions/$LISTENER_PID.json"
+    LISTENER_SOCKET=$listener_socket
+    LISTENER_OUTPUT=$listener_output
+}
+
+register_session() {
+    register_home=$1
+    register_identity=$2
+    register_session_id=$3
+    register_pid=$4
+    register_socket=$5
+    register_kind=$6
+    register_phase=$7
+    register_extra=${8-}
+    # shellcheck disable=SC2086
+    runtime_env KHALA_HOME="$register_home" KHALA_SESSION="$register_identity" \
+        "$KHALA" bind --register "$register_phase" --session-id "$register_session_id" \
+        --pid "$register_pid" --socket "$register_socket" --kind "$register_kind" \
+        --cc-version 2.1.233 $register_extra
+}
+
+stage_letter() {
+    stage_home=$1
+    stage_identity=$2
+    stage_seq=$3
+    stage_from=${4-sender@alpha}
+    stage_dir=$stage_home/inbox/$stage_identity/new
+    mkdir -p "$stage_dir"
+    cat > "$stage_dir/1700000000.1.$stage_seq.sender@alpha" <<EOF
+Khala: 0.1
+Id: 1700000000.1.$stage_seq.sender@alpha
+From: $stage_from
+To: $stage_identity@alpha
+Date: 2026-08-16T00:00:00Z
+Type: message
+Subject: conduit-$stage_seq
+Expires: 1999999999
+
+body-$stage_seq
+EOF
+}
+
+start_conduit() {
+    conduit_home=$1
+    shift
+    env XDG_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
+        KHALA_CLAUDE_SESSIONS_DIR="$RIG/cc-sessions" KHALA_HOME="$conduit_home" \
+        KHALA_CONDUIT_TEST_SCAN_INTERVAL=50ms \
+        "$@" "$BIN" conduit &
+    CONDUIT_PID=$!
+    PIDS="$PIDS $CONDUIT_PID"
+}
+
+stop_pid() {
+    stop_target=$1
+    kill "$stop_target" 2>/dev/null || :
+    wait "$stop_target" 2>/dev/null || :
+}
+
+mkdir -p "$RIG" "$RUNTIME_BASE" "$RIG/cc-sessions" || fail setup "fixture mkdir failed"
+trap cleanup EXIT HUP INT TERM
+(uv venv --python 3.13 "$RIG/venv" >/dev/null) || fail setup "test Python venv failed"
+(cd "$ROOT/link" && CGO_ENABLED=0 "$GO" build -o "$BIN" .) || fail setup "Go build failed"
+
+# H1/H2 — durable new/ remains authoritative and generations coalesce.
+H1_HOME=$RIG/h1-home
+init_home "$H1_HOME"
+start_listener h1 h1-session
+H1_LISTENER_PID=$LISTENER_PID
+H1_SOCKET=$LISTENER_SOCKET
+H1_FRAMES=$LISTENER_OUTPUT
+H1_REGISTER=$(register_session "$H1_HOME" eddy h1-session "$H1_LISTENER_PID" \
+    "$H1_SOCKET" interactive ready) || fail H1 "ready registration failed"
+stage_letter "$H1_HOME" eddy 1 reel@bw2
+start_conduit "$H1_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
+H1_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H1_FRAMES" 1 40 || fail H1 "no frame within 2s"
+sleep 0.15
+[ "$(line_count "$H1_FRAMES")" -eq 1 ] || fail H1 "first generation rang more than once before backoff"
+[ -f "$H1_HOME/inbox/eddy/new/1700000000.1.1.sender@alpha" ] || fail H1 "conduit consumed new/"
+uv run --no-project python - "$H1_FRAMES" <<'PY' || fail H1 "frame JSON/shape invalid"
+import json, sys
+frame = json.loads(open(sys.argv[1], encoding="utf-8").readline())
+assert frame["type"] == "user"
+assert frame["message"]["role"] == "user"
+assert frame["message"]["content"].startswith("KHALA-CONDUIT/1")
+assert frame["priority"] == "later"
+assert ":" in frame["msg_id"]
+PY
+pass H1 "one valid doorbell arrived and the letter remained in new/"
+
+stage_letter "$H1_HOME" eddy 2 clawd@mini
+wait_lines "$H1_FRAMES" 2 40 || fail H2 "second generation did not ring"
+stage_letter "$H1_HOME" eddy 3 pen@b200
+sleep 0.15
+[ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed outstanding backoff"
+wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not ring after backoff"
+pass H2 "generation changes ring once and a burst remains coalesced until backoff"
+stop_pid "$H1_CONDUIT_PID"
+stop_pid "$H1_LISTENER_PID"
+
+# H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
+H3_HOME=$RIG/h3-home
+init_home "$H3_HOME"
+start_listener h3 h3-session
+H3_PID=$LISTENER_PID
+H3_SOCKET=$LISTENER_SOCKET
+H3_FRAMES=$LISTENER_OUTPUT
+H3_REG=$(register_session "$H3_HOME" late h3-session "$H3_PID" \
+    "$RIG/missing.sock" interactive starting) || fail H3 "starting registration failed"
+H3_INSTANCE=$(printf '%s\n' "$H3_REG" | sed -n 's/^instance //p')
+stage_letter "$H3_HOME" late 4
+start_conduit "$H3_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms
+H3_CONDUIT_PID=$CONDUIT_PID
+sleep 0.3
+[ "$(line_count "$H3_FRAMES")" -eq 0 ] || fail H3 "starting registration received a frame"
+find "$RUNTIME_BASE/khala/deliveries/late/$H3_INSTANCE" -name '*.json' \
+    -exec grep -l '"status":"failed"' {} \; > "$RIG/h3-failed-journals"
+[ -s "$RIG/h3-failed-journals" ] || fail H3 "failed attempt was not journaled"
+register_session "$H3_HOME" late h3-session "$H3_PID" "$H3_SOCKET" interactive ready \
+    "--instance $H3_INSTANCE" >/dev/null || fail H3 "late ready update failed"
+wait_lines "$H3_FRAMES" 1 40 || fail H3 "socket appearance did not recover delivery"
+[ -f "$H3_HOME/inbox/late/new/1700000000.1.4.sender@alpha" ] || fail H3 "failed/recovered path consumed new/"
+pass H3 "unready/missing sockets fail durably and recover when the socket appears"
+stop_pid "$H3_CONDUIT_PID"
+stop_pid "$H3_PID"
+
+# H4/H5/H6 — exclusive lease, worker exclusion, epoch-only takeover.
+H4_HOME=$RIG/h4-home
+init_home "$H4_HOME"
+start_listener owner owner-session
+OWNER_PID=$LISTENER_PID; OWNER_SOCKET=$LISTENER_SOCKET; OWNER_FRAMES=$LISTENER_OUTPUT
+OWNER_REG=$(register_session "$H4_HOME" shared owner-session "$OWNER_PID" "$OWNER_SOCKET" \
+    interactive ready) || fail H4 "owner registration failed"
+OWNER_INSTANCE=$(printf '%s\n' "$OWNER_REG" | sed -n 's/^instance //p')
+start_listener claimant claimant-session
+CLAIM_PID=$LISTENER_PID; CLAIM_SOCKET=$LISTENER_SOCKET; CLAIM_FRAMES=$LISTENER_OUTPUT
+CLAIM_REG=$(register_session "$H4_HOME" shared claimant-session "$CLAIM_PID" "$CLAIM_SOCKET" \
+    interactive ready) || fail H4 "claimant registration failed"
+CLAIM_INSTANCE=$(printf '%s\n' "$CLAIM_REG" | sed -n 's/^instance //p')
+printf '%s\n' "$OWNER_REG" | grep -q '^owner yes$' || fail H4 "first claimant did not own lease"
+printf '%s\n' "$CLAIM_REG" | grep -q '^owner no$' || fail H4 "second claimant became owner"
+stage_letter "$H4_HOME" shared 5
+start_conduit "$H4_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+H4_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$OWNER_FRAMES" 1 40 || fail H4 "lease owner was not rung"
+[ "$(line_count "$CLAIM_FRAMES")" -eq 0 ] || fail H4 "non-owner was rung"
+H4_PROJECT=$RIG/h4-project
+mkdir -p "$H4_PROJECT"
+printf '%s\n' shared > "$H4_PROJECT/.khala-session"
+HOME=$RIG KHALA_HOME=$H4_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+    KHALA_CLAUDE_SESSION_ID=h4-hook-session KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
+    CLAUDE_PROJECT_DIR=$H4_PROJECT PATH=$H4_HOME/bin:$ROOT/bin:/usr/bin:/bin \
+    "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h4-hook-session"}' \
+    >"$RIG/h4-hook.out" 2>"$RIG/h4-hook.err" || fail H4 "non-owner SessionStart failed"
+grep -q 'you are not the receiver of shared' "$RIG/h4-hook.out" || fail H4 "non-owner hook warning missing"
+[ -f "$H4_HOME/inbox/shared/new/1700000000.1.5.sender@alpha" ] || fail H4 "non-owner hook drained mail"
+pass H4 "only the lease owner is rung; a second SessionStart warns and drains nothing"
+
+WORKER_REG=$(register_session "$H4_HOME" worker worker-session "$CLAIM_PID" "$CLAIM_SOCKET" \
+    worker ready) || fail H5 "worker registration failed"
+printf '%s\n' "$WORKER_REG" | grep -q '^owner no$' || fail H5 "worker owned lease without opt-in"
+pass H5 "non-interactive registration cannot acquire a lease without opt-in"
+
+old_epoch=$(uv run --no-project python - "$RUNTIME_BASE/khala/identities/shared.lease" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["epoch"])
+PY
+)
+runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$CLAIM_INSTANCE" \
+    KHALA_CLAUDE_SESSION_ID=claimant-session "$KHALA" bind --takeover >/dev/null || \
+    fail H6 "takeover failed"
+new_epoch=$(uv run --no-project python - "$RUNTIME_BASE/khala/identities/shared.lease" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["epoch"])
+PY
+)
+[ "$new_epoch" -eq "$((old_epoch + 1))" ] || fail H6 "takeover did not bump epoch exactly once"
+kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "takeover signalled the prior owner"
+stage_letter "$H4_HOME" shared 6
+wait_lines "$CLAIM_FRAMES" 1 40 || fail H6 "new owner was not rung after takeover"
+kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "old owner died after conduit reroute"
+pass H6 "takeover bumps only the epoch, reroutes delivery, and sends no signal"
+stop_pid "$H4_CONDUIT_PID"
+stop_pid "$OWNER_PID"
+stop_pid "$CLAIM_PID"
+
+# H7/H9 are hook-level gates: no identity refuses; non-owner never drains;
+# ready registration survives a drain lock deadline.
+H7_HOME=$RIG/h7-home
+init_home "$H7_HOME"
+H7_PROJECT=$RIG/h7-project
+mkdir -p "$H7_PROJECT"
+HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE \
+    KHALA_TEST_BOOT_ID=conduit-test-boot CLAUDE_PROJECT_DIR=$H7_PROJECT \
+    PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
+    "$ROOT/plugin/hooks/session-start.sh" </dev/null >"$RIG/h7.out" 2>"$RIG/h7.err" || \
+    fail H7 "identity refusal hook exited nonzero"
+grep -q 'KHALA_SESSION' "$RIG/h7.out" || fail H7 "identity instruction missing"
+[ ! -d "$H7_HOME/inbox" ] || [ -z "$(find "$H7_HOME/inbox" -path '*/cur/*' -type f -print -quit)" ] || \
+    fail H7 "identity refusal moved mail"
+
+H9_PROJECT=$RIG/h9-project
+mkdir -p "$H9_PROJECT"
+printf '%s\n' timed > "$H9_PROJECT/.khala-session"
+stage_letter "$H7_HOME" timed 7
+mkdir -p "$H7_HOME/run/brain.lock.d"
+printf '%s\npid %s contention\n' "$(date +%s)" "$$" > "$H7_HOME/run/brain.lock.d/owner"
+h9_reconcile_pids=
+h9_loop=1
+while [ "$h9_loop" -le 3 ]; do
+    setsid sh -c 'while :; do KHALA_HOME=$1 "$2" reconcile >/dev/null 2>&1 || :; done' \
+        sh "$H7_HOME" "$KHALA" &
+    h9_reconcile_pid=$!
+    h9_reconcile_pids="$h9_reconcile_pids $h9_reconcile_pid"
+    h9_loop=$((h9_loop + 1))
+done
+start_conduit "$H7_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+H9_CONDUIT_PID=$CONDUIT_PID
+h9_wait=0
+while ! runtime_env KHALA_HOME="$H7_HOME" "$BIN" runtime daemon-status >/dev/null 2>&1 && \
+    [ "$h9_wait" -lt 40 ]; do
+    sleep 0.05
+    h9_wait=$((h9_wait + 1))
+done
+[ "$h9_wait" -lt 40 ] || fail H9 "fixture conduit did not become live"
+H7_OWNER=$(register_session "$H7_HOME" taken h7-owner "$$" "$RIG/h7-missing.sock" \
+    interactive ready) || fail H7 "live owner registration failed"
+printf '%s\n' "$H7_OWNER" | grep -q '^owner yes$' || fail H7 "fixture owner did not get lease"
+stage_letter "$H7_HOME" taken 11
+H7_TAKEN_PROJECT=$RIG/h7-taken-project
+mkdir -p "$H7_TAKEN_PROJECT"
+printf '%s\n' taken > "$H7_TAKEN_PROJECT/.khala-session"
+HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+    KHALA_CLAUDE_SESSION_ID=h7-other KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
+    CLAUDE_PROJECT_DIR=$H7_TAKEN_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
+    "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h7-other"}' \
+    >"$RIG/h7-taken.out" 2>"$RIG/h7-taken.err" || fail H7 "non-owner hook failed"
+grep -q 'you are not the receiver of taken' "$RIG/h7-taken.out" || fail H7 "non-owner warning missing"
+[ -f "$H7_HOME/inbox/taken/new/1700000000.1.11.sender@alpha" ] || fail H7 "non-owner moved mail"
+pass H7 "SessionStart refuses inference and a valid non-owner consumes no mail"
+h9_started=$(uv run --no-project python - <<'PY'
+import time
+print(time.monotonic())
+PY
+)
+HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE \
+    KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_SESSION_INSTANCE=h9-instance \
+    KHALA_CLAUDE_SESSION_ID=h9-session KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
+    CLAUDE_PROJECT_DIR=$H9_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
+    "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h9-session"}' \
+    >"$RIG/h9.out" 2>"$RIG/h9.err" || fail H9 "contended hook exited nonzero"
+h9_finished=$(uv run --no-project python - <<'PY'
+import time
+print(time.monotonic())
+PY
+)
+h9_elapsed=$(uv run --no-project python - "$h9_started" "$h9_finished" <<'PY'
+import sys
+print(float(sys.argv[2]) - float(sys.argv[1]))
+PY
+)
+uv run --no-project python - "$h9_elapsed" <<'PY' || fail H9 "hook exceeded 12s: ${h9_elapsed}s"
+import sys
+assert float(sys.argv[1]) < 12.0
+PY
+grep -R -q '"phase":"ready"' "$RUNTIME_BASE/khala/sessions" || fail H9 "registration never reached ready"
+[ -f "$H7_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out drain consumed/misplaced mail"
+rm -rf -- "$H7_HOME/run/brain.lock.d"
+for h9_reconcile_pid in $h9_reconcile_pids; do
+    kill -- "-$h9_reconcile_pid" 2>/dev/null || :
+    wait "$h9_reconcile_pid" 2>/dev/null || :
+done
+pass H9 "contended SessionStart ${h9_elapsed}s (<12s), ready preceded the 10s drain timeout"
+stop_pid "$H9_CONDUIT_PID"
+
+# H8 — journal recovery suppresses an immediate duplicate; failed writes retry.
+H8_HOME=$RIG/h8-home
+init_home "$H8_HOME"
+start_listener h8 h8-session
+H8_PID=$LISTENER_PID; H8_SOCKET=$LISTENER_SOCKET; H8_FRAMES=$LISTENER_OUTPUT
+register_session "$H8_HOME" restart h8-session "$H8_PID" "$H8_SOCKET" interactive ready \
+    >/dev/null || fail H8 "registration failed"
+stage_letter "$H8_HOME" restart 8
+start_conduit "$H8_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+H8_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H8_FRAMES" 1 40 || fail H8 "first written frame missing"
+stop_pid "$H8_CONDUIT_PID"
+start_conduit "$H8_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+H8_CONDUIT_PID=$CONDUIT_PID
+sleep 0.3
+[ "$(line_count "$H8_FRAMES")" -eq 1 ] || fail H8 "restart duplicated written unchanged generation"
+pass H8 "restart restores written/failed journal state without an immediate duplicate"
+stop_pid "$H8_CONDUIT_PID"
+stop_pid "$H8_PID"
+
+# H10 — watch retreats only for its own verified, socket-backed registration.
+H10_HOME=$RIG/h10-home
+init_home "$H10_HOME"
+start_listener h10 h10-session
+H10_PID=$LISTENER_PID; H10_SOCKET=$LISTENER_SOCKET
+H10_REG=$(register_session "$H10_HOME" watcher h10-session "$H10_PID" "$H10_SOCKET" \
+    interactive ready) || fail H10 "watch registration failed"
+H10_INSTANCE=$(printf '%s\n' "$H10_REG" | sed -n 's/^instance //p')
+start_conduit "$H10_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+H10_CONDUIT_PID=$CONDUIT_PID
+wait_i=0
+while ! grep -R -q '"conduitVerified":true' "$RUNTIME_BASE/khala/sessions" 2>/dev/null && \
+    [ "$wait_i" -lt 40 ]; do
+    sleep 0.05
+    wait_i=$((wait_i + 1))
+done
+KHALA_HOME=$H10_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+    KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
+    "$KHALA" watch --session watcher --interval 1 --max-wait 1 >"$RIG/h10.out" 2>"$RIG/h10.err" || \
+    fail H10 "verified watch did not retreat 0"
+grep -Fqx 'conduit has the ear' "$RIG/h10.out" || fail H10 "retreat line differs"
+printf 'self alpha\nmailbox alpha\npeer alpha %s\nttl 120\n' "$H10_HOME" > "$H10_HOME/config"
+KHALA_HOME=$H10_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+    KHALA_SESSION=legacy "$KHALA" watch --session legacy --interval 1 --max-wait 3 \
+    >"$RIG/h10-legacy.out" 2>"$RIG/h10-legacy.err" &
+H10_WATCH_PID=$!
+PIDS="$PIDS $H10_WATCH_PID"
+sleep 0.2
+kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified watch retreated early"
+stage_letter "$H10_HOME" legacy 10
+wait "$H10_WATCH_PID" || fail H10 "legacy watch did not wake on a letter"
+grep -q '^1$' "$RIG/h10-legacy.out" || fail H10 "legacy watch output missing letter count"
+pass H10 "watch retreats only when verified and otherwise retains legacy wake behavior"
+stop_pid "$H10_CONDUIT_PID"
+stop_pid "$H10_PID"
+
+# H11 — all runtime writers reject a symlink root.
+H11_HOME=$RIG/h11-home
+init_home "$H11_HOME"
+H11_XDG=$RIG/h11-xdg
+mkdir -p "$H11_XDG" "$RIG/h11-target"
+ln -s "$RIG/h11-target" "$H11_XDG/khala"
+if env XDG_RUNTIME_DIR=$H11_XDG KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_HOME=$H11_HOME \
+    "$BIN" conduit >"$RIG/h11.out" 2>"$RIG/h11.err"; then
+    fail H11 "conduit accepted a symlink runtime"
+fi
+grep -qi 'symlink' "$RIG/h11.err" || fail H11 "symlink refusal was unclear"
+H11_PROJECT=$RIG/h11-project
+mkdir -p "$H11_PROJECT"
+printf '%s\n' symlinked > "$H11_PROJECT/.khala-session"
+HOME=$RIG KHALA_HOME=$H11_HOME XDG_RUNTIME_DIR=$H11_XDG \
+    KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
+    KHALA_CLAUDE_SESSION_ID=h11-session CLAUDE_PROJECT_DIR=$H11_PROJECT \
+    PATH=$H11_HOME/bin:$ROOT/bin:/usr/bin:/bin "$ROOT/plugin/hooks/session-start.sh" \
+    <<<'{"session_id":"h11-session"}' >"$RIG/h11-hook.out" 2>"$RIG/h11-hook.err" || \
+    fail H11 "symlink hook exited nonzero"
+grep -qi 'symlink' "$RIG/h11-hook.out" || fail H11 "hook symlink refusal was unclear"
+[ -z "$(find "$RIG/h11-target" -mindepth 1 -print -quit)" ] || fail H11 "symlink target was written"
+pass H11 "conduit and SessionStart refuse a symlink runtime root"
+
+# H12 — only the dial process may launch periodic reconcile; serve is per-peer singleton.
+H12_A=$RIG/h12-a
+H12_B=$RIG/h12-b
+init_home "$H12_A"
+init_home "$H12_B"
+printf 'self alpha\nmailbox beta\npeer beta direct-test-carrier\nttl 120\n' > "$H12_A/config"
+printf 'self beta\nmailbox beta\npeer beta direct-test-carrier\nttl 120\n' > "$H12_B/config"
+KHALA_HOME=$H12_A KHALA_BRAIN=$KHALA KHALA_LINK_TEST_SERVE_HOME=$H12_B \
+    KHALA_LINK_TEST_SERVE_NODE=beta KHALA_LINK_TEST_SCAN_INTERVAL=100ms \
+    "$BIN" >"$RIG/h12-dial.out" 2>"$RIG/h12-dial.err" &
+H12_DIAL_PID=$!
+PIDS="$PIDS $H12_DIAL_PID"
+wait_file "$H12_B/run/serve.alpha.lock" 100 || fail H12 "first serve did not acquire peer guard"
+if ! KHALA_HOME=$H12_B KHALA_BRAIN=$KHALA "$BIN" --serve --peer alpha \
+    </dev/null >"$RIG/h12-second.out" 2>"$RIG/h12-second.err"; then
+    fail H12 "second serve did not exit 0"
+fi
+H12_SECONDS=${H12_SECONDS:-60}
+h12_end=$(( $(date +%s) + H12_SECONDS ))
+while [ "$(date +%s)" -lt "$h12_end" ]; do
+    if [ -f "$H12_A/run/brain.lock.d/owner" ]; then
+        h12_owner=$(sed -n '2s/^pid \([0-9][0-9]*\) .*/\1/p' \
+            "$H12_A/run/brain.lock.d/owner" 2>/dev/null) || h12_owner=
+        if [ -n "$h12_owner" ]; then
+            h12_parent=$(ps -o ppid= -p "$h12_owner" 2>/dev/null | tr -d ' ')
+            [ -z "$h12_parent" ] || [ "$h12_parent" = "$H12_DIAL_PID" ] || \
+                fail H12 "non-dial process $h12_parent owned periodic brain reconcile"
+        fi
+    fi
+    [ ! -d "$H12_B/run/brain.lock.d" ] || \
+        fail H12 "serve-side brain.lock.d appeared"
+    sleep 0.05
+done
+pass H12 "dial alone reconciles and duplicate per-peer serve exits 0"
+
+bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
+    "$ROOT/plugin/hooks/session-start.sh" "$ROOT/plugin/hooks/stop.sh" \
+    "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
+
+printf 'RESULT: PASS\n'
+printf 'Conduit H1-H12 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'

@@ -7,8 +7,21 @@ START=$ROOT/plugin/hooks/session-start.sh
 STOP=$ROOT/plugin/hooks/stop.sh
 RIG=$HOME/.khala-minds-test-$$
 FAILURES=
+GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO_TMP=$HOME/.cache/khala-go-tmp
+GO_CACHE=$HOME/.cache/khala-go-cache
 
 cleanup() {
+    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
+    for cleanup_status in "$RIG"/*/run/link.status; do
+        [ -f "$cleanup_status" ] || continue
+        cleanup_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$cleanup_status")
+        [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
+    done
     rm -rf -- "$RIG"
 }
 
@@ -113,6 +126,13 @@ prepare_hook() {
     if [ ! -e "$HOOK_SHIM/khala" ]; then
         ln -s "$KHALA" "$HOOK_SHIM/khala" || return 1
     fi
+    HOOK_LINK_BIN=$RIG/khala-link
+    if [ ! -x "$HOOK_LINK_BIN" ]; then
+        [ -x "$GO" ] || return 1
+        mkdir -p "$GO_TMP" "$GO_CACHE" || return 1
+        (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
+            "$GO" build -trimpath -o "$HOOK_LINK_BIN" .) || return 1
+    fi
 }
 
 run_start() {
@@ -120,12 +140,21 @@ run_start() {
     start_project=$2
     start_output=$3
     start_input=$4
+    mkdir -p "$start_home/bin" || return 1
+    if [ ! -e "$start_home/bin/khala-link" ]; then
+        cp "$HOOK_LINK_BIN" "$start_home/bin/khala-link" || return 1
+    else
+        cmp -s "$HOOK_LINK_BIN" "$start_home/bin/khala-link" || return 1
+    fi
     # A caller shell's exported KHALA_SESSION would beat the fixture's
     # .khala-session identity file (env > file precedence) and corrupt every
     # SessionStart property — eddy hit exactly this. Sanitize explicitly.
     printf '%s\n' "$start_input" | \
         env -u KHALA_SESSION \
         HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
+        XDG_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=minds-test-boot \
+        KHALA_CLAUDE_SESSION_ID=$(basename "$start_output") KHALA_SESSION_PID=$$ \
+        KHALA_SESSION_KIND=interactive \
         PATH=$HOOK_SHIM:/usr/bin:/bin "$START" > "$start_output" 2> "$start_output.err"
 }
 
@@ -320,9 +349,9 @@ property_m9() {
     [ "$(sed -n 's/^Generation: //p' "$current_file")" = "$current" ] || die "Generation header differs from filename"
     [ "$(sed -n 's/^Session: //p' "$current_file")" = joined ] || die "Session header differs"
     [ "$(sed -n 's/^Node: //p' "$current_file")" = alpha ] || die "Node header differs"
-    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.4.0' ] || die "brain version is not 0.4.0"
-    grep -q '"version": "0.4.0"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
-        die "plugin version is not 0.4.0"
+    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.5.0' ] || die "brain version is not 0.5.0"
+    grep -q '"version": "0.5.0"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
+        die "plugin version is not 0.5.0"
     grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && die "plugin manifest contains forbidden hooks key"
     return 0
 }
