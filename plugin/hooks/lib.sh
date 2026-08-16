@@ -167,7 +167,8 @@ khala_read_session_file() {
     [ "$khala_session_line_count" -eq 1 ] && khala_valid_name "$KHALA_SESSION_FILE_VALUE"
 }
 
-# $1: allow basename fallback (1/0), $2: emit resolution warnings (1/0)
+# $1 is retained for hook-call compatibility; basename inference is forbidden.
+# $2: emit resolution warnings (1/0)
 khala_resolve_session() {
     khala_allow_basename=$1
     khala_emit_warning=$2
@@ -202,24 +203,10 @@ khala_resolve_session() {
         fi
     fi
 
-    [ "$khala_allow_basename" -eq 1 ] || return 1
-    if [ -z "${CLAUDE_PROJECT_DIR-}" ]; then
-        if [ "$khala_emit_warning" -eq 1 ]; then
-            printf '%s\n' 'khala: CLAUDE_PROJECT_DIR가 없어 세션을 정할 수 없습니다 — 드레인을 건너뜁니다'
-        fi
-        return 1
+    if [ "$khala_emit_warning" -eq 1 ]; then
+        printf '%s\n' 'khala: 세션 신원이 없습니다 — KHALA_SESSION=<name>을 설정하거나 프로젝트에 한 줄짜리 .khala-session을 만드세요'
     fi
-    khala_basename=$(basename "$CLAUDE_PROJECT_DIR")
-    if ! khala_valid_name "$khala_basename"; then
-        if [ "$khala_emit_warning" -eq 1 ]; then
-            printf 'khala: 프로젝트 디렉터리명으로 세션을 정할 수 없습니다: %s (허용: [a-z0-9][a-z0-9-]*) — 드레인을 건너뜁니다\n' \
-                "$khala_basename"
-        fi
-        return 1
-    fi
-    KHALA_RESOLVED_SESSION=$khala_basename
-    KHALA_SESSION_SOURCE=basename
-    return 0
+    return 1
 }
 
 khala_self_node() {
@@ -284,4 +271,34 @@ khala_link_is_fresh() {
     khala_now=$(date +%s) || return 1
     [ "$khala_now" -ge "$khala_link_mtime" ] || return 1
     [ "$((khala_now - khala_link_mtime))" -le 60 ]
+}
+
+# Run only a hook-owned child for at most $1 seconds. Output paths are explicit
+# so a killed drain can still expose any complete letters it printed first.
+khala_run_with_deadline() {
+    khala_deadline_seconds=$1
+    khala_deadline_stdout=$2
+    khala_deadline_stderr=$3
+    shift 3
+    mkdir -p "$KHALA_ROOT/tmp" || return 1
+    khala_deadline_marker=$KHALA_ROOT/tmp/hook-timeout.$$.${RANDOM-0}
+    rm -f "$khala_deadline_marker"
+    "$@" > "$khala_deadline_stdout" 2> "$khala_deadline_stderr" &
+    khala_deadline_pid=$!
+    (
+        sleep "$khala_deadline_seconds"
+        if kill "$khala_deadline_pid" 2>/dev/null; then
+            printf '%s\n' timeout > "$khala_deadline_marker"
+        fi
+    ) &
+    khala_deadline_watchdog=$!
+    wait "$khala_deadline_pid"
+    khala_deadline_status=$?
+    kill "$khala_deadline_watchdog" 2>/dev/null || :
+    wait "$khala_deadline_watchdog" 2>/dev/null || :
+    if [ -f "$khala_deadline_marker" ]; then
+        rm -f "$khala_deadline_marker"
+        return 124
+    fi
+    return "$khala_deadline_status"
 }

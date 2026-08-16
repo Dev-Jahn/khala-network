@@ -298,10 +298,12 @@ func (t *treeWatcher) scanAgeGoverned() {
 }
 
 func (t *treeWatcher) ageScanReady() bool {
-	if err := t.brain.reconcile(true); err != nil {
-		t.ageReady = false
-		t.logger.Printf("age-governed scan skipped; brain reconcile failed: %v", err)
-		return false
+	if t.brain.ownsReconcile() {
+		if err := t.brain.reconcile(true); err != nil {
+			t.ageReady = false
+			t.logger.Printf("age-governed scan skipped; brain reconcile failed: %v", err)
+			return false
+		}
 	}
 	// Presence has no filename epoch, so successful reconciliation is its
 	// only age gate. Register first, then scan to preserve C4 event coverage.

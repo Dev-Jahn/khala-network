@@ -46,7 +46,7 @@ type pump struct {
 	expiredOfferLogs *logOnceSet
 }
 
-func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, maxObject int64, retainDays uint64, scanEvery time.Duration, expiredOfferLogs *logOnceSet, logger *log.Logger) (hello, error) {
+func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, nodeBrain *brain, maxObject int64, retainDays uint64, scanEvery time.Duration, expiredOfferLogs *logOnceSet, logger *log.Logger) (hello, error) {
 	localMinor, err := advertisedMinor(role)
 	if err != nil {
 		return hello{}, err
@@ -83,12 +83,12 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	p.lastInput.Store(time.Now().UnixNano())
 
 	sessionCtx, cancel := context.WithCancel(ctx)
-	p.brain = newBrain(brainPath, home, logger)
-	brainDone := make(chan struct{})
-	go func() {
-		p.brain.run(sessionCtx)
-		close(brainDone)
-	}()
+	// A dial carrier shares the main process's one reconcile owner. A serve
+	// carrier gets a trigger-only handle that never invokes the brain itself.
+	p.brain = nodeBrain
+	if p.brain == nil {
+		p.brain = newBrain(brainPath, home, logger, false)
+	}
 	candidates := make(chan candidate, 256)
 	watcher := newTreeWatcher(home, role, self, p.peer, logger, p.brain, p.origins, candidates, scanEvery)
 	errs := make(chan error, 4)
@@ -99,14 +99,9 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	}()
 	defer func() {
 		cancel()
-		// A scan-gate reconcile can own brain.lock.d. Let the watcher finish it
-		// before this process exits, otherwise the child dies with a live lock.
+		// A dial scan-gate can be using the shared reconcile owner. Let the
+		// watcher leave that call before carrier teardown returns.
 		<-watcherDone
-		select {
-		case <-brainDone:
-		case <-time.After(10 * time.Second):
-			logger.Printf("brain reconcile still running after link shutdown; leaving it alive to release brain.lock.d")
-		}
 	}()
 	go func() { errs <- p.sendLoop(sessionCtx, candidates) }()
 	go func() { errs <- p.readLoop(sessionCtx) }()

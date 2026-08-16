@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 )
+
+var errNoDialEndpoints = errors.New("config has no remote mailbox peer for link dial")
 
 var (
 	nodePattern       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
@@ -94,7 +97,7 @@ func (c config) dialEndpoints() ([]dialEndpoint, error) {
 		}
 	}
 	if len(endpoints) == 0 {
-		return nil, errorsf("config has no remote mailbox peer for link dial")
+		return nil, errNoDialEndpoints
 	}
 	return endpoints, nil
 }

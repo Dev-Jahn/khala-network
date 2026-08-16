@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.4.2
+KHALA_VERSION=0.5.0
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -42,12 +42,51 @@ error() {
 }
 
 usage() {
+    case "${1-}" in
+        version) printf '%s\n' 'usage: khala version'; return 0 ;;
+        init) printf '%s\n' 'usage: khala init <node>'; return 0 ;;
+        send)
+            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--as session]'
+            return 0
+            ;;
+        say)
+            printf '%s\n' 'usage: khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]'
+            return 0
+            ;;
+        join) printf '%s\n' 'usage: khala join <stream> [--from-start] [--quiet]'; return 0 ;;
+        leave) printf '%s\n' 'usage: khala leave <stream>'; return 0 ;;
+        streams) printf '%s\n' 'usage: khala streams'; return 0 ;;
+        stream) printf '%s\n' 'usage: khala stream cat <stream> [-n N]'; return 0 ;;
+        mind) printf '%s\n' 'usage: khala mind (-m focus [--stance stance] | --clear)'; return 0 ;;
+        profile)
+            printf '%s\n' 'usage: khala profile [--model model] [--effort effort] [--role role] [--charge charge]'
+            return 0
+            ;;
+        minds) printf '%s\n' 'usage: khala minds'; return 0 ;;
+        retire) printf '%s\n' 'usage: khala retire <session>'; return 0 ;;
+        reconcile) printf '%s\n' 'usage: khala reconcile'; return 0 ;;
+        sync) printf '%s\n' 'usage: khala sync'; return 0 ;;
+        link)
+            printf '%s\n' 'usage: khala link [restart] [--max-object-bytes bytes]'
+            printf '%s\n' '       khala link --serve [--max-object-bytes bytes]'
+            return 0
+            ;;
+        watch)
+            printf '%s\n' 'usage: khala watch [--session session] [--interval seconds] [--max-wait seconds]'
+            return 0
+            ;;
+        inbox)
+            printf '%s\n' 'usage: khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B]]'
+            return 0
+            ;;
+        presence) printf '%s\n' 'usage: khala presence'; return 0 ;;
+    esac
     cat >&2 <<'EOF'
 usage:
   khala version
   khala init <node>
-  khala send <session@node> [-s subject] [-e seconds] [-m message] [--as session]
-  khala say [stream] [-s subject] [-r ref-id] [-m message]
+  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--as session]
+  khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]
   khala join <stream> [--from-start] [--quiet]
   khala leave <stream>
   khala streams
@@ -61,7 +100,7 @@ usage:
   khala link [restart] [--max-object-bytes bytes]
   khala link --serve [--max-object-bytes bytes]
   khala watch [--session session] [--interval seconds] [--max-wait seconds]
-  khala inbox [--drain [--max-n N] [--max-bytes B]]
+  khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B]]
   khala presence
 EOF
 }
@@ -159,11 +198,8 @@ session_name() {
         # checkout silently completes under the directory basename instead.
         session=$session_file
     else
-        if [ -z "${PWD-}" ]; then
-            error "발신 세션 이름을 정할 수 없습니다; --as를 지정하세요"
-            return 1
-        fi
-        session=$(basename "$PWD")
+        error "세션 이름을 정할 수 없습니다; KHALA_SESSION을 설정하거나 .khala-session을 만들거나 --as를 지정하세요"
+        return 1
     fi
     if ! valid_name "$session"; then
         error "잘못된 세션 이름: $session"
@@ -2350,6 +2386,12 @@ cmd_send() {
     fi
     send_to=$1
     shift
+    case "$send_to" in
+        --*)
+            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --as"
+            return 1
+            ;;
+    esac
     if ! valid_address "$send_to"; then
         error "잘못된 주소: $send_to"
         return 1
@@ -2360,10 +2402,11 @@ cmd_send() {
     send_body_set=0
     send_as=
     send_as_set=0
+    send_reply_to=
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -s)
-                [ "$#" -ge 2 ] || { error "-s 값이 없습니다"; return 1; }
+            -s|--subject)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
                 send_subject=$2
                 shift 2
                 ;;
@@ -2372,10 +2415,15 @@ cmd_send() {
                 send_ttl=$2
                 shift 2
                 ;;
-            -m)
-                [ "$#" -ge 2 ] || { error "-m 값이 없습니다"; return 1; }
+            -m|--message|--body)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
                 send_body=$2
                 send_body_set=1
+                shift 2
+                ;;
+            --reply-to)
+                [ "$#" -ge 2 ] || { error "--reply-to 값이 없습니다"; return 1; }
+                send_reply_to=$2
                 shift 2
                 ;;
             --as)
@@ -2383,6 +2431,10 @@ cmd_send() {
                 send_as=$2
                 send_as_set=1
                 shift 2
+                ;;
+            --*)
+                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --as"
+                return 1
                 ;;
             *)
                 error "알 수 없는 send 옵션: $1"
@@ -2399,6 +2451,10 @@ cmd_send() {
         *'
 '*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
     esac
+    if [ -n "$send_reply_to" ] && ! valid_message_id "$send_reply_to"; then
+        error "잘못된 reply Id: $send_reply_to"
+        return 1
+    fi
     send_node=$(self_node) || return 1
     send_session=$(session_name "$send_as" "$send_as_set") || return 1
     send_from=$send_session@$send_node
@@ -2421,6 +2477,9 @@ cmd_send() {
         # AMBIGUOUS: §9.6 exposes -s but does not define its on-disk header.
         if [ -n "$send_subject" ]; then
             printf 'Subject: %s\n' "$send_subject"
+        fi
+        if [ -n "$send_reply_to" ]; then
+            printf 'In-Reply-To: %s\n' "$send_reply_to"
         fi
         printf 'Expires: %s\n' "$send_expires"
         printf '\n'
@@ -2474,8 +2533,8 @@ cmd_say() {
     say_body_set=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            -s)
-                [ "$#" -ge 2 ] || { error "-s 값이 없습니다"; return 1; }
+            -s|--subject)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
                 say_subject=$2
                 shift 2
                 ;;
@@ -2484,11 +2543,15 @@ cmd_say() {
                 say_ref=$2
                 shift 2
                 ;;
-            -m)
-                [ "$#" -ge 2 ] || { error "-m 값이 없습니다"; return 1; }
+            -m|--message|--body)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
                 say_body=$2
                 say_body_set=1
                 shift 2
+                ;;
+            --*)
+                error "알 수 없는 say 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -r"
+                return 1
                 ;;
             *) error "알 수 없는 say 옵션: $1"; return 1 ;;
         esac
@@ -3115,23 +3178,243 @@ cmd_sync() {
 
 cmd_link() {
     require_config || return 1
+    if ! find_link_binary; then
+        error "khala-link 바이너리가 없습니다; 예상 경로: $link_home_binary 또는 $link_sibling_binary"
+        return 1
+    fi
     link_script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || {
         error "bin/khala의 절대 경로를 확인하지 못했습니다"
         return 1
     }
     link_brain=$link_script_dir/$(basename "$0")
+
+    export KHALA_BRAIN=$link_brain
+    exec "$LINK_BINARY" "$@"
+}
+
+find_link_binary() {
+    LINK_BINARY=
+    link_script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || return 1
     link_home_binary=$KHALA_ROOT/bin/khala-link
     link_sibling_binary=$link_script_dir/khala-link
     if [ -x "$link_home_binary" ]; then
-        link_binary=$link_home_binary
+        LINK_BINARY=$link_home_binary
     elif [ -x "$link_sibling_binary" ]; then
-        link_binary=$link_sibling_binary
+        LINK_BINARY=$link_sibling_binary
+    fi
+    [ -n "$LINK_BINARY" ]
+}
+
+cmd_bind() {
+    require_config || return 1
+    find_link_binary || {
+        error "khala bind에는 khala-link 바이너리가 필요합니다"
+        return 1
+    }
+    if [ "$#" -ge 1 ] && [ "$1" = --register ]; then
+        [ "$#" -ge 2 ] || { error "--register phase가 없습니다"; return 1; }
+        bind_phase=$2
+        shift 2
+        bind_identity=$(session_name "" 0) || return 1
+        "$LINK_BINARY" runtime register --identity "$bind_identity" --phase "$bind_phase" \
+            --caller-pid "$$" "$@"
+        return $?
+    fi
+    if [ "$#" -ge 1 ] && [ "$1" = --release ]; then
+        shift
+        bind_identity=${KHALA_SESSION-}
+        if [ -n "$bind_identity" ] && ! valid_name "$bind_identity"; then
+            error "잘못된 세션 이름: $bind_identity"
+            return 1
+        fi
+        "$LINK_BINARY" runtime release --identity "$bind_identity" "$@"
+        return $?
+    fi
+    if [ "$#" -ge 1 ] && [ "$1" = --native-warning ]; then
+        shift
+        "$LINK_BINARY" runtime native-warning "$@"
+        return $?
+    fi
+    bind_takeover=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --takeover) bind_takeover=1; shift ;;
+            *) error "알 수 없는 bind 옵션: $1"; return 1 ;;
+        esac
+    done
+    bind_identity=$(session_name "" 0) || return 1
+    if [ "$bind_takeover" -eq 1 ]; then
+        "$LINK_BINARY" runtime bind --identity "$bind_identity" --caller-pid "$$" --takeover
     else
-        error "khala-link 바이너리가 없습니다; 예상 경로: $link_home_binary 또는 $link_sibling_binary"
+        "$LINK_BINARY" runtime bind --identity "$bind_identity" --caller-pid "$$"
+    fi
+}
+
+cmd_status() {
+    require_config || return 1
+    [ "$#" -eq 0 ] || { usage; return 1; }
+    find_link_binary || {
+        error "khala status의 conduit 상태에는 khala-link 바이너리가 필요합니다"
+        return 1
+    }
+    "$LINK_BINARY" runtime status
+}
+
+node_accept_configured() {
+    [ -n "${HOME-}" ] || return 1
+    node_settings=$HOME/.claude/settings.json
+    [ -f "$node_settings" ] || return 1
+    grep -Eq '"crossSessionInbound"[[:space:]]*:[[:space:]]*"accept"' "$node_settings"
+}
+
+node_write_systemd_units() {
+    node_unit_dir=$HOME/.config/systemd/user
+    mkdir -p "$node_unit_dir" || return 1
+    node_conduit_unit=$node_unit_dir/khala-conduit.service
+    node_link_unit=$node_unit_dir/khala-link.service
+    node_tmp=$(mktemp "$node_unit_dir/.khala-conduit.XXXXXX") || return 1
+    if ! {
+        printf '%s\n' '[Unit]' 'Description=Khala conduit doorbell' '' '[Service]' 'Type=simple'
+        printf 'Environment="KHALA_HOME=%s"\n' "$KHALA_ROOT"
+        if [ -n "${XDG_RUNTIME_DIR-}" ]; then
+            printf 'Environment="XDG_RUNTIME_DIR=%s"\n' "$XDG_RUNTIME_DIR"
+        fi
+        printf 'ExecStart="%s" conduit\n' "$LINK_BINARY"
+        printf 'StandardOutput=append:%s\n' "$KHALA_ROOT/log/conduit.log"
+        printf 'StandardError=append:%s\n' "$KHALA_ROOT/log/conduit.log"
+        printf '%s\n' 'Restart=on-failure' '' '[Install]' 'WantedBy=default.target'
+    } > "$node_tmp" || ! mv "$node_tmp" "$node_conduit_unit"; then
+        rm -f "$node_tmp"
         return 1
     fi
-    export KHALA_BRAIN=$link_brain
-    exec "$link_binary" "$@"
+    node_tmp=$(mktemp "$node_unit_dir/.khala-link.XXXXXX") || return 1
+    if ! {
+        printf '%s\n' '[Unit]' 'Description=Khala fleet link' '' '[Service]' 'Type=simple'
+        printf 'Environment="KHALA_HOME=%s"\n' "$KHALA_ROOT"
+        printf 'ExecStart="%s" link\n' "$KHALA_EXECUTABLE"
+        printf '%s\n' 'Restart=on-failure' '' '[Install]' 'WantedBy=default.target'
+    } > "$node_tmp" || ! mv "$node_tmp" "$node_link_unit"; then
+        rm -f "$node_tmp"
+        return 1
+    fi
+    systemctl --user daemon-reload >/dev/null 2>&1
+}
+
+node_write_launch_agents() {
+    node_agent_dir=$HOME/Library/LaunchAgents
+    mkdir -p "$node_agent_dir" || return 1
+    node_conduit_plist=$node_agent_dir/dev.khala.conduit.plist
+    node_tmp=$(mktemp "$node_agent_dir/.khala-conduit.XXXXXX") || return 1
+    if ! {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' '<plist version="1.0"><dict>' '<key>Label</key><string>dev.khala.conduit</string>' '<key>ProgramArguments</key><array>'
+        printf '<string>%s</string><string>conduit</string>\n' "$LINK_BINARY"
+        printf '%s\n' '</array>'
+        printf '<key>EnvironmentVariables</key><dict><key>KHALA_HOME</key><string>%s</string>\n' "$KHALA_ROOT"
+        if [ -n "${XDG_RUNTIME_DIR-}" ]; then
+            printf '<key>XDG_RUNTIME_DIR</key><string>%s</string>\n' "$XDG_RUNTIME_DIR"
+        fi
+        printf '%s\n' '</dict>'
+        printf '<key>StandardOutPath</key><string>%s</string>\n' "$KHALA_ROOT/log/conduit.log"
+        printf '<key>StandardErrorPath</key><string>%s</string>\n' "$KHALA_ROOT/log/conduit.log"
+        printf '%s\n' '<key>KeepAlive</key><true/><key>RunAtLoad</key><true/></dict></plist>'
+    } > "$node_tmp" || ! mv "$node_tmp" "$node_conduit_plist"; then
+        rm -f "$node_tmp"
+        return 1
+    fi
+    node_link_plist=$node_agent_dir/dev.khala.link.plist
+    node_tmp=$(mktemp "$node_agent_dir/.khala-link.XXXXXX") || return 1
+    if ! {
+        printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' '<plist version="1.0"><dict>' '<key>Label</key><string>dev.khala.link</string>' '<key>ProgramArguments</key><array>'
+        printf '<string>%s</string><string>link</string>\n' "$KHALA_EXECUTABLE"
+        printf '%s\n' '</array>'
+        printf '<key>EnvironmentVariables</key><dict><key>KHALA_HOME</key><string>%s</string></dict>\n' "$KHALA_ROOT"
+        printf '%s\n' '<key>KeepAlive</key><true/><key>RunAtLoad</key><true/></dict></plist>'
+    } > "$node_tmp" || ! mv "$node_tmp" "$node_link_plist"; then
+        rm -f "$node_tmp"
+        return 1
+    fi
+    return 0
+}
+
+node_start_detached() {
+    node_daemon=$1
+    node_log=$2
+    case "$node_daemon" in
+        conduit)
+            setsid sh -c 'KHALA_HOME=$1; export KHALA_HOME; "$2" conduit </dev/null >>"$3" 2>&1 &' \
+                sh "$KHALA_ROOT" "$LINK_BINARY" "$node_log" </dev/null >/dev/null 2>&1 &
+            ;;
+        link)
+            setsid sh -c 'KHALA_HOME=$1; export KHALA_HOME; "$2" link </dev/null >>"$3" 2>&1 &' \
+                sh "$KHALA_ROOT" "$KHALA_EXECUTABLE" "$node_log" </dev/null >/dev/null 2>&1 &
+            ;;
+    esac
+}
+
+cmd_node() {
+    require_config || return 1
+    [ "$#" -eq 1 ] && [ "$1" = ensure ] || { error "node 하위 명령은 ensure입니다"; return 1; }
+    find_link_binary || {
+        error "khala node ensure에는 khala-link 바이너리가 필요합니다"
+        return 1
+    }
+    KHALA_EXECUTABLE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)/$(basename "$0")
+    mkdir -p "$KHALA_ROOT/log" || return 1
+    node_started=
+    node_conduit_live=0
+    "$LINK_BINARY" runtime daemon-status >/dev/null 2>&1 && node_conduit_live=1
+    node_link_live=0
+    node_link_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$KHALA_ROOT/run/link.status" 2>/dev/null)
+    if positive_integer "$node_link_pid" && kill -0 "$node_link_pid" 2>/dev/null; then
+        node_link_live=1
+    fi
+    # A mailbox node still needs the dial-side singleton when it has no remote
+    # endpoint: that process is the sole owner of periodic local reconcile.
+    node_need_link=1
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+        node_write_systemd_units || { error "systemd user unit 설치 실패"; return 1; }
+        if [ "$node_conduit_live" -eq 0 ]; then
+            systemctl --user enable --now khala-conduit.service >/dev/null 2>&1 || return 1
+            node_started=conduit
+        fi
+        if [ "$node_need_link" -eq 1 ] && [ "$node_link_live" -eq 0 ]; then
+            systemctl --user enable --now khala-link.service >/dev/null 2>&1 || return 1
+            node_started=${node_started:+$node_started,}link
+        fi
+    elif [ "$(uname -s 2>/dev/null)" = Darwin ] && command -v launchctl >/dev/null 2>&1; then
+        node_write_launch_agents || { error "LaunchAgent 설치 실패"; return 1; }
+        if [ "$node_conduit_live" -eq 0 ]; then
+            launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.khala.conduit.plist" >/dev/null 2>&1 || \
+                launchctl kickstart -k "gui/$(id -u)/dev.khala.conduit" >/dev/null 2>&1 || return 1
+            node_started=conduit
+        fi
+        if [ "$node_need_link" -eq 1 ] && [ "$node_link_live" -eq 0 ]; then
+            launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/dev.khala.link.plist" >/dev/null 2>&1 || \
+                launchctl kickstart -k "gui/$(id -u)/dev.khala.link" >/dev/null 2>&1 || return 1
+            node_started=${node_started:+$node_started,}link
+        fi
+    else
+        command -v setsid >/dev/null 2>&1 || {
+            error "systemd user bus나 LaunchAgent가 없고 setsid도 없습니다"
+            return 1
+        }
+        if [ "$node_conduit_live" -eq 0 ]; then
+            node_start_detached conduit "$KHALA_ROOT/log/conduit.log"
+            node_started=conduit
+        fi
+        if [ "$node_need_link" -eq 1 ] && [ "$node_link_live" -eq 0 ]; then
+            node_start_detached link "$KHALA_ROOT/log/link.log"
+            node_started=${node_started:+$node_started,}link
+        fi
+    fi
+    if [ -n "$node_started" ]; then
+        printf 'khala: node ensure started %s\n' "$node_started"
+    fi
+    if ! node_accept_configured; then
+        printf '%s\n' 'khala: crossSessionInbound가 accept가 아닙니다 — `claude config set crossSessionInbound accept` 또는 `/config`의 해당 행에서 accept로 설정하세요' >&2
+    fi
+    return 0
 }
 
 collect_watch_stream_rows() {
@@ -3202,6 +3485,13 @@ cmd_watch() {
     watch_interval=$(normalize_integer "$watch_interval")
     watch_max_wait=$(normalize_integer "$watch_max_wait")
     watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
+    if find_link_binary && "$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
+        --instance "${KHALA_SESSION_INSTANCE-}" \
+        --session-id "${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}" \
+        --caller-pid "$$" >/dev/null 2>&1; then
+        printf '%s\n' 'conduit has the ear'
+        return 0
+    fi
     watch_self=$(self_node) || {
         error "설정을 확인하거나 khala init 먼저 실행하세요."
         return 1
@@ -3303,6 +3593,11 @@ cmd_watch() {
         watch_stream_count=$(wc -l < "$watch_stream_rows" | tr -d ' ')
         watch_total=$((watch_count + watch_stream_count))
         if [ "$watch_total" -gt 0 ]; then
+            if [ "$watch_count" -gt 0 ]; then
+                printf '%s\n' 'wake: delivery'
+            else
+                printf '%s\n' 'wake: stream'
+            fi
             printf '%s\n' "$watch_total"
             for watch_file in "$watch_inbox_dir"/*; do
                 [ -f "$watch_file" ] || continue
@@ -3341,39 +3636,56 @@ cmd_watch() {
 
 cmd_inbox() {
     require_config || return 1
-    drain=0
+    inbox_mode=summary
     # AMBIGUOUS: §9.6 requires drain bounds but does not specify their defaults.
     max_n=20
     max_bytes=65536
     if [ "$#" -gt 0 ]; then
-        if [ "$1" != --drain ]; then
-            error "inbox 옵션은 --drain부터 시작해야 합니다"
-            return 1
-        fi
-        drain=1
-        shift
-        while [ "$#" -gt 0 ]; do
-            case "$1" in
-                --max-n)
-                    [ "$#" -ge 2 ] || { error "--max-n 값이 없습니다"; return 1; }
-                    max_n=$2
-                    shift 2
-                    ;;
-                --max-bytes)
-                    [ "$#" -ge 2 ] || { error "--max-bytes 값이 없습니다"; return 1; }
-                    max_bytes=$2
-                    shift 2
-                    ;;
-                *) error "알 수 없는 inbox 옵션: $1"; return 1 ;;
-            esac
-        done
+        case "$1" in
+            --drain)
+                inbox_mode=drain
+                shift
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --max-n)
+                            [ "$#" -ge 2 ] || { error "--max-n 값이 없습니다"; return 1; }
+                            max_n=$2
+                            shift 2
+                            ;;
+                        --max-bytes)
+                            [ "$#" -ge 2 ] || { error "--max-bytes 값이 없습니다"; return 1; }
+                            max_bytes=$2
+                            shift 2
+                            ;;
+                        *) error "알 수 없는 inbox 옵션: $1"; return 1 ;;
+                    esac
+                done
+                ;;
+            list)
+                [ "$#" -eq 1 ] || { error "inbox list는 인자를 받지 않습니다"; return 1; }
+                inbox_mode=list
+                ;;
+            read)
+                [ "$#" -eq 2 ] || { error "사용법: khala inbox read <Id>"; return 1; }
+                inbox_mode=read
+                inbox_read_id=$2
+                if ! valid_message_id "$inbox_read_id"; then
+                    error "잘못된 편지 Id: $inbox_read_id"
+                    return 1
+                fi
+                ;;
+            *) error "알 수 없는 inbox 모드: $1; 사용 가능: list, read <Id>, --drain"; return 1 ;;
+        esac
     fi
-    if ! positive_integer "$max_n" || ! positive_integer "$max_bytes"; then
+    if [ "$inbox_mode" = drain ] && \
+        { ! positive_integer "$max_n" || ! positive_integer "$max_bytes"; }; then
         error "drain 상한은 양의 정수여야 합니다"
         return 1
     fi
-    max_n=$(normalize_integer "$max_n")
-    max_bytes=$(normalize_integer "$max_bytes")
+    if [ "$inbox_mode" = drain ]; then
+        max_n=$(normalize_integer "$max_n")
+        max_bytes=$(normalize_integer "$max_bytes")
+    fi
     inbox_session=$(session_name "" 0) || return 1
     if ! heartbeat "$inbox_session"; then
         error "heartbeat를 갱신하지 못했습니다"
@@ -3384,7 +3696,7 @@ cmd_inbox() {
         error "inbox 디렉터리를 만들지 못했습니다"
         return 1
     fi
-    if [ "$drain" -eq 0 ]; then
+    if [ "$inbox_mode" = summary ]; then
         for inbox_file in "$inbox_dir"/new/*; do
             [ -f "$inbox_file" ] || continue
             list_id=$(header_value Id "$inbox_file")
@@ -3394,12 +3706,51 @@ cmd_inbox() {
         done
         return 0
     fi
+    if [ "$inbox_mode" = list ]; then
+        inbox_list_tmp=$(mktemp "$TMP_DIR/inbox-list.XXXXXX") || return 1
+        for inbox_list_state in new cur; do
+            : > "$inbox_list_tmp" || { rm -f "$inbox_list_tmp"; return 1; }
+            for inbox_file in "$inbox_dir/$inbox_list_state"/*; do
+                [ -f "$inbox_file" ] || continue
+                list_id=$(header_value Id "$inbox_file")
+                printf '%s\t%s\n' "${list_id%%.*}" "$inbox_file" >> "$inbox_list_tmp" || {
+                    rm -f "$inbox_list_tmp"
+                    return 1
+                }
+            done
+            sort -n -k1,1 -k2,2 "$inbox_list_tmp" | \
+                while IFS="$TAB" read -r list_epoch inbox_file; do
+                    [ -n "${inbox_file-}" ] || continue
+                    list_id=$(header_value Id "$inbox_file")
+                    list_from=$(header_value From "$inbox_file")
+                    list_subject=$(header_value Subject "$inbox_file")
+                    list_date=$(header_value Date "$inbox_file")
+                    printf '%s\t%s\t%s\t%s\n' "$list_id" "$list_from" \
+                        "$list_subject" "$list_date"
+                done || { rm -f "$inbox_list_tmp"; return 1; }
+        done
+        rm -f "$inbox_list_tmp"
+        return 0
+    fi
+    if [ "$inbox_mode" = read ]; then
+        if [ -f "$inbox_dir/cur/$inbox_read_id" ]; then
+            inbox_read_file=$inbox_dir/cur/$inbox_read_id
+        elif [ -f "$inbox_dir/new/$inbox_read_id" ]; then
+            inbox_read_file=$inbox_dir/new/$inbox_read_id
+        else
+            error "$inbox_read_id: 편지를 찾지 못했습니다"
+            return 1
+        fi
+        cat "$inbox_read_file"
+        return $?
+    fi
     inbox_lock=$KHALA_ROOT/run/brain.lock.d
     if ! acquire_lock "$inbox_lock" 300 inbox-drain; then
         error "inbox drain용 brain lock을 얻지 못했습니다"
         return 1
     fi
     inbox_drain_status=0
+    trap '' PIPE
     prune_stream_entries
     drained_n=0
     drained_bytes=0
@@ -3410,20 +3761,18 @@ cmd_inbox() {
         file_bytes=$(wc -c < "$inbox_file" | tr -d ' ')
         if [ "$drained_n" -lt "$max_n" ] && \
             [ "$((drained_bytes + file_bytes))" -le "$max_bytes" ]; then
-            printf '%s\n' "--- $(basename "$inbox_file") ---"
-            if ! cat "$inbox_file"; then
-                error "$inbox_file: 읽기에 실패했습니다"
-                inbox_drain_status=1
-                break
-            fi
-            printf '\n'
-            if ! mv "$inbox_file" "$inbox_dir/cur/$(basename "$inbox_file")"; then
+            inbox_basename=$(basename "$inbox_file")
+            inbox_cur_file=$inbox_dir/cur/$inbox_basename
+            if ! mv "$inbox_file" "$inbox_cur_file"; then
                 error "$inbox_file: cur 이동에 실패했습니다"
                 inbox_drain_status=1
                 break
             fi
             drained_n=$((drained_n + 1))
             drained_bytes=$((drained_bytes + file_bytes))
+            printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
+            cat "$inbox_cur_file" 2>/dev/null || :
+            printf '\n' 2>/dev/null || :
         else
             remaining_n=$((remaining_n + 1))
             remaining_from=$(header_value From "$inbox_file")
@@ -3516,9 +3865,11 @@ cmd_inbox() {
         done
     fi
     if ! release_lock "$inbox_lock"; then
+        trap - PIPE
         error "inbox drain용 brain lock을 해제하지 못했습니다"
         return 1
     fi
+    trap - PIPE
     return "$inbox_drain_status"
 }
 
@@ -3605,6 +3956,19 @@ fi
 command_name=$1
 shift
 case "$command_name" in
+    version|init|send|say|join|leave|streams|stream|mind|profile|minds|retire|reconcile|sync|link|watch|inbox|presence)
+        if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
+            usage "$command_name"
+            exit 0
+        fi
+        ;;
+    --help|-h)
+        [ "$#" -eq 0 ] || { usage; exit 1; }
+        usage 2>&1
+        exit 0
+        ;;
+esac
+case "$command_name" in
     version)
         [ "$#" -eq 0 ] || { usage; exit 1; }
         printf 'khala %s\n' "$KHALA_VERSION"
@@ -3623,6 +3987,9 @@ case "$command_name" in
     reconcile) cmd_reconcile "$@" ;;
     sync) cmd_sync "$@" ;;
     link) cmd_link "$@" ;;
+    node) cmd_node "$@" ;;
+    bind) cmd_bind "$@" ;;
+    status) cmd_status "$@" ;;
     watch) cmd_watch "$@" ;;
     inbox) cmd_inbox "$@" ;;
     presence) cmd_presence "$@" ;;

@@ -32,9 +32,14 @@ to make those slices converge.
   seconds. It runs over a plain ssh pipe — spokes dial
   `ssh <hub> khala link --serve` — so the hub runs no daemon, opens no new
   port, and mints no new credentials.
-- **The ear — `khala watch`**: exits the moment mail lands in the session's
-  inbox, so a Claude Code background task wakes the session. With a live
-  nerve, send-to-wake is second-scale end to end.
+- **The conduit — `khala-link conduit`** (0.5.0): the node's resident ear.
+  Sessions arm nothing. When mail lands in `inbox/<session>/new`, the conduit
+  rings that session's own Claude Code inbox socket with one coalesced
+  plaintext doorbell (`KHALA-CONDUIT/1`, priority *later*), and the session
+  reads it as a `<cross-session-message>` at the head of its next turn and
+  runs `khala inbox --drain`. The doorbell is lossy by design; the letter in
+  `new/` is the truth and only the drain moves it. With a live nerve,
+  send-to-doorbell is second-scale end to end.
 
 Severing the nerve cord does not cast a node out of the communion — it
 merely goes Nerazim: the same letters travel the same mailbox protocol on
@@ -154,27 +159,46 @@ khala inbox --drain                         # read your mail
 khala presence                              # who is alive / asleep / watching
 ```
 
-## Optional: the nerve cord (`khala link`, second-scale propagation)
+## The nerve cord and the conduit (`khala node ensure`)
 
 ```sh
 cd link && go build -o ~/.khala/bin/khala-link .   # or cross-build with GOOS/GOARCH
-nohup khala link >> ~/.khala/log/link.log 2>&1 &
+khala node ensure                                   # idempotent; the plugin hook runs it too
 ```
 
-One link per node; a flock singleton makes repeat starts harmless. It
-reconnects by itself with jitter after sleep or network loss. If it is down,
-sync/watch carry the mail at minute-scale — the link only lowers latency.
-Streams ride the same nerve (protocol 1.1); against an older link the two
-sides negotiate down and streams simply travel at sync cadence instead —
-wrong never, slower at worst.
+`node ensure` starts two node processes from the same binary, each supervised
+by the best thing the host has (`systemd --user` → macOS LaunchAgent → a
+locked `setsid` fallback), never as a child of the session that ran it:
+
+- **`khala link`** — the nerve; one dial-side singleton per node, the only
+  periodic reconciler. It reconnects with jitter after sleep or network loss.
+  If it is down, sync carries the mail at minute-scale — the link only lowers
+  latency. Streams and minds ride the same nerve; an older peer negotiates down.
+- **`khala-link conduit`** — the ear; one per node. Watches `inbox/*/new`,
+  verifies the live session that holds each identity's lease (pid, start
+  time, socket, session id — never a bare pid), rings its inbox socket, and
+  journals every attempt under the runtime dir. It never moves mail.
+
+Doorbells reach a session that bypasses permission prompts only when Claude
+Code's `crossSessionInbound` is `accept`; `node ensure` says so, once, when it
+is not (it never edits your settings). Note that `accept` admits any same-user
+local process and Remote Control peers, not just the conduit.
 
 ## What the plugin does (the last mile)
 
-- **SessionStart** installs/updates the bundled CLI, drains the session inbox
-  into context (capped), and ensures the node link is up.
-- **Stop** re-arms the mail watch for sessions that opted in, so an idle
-  session is always wakeable by mail.
-- The **khala skill** teaches the session safe usage.
+- **SessionStart** installs/updates the bundled CLI, resolves the identity
+  (`KHALA_SESSION`, else `.khala-session`, else refuses — never the folder
+  name), registers the session in the runtime dir, takes the identity lease,
+  marks itself ready, drains the inbox into context (capped, owner only,
+  bounded), and runs `khala node ensure`.
+- **Stop** does nothing. **SessionEnd** releases the registration.
+- The **khala skill** teaches the session that a conduit doorbell means
+  "drain now" and nothing else.
+
+Two sessions claiming one identity: the first live claimant owns it; the
+second is told loudly and receives nothing until `khala bind --takeover`
+(an epoch bump — no process is signalled). Non-interactive sessions
+(`claude -p`, forks) receive only if they opt in.
 
 Opt a checkout in by writing a single-line `.khala-session` file with the
 session name (or export `KHALA_SESSION`). The full address is
