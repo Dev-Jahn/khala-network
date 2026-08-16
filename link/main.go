@@ -19,18 +19,27 @@ import (
 	"time"
 )
 
-var implVersion = "0.4.0"
+var implVersion = "0.5.0"
 
 type options struct {
-	serve    bool
-	restart  bool
-	maxBytes int64
-	scan     time.Duration
+	serve     bool
+	servePeer string
+	restart   bool
+	maxBytes  int64
+	scan      time.Duration
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
 
 func run(args []string) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "conduit":
+			return runConduit(args[1:])
+		case "runtime":
+			return runRuntime(args[1:])
+		}
+	}
 	opts, err := parseOptions(args)
 	if err != nil {
 		return fatalf("%v", err)
@@ -64,11 +73,20 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if opts.serve {
+		guard, acquired, err := acquireServeSingleton(home, opts.servePeer)
+		if err != nil {
+			return fatalf("serve guard for %s: %v", opts.servePeer, err)
+		}
+		if !acquired {
+			fmt.Fprintf(os.Stdout, "khala-link: serve for %s already running\n", opts.servePeer)
+			return 0
+		}
+		defer guard.Close()
 		if err := recoverStaleTemps(home, logger); err != nil {
 			return fatalf("recover stale link tmp files: %v", err)
 		}
 		rw := readWriter{Reader: os.Stdin, Writer: os.Stdout}
-		_, err := runPump(ctx, rw, home, "serve", cfg.self, "", brainPath, opts.maxBytes, cfg.retainDays, opts.scan, newLogOnceSet(), logger)
+		_, err = runPump(ctx, rw, home, "serve", cfg.self, opts.servePeer, brainPath, nil, opts.maxBytes, cfg.retainDays, opts.scan, newLogOnceSet(), logger)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			logger.Printf("serve stopped: %v", err)
 			return fatalf("serve stopped: %v", err)
@@ -111,10 +129,52 @@ func run(args []string) int {
 		endpoints = []dialEndpoint{{node: peer, address: "direct-test-carrier"}}
 		err = nil
 	}
-	if err != nil {
+	localOnly := errors.Is(err, errNoDialEndpoints)
+	if err != nil && !localOnly {
 		return fatalf("%v", err)
 	}
-	if err := dialForever(ctx, home, cfg.self, brainPath, cfg.retainDays, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
+	nodeBrain := newBrain(brainPath, home, logger, true)
+	nodeBrainDone := make(chan struct{})
+	go func() {
+		nodeBrain.run(ctx)
+		close(nodeBrainDone)
+	}()
+	if localOnly {
+		nodeBrain.trigger()
+	}
+	periodicDone := make(chan struct{})
+	if localOnly {
+		go func() {
+			defer close(periodicDone)
+			ticker := time.NewTicker(opts.scan)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					nodeBrain.trigger()
+				}
+			}
+		}()
+	} else {
+		close(periodicDone)
+	}
+	defer func() {
+		stop()
+		<-periodicDone
+		select {
+		case <-nodeBrainDone:
+		case <-time.After(10 * time.Second):
+			logger.Printf("node reconcile still running after link shutdown; leaving it to release brain.lock.d")
+		}
+	}()
+	if localOnly {
+		logger.Printf("no remote dial endpoint; running node reconcile singleton only")
+		<-ctx.Done()
+		return 0
+	}
+	if err := dialForever(ctx, home, cfg.self, brainPath, nodeBrain, cfg.retainDays, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
 		return fatalf("dial stopped: %v", err)
 	}
 	return 0
@@ -127,6 +187,12 @@ func parseOptions(args []string) (options, error) {
 		case "--serve":
 			o.serve = true
 			args = args[1:]
+		case "--peer":
+			if len(args) < 2 || !validNode(args[1]) {
+				return o, errors.New("--peer needs a valid node name")
+			}
+			o.servePeer = args[1]
+			args = args[2:]
 		case "restart":
 			o.restart = true
 			args = args[1:]
@@ -146,6 +212,12 @@ func parseOptions(args []string) (options, error) {
 	}
 	if o.serve && o.restart {
 		return o, errors.New("--serve and restart are mutually exclusive")
+	}
+	if o.serve && o.servePeer == "" {
+		return o, errors.New("--serve requires --peer <node>")
+	}
+	if !o.serve && o.servePeer != "" {
+		return o, errors.New("--peer is valid only with --serve")
 	}
 	o.scan = durationEnv("KHALA_LINK_TEST_SCAN_INTERVAL", o.scan)
 	return o, nil
@@ -179,6 +251,40 @@ func acquireSingleton(home string) (*os.File, bool, error) {
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, false, nil
 		}
+		return nil, false, err
+	}
+	return f, true, nil
+}
+
+func acquireServeSingleton(home, peer string) (*os.File, bool, error) {
+	if !validNode(peer) {
+		return nil, false, errors.New("invalid peer")
+	}
+	runDir := filepath.Join(home, "run")
+	if err := os.MkdirAll(runDir, 0700); err != nil {
+		return nil, false, err
+	}
+	f, err := os.OpenFile(filepath.Join(runDir, "serve."+peer+".lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if err := f.Truncate(0); err != nil {
+		f.Close()
+		return nil, false, err
+	}
+	if _, err := fmt.Fprintf(f, "pid %d\npeer %s\n", os.Getpid(), peer); err != nil {
+		f.Close()
+		return nil, false, err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
 		return nil, false, err
 	}
 	return f, true, nil
@@ -241,7 +347,7 @@ func terminatePrior(home string, logger *log.Logger) error {
 	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
-func dialForever(ctx context.Context, home, self, brainPath string, retainDays uint64, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
+func dialForever(ctx context.Context, home, self, brainPath string, nodeBrain *brain, retainDays uint64, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
 	attempt := 0
 	index := 0
 	expiredOfferLogs := newLogOnceSet()
@@ -249,7 +355,7 @@ func dialForever(ctx context.Context, home, self, brainPath string, retainDays u
 		endpoint := endpoints[index%len(endpoints)]
 		index++
 		started := time.Now()
-		err := runCarrier(ctx, home, self, brainPath, retainDays, opts, endpoint, expiredOfferLogs, logger)
+		err := runCarrier(ctx, home, self, brainPath, nodeBrain, retainDays, opts, endpoint, expiredOfferLogs, logger)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -272,8 +378,8 @@ func dialForever(ctx context.Context, home, self, brainPath string, retainDays u
 	}
 }
 
-func runCarrier(ctx context.Context, home, self, brainPath string, retainDays uint64, opts options, endpoint dialEndpoint, expiredOfferLogs *logOnceSet, logger *log.Logger) error {
-	cmd, err := carrierCommand(brainPath, opts, endpoint)
+func runCarrier(ctx context.Context, home, self, brainPath string, nodeBrain *brain, retainDays uint64, opts options, endpoint dialEndpoint, expiredOfferLogs *logOnceSet, logger *log.Logger) error {
+	cmd, err := carrierCommand(brainPath, opts, endpoint, self)
 	if err != nil {
 		return err
 	}
@@ -296,7 +402,7 @@ func runCarrier(ctx context.Context, home, self, brainPath string, retainDays ui
 	stderrDone := make(chan struct{})
 	go func() { logStderr(logger, stderr); close(stderrDone) }()
 	rw := readWriter{Reader: stdout, Writer: stdin}
-	_, pumpErr := runPump(ctx, rw, home, "dial", self, endpoint.node, brainPath, opts.maxBytes, retainDays, opts.scan, expiredOfferLogs, logger)
+	_, pumpErr := runPump(ctx, rw, home, "dial", self, endpoint.node, brainPath, nodeBrain, opts.maxBytes, retainDays, opts.scan, expiredOfferLogs, logger)
 	// Carrier cleanup is deliberately process-group scoped. It never signals a
 	// user session; only the child carrier started immediately above.
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
@@ -318,19 +424,20 @@ func runCarrier(ctx context.Context, home, self, brainPath string, retainDays ui
 	return waitErr
 }
 
-func carrierCommand(brainPath string, opts options, endpoint dialEndpoint) (*exec.Cmd, error) {
+func carrierCommand(brainPath string, opts options, endpoint dialEndpoint, self string) (*exec.Cmd, error) {
 	if endpoint.address == "direct-test-carrier" {
 		exe, err := os.Executable()
 		if err != nil {
 			return nil, err
 		}
-		args := []string{"--serve", "--max-object-bytes", strconv.FormatInt(opts.maxBytes, 10)}
+		args := []string{"--serve", "--peer", self, "--max-object-bytes", strconv.FormatInt(opts.maxBytes, 10)}
 		cmd := exec.Command(exe, args...)
 		serveHome := os.Getenv("KHALA_LINK_TEST_SERVE_HOME")
 		cmd.Env = replaceEnv(os.Environ(), map[string]string{"KHALA_HOME": serveHome, "KHALA_BRAIN": brainPath})
 		return cmd, nil
 	}
-	cmd := exec.Command("ssh", "-T", "-o", "BatchMode=yes", endpoint.address, "exec ~/.local/bin/khala link --serve")
+	cmd := exec.Command("ssh", "-T", "-o", "BatchMode=yes", endpoint.address,
+		"exec ~/.local/bin/khala link --serve --peer "+self)
 	return cmd, nil
 }
 
