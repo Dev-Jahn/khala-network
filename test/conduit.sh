@@ -250,6 +250,42 @@ pass H3 "unready/missing sockets fail durably and recover when the socket appear
 stop_pid "$H3_CONDUIT_PID"
 stop_pid "$H3_PID"
 
+# H14 — resume race: the lease was claimed before the Claude registry file
+# existed (pid unknown → lease pid 0); once the registration resolves the pid,
+# the conduit heals the lease and rings instead of failing forever with
+# "pid/start mismatch" (measured 2026-08-16, ink `claude --resume`).
+H14_HOME=$RIG/h14-home
+init_home "$H14_HOME"
+start_listener h14 h14-session
+H14_PID=$LISTENER_PID; H14_SOCKET=$LISTENER_SOCKET; H14_FRAMES=$LISTENER_OUTPUT
+# hide the registry entry so bind cannot learn the pid; register with pid 0
+mv "$RIG/cc-sessions/$H14_PID.json" "$RIG/h14-registry.hidden"
+H14_REG=$(register_session "$H14_HOME" resumed h14-session 0 "$H14_SOCKET" interactive ready) || \
+    fail H14 "registration without registry failed"
+H14_INSTANCE=$(printf '%s\n' "$H14_REG" | sed -n 's/^instance //p')
+printf '%s\n' "$H14_REG" | grep -q '^owner yes$' || fail H14 "did not own lease"
+uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumed.lease" <<'PY' || fail H14 "lease unexpectedly already carried a pid"
+import json, sys
+lease = json.load(open(sys.argv[1]))
+assert lease["pid"] == 0, lease
+PY
+# registry lands later (resume ordering)
+mv "$RIG/h14-registry.hidden" "$RIG/cc-sessions/$H14_PID.json"
+stage_letter "$H14_HOME" resumed 5
+start_conduit "$H14_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms
+H14_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H14_FRAMES" 1 60 || fail H14 "conduit never rang after the registry landed (lease pid stayed 0)"
+uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumed.lease" "$H14_PID" <<'PY' || fail H14 "lease was not healed with the live pid"
+import json, sys
+lease = json.load(open(sys.argv[1]))
+assert lease["pid"] == int(sys.argv[2]), lease
+assert lease["pidStart"], lease
+PY
+[ -f "$H14_HOME/inbox/resumed/new/1700000000.1.5.sender@alpha" ] || fail H14 "healed path consumed new/"
+pass H14 "a lease claimed before the Claude registry existed is healed with the live pid and rung"
+stop_pid "$H14_CONDUIT_PID"
+stop_pid "$H14_PID"
+
 # H4/H5/H6 — exclusive lease, worker exclusion, epoch-only takeover.
 H4_HOME=$RIG/h4-home
 init_home "$H4_HOME"
@@ -306,6 +342,39 @@ stage_letter "$H4_HOME" shared 6
 wait_lines "$CLAIM_FRAMES" 1 40 || fail H6 "new owner was not rung after takeover"
 kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "old owner died after conduit reroute"
 pass H6 "takeover bumps only the epoch, reroutes delivery, and sends no signal"
+
+# H15 — a bind run from inside ANOTHER session (whose environment exports
+# CLAUDE_CODE_MESSAGING_SOCKET, as every Bash child of a Claude Code session
+# does) must not re-point an existing registration at that foreign socket.
+# Measured 2026-08-16: this suite, run from a live session, silently rewired
+# the takeover claimant to the runner's own inbox.
+H15_REG_SOCKET=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["socketPath"])
+PY
+)
+[ "$H15_REG_SOCKET" = "$CLAIM_SOCKET" ] || fail H15 "precondition: claimant socket is $H15_REG_SOCKET"
+runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$CLAIM_INSTANCE" \
+    KHALA_CLAUDE_SESSION_ID=claimant-session CLAUDE_CODE_MESSAGING_SOCKET="$RIG/foreign.sock" \
+    "$KHALA" bind --register ready --instance "$CLAIM_INSTANCE" --session-id claimant-session \
+    --pid "$CLAIM_PID" --kind interactive --cc-version 2.1.233 >/dev/null || fail H15 "re-bind failed"
+H15_AFTER=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["socketPath"])
+PY
+)
+[ "$H15_AFTER" = "$CLAIM_SOCKET" ] || fail H15 "environment socket replaced the registration's socket ($H15_AFTER)"
+runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$CLAIM_INSTANCE" \
+    KHALA_CLAUDE_SESSION_ID=claimant-session CLAUDE_CODE_MESSAGING_SOCKET="$RIG/foreign.sock" \
+    "$KHALA" bind --register ready --instance "$CLAIM_INSTANCE" --session-id claimant-session \
+    --pid "$CLAIM_PID" --socket "$RIG/explicit.sock" --kind interactive --cc-version 2.1.233 >/dev/null || fail H15 "explicit re-bind failed"
+H15_EXPLICIT=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["socketPath"])
+PY
+)
+[ "$H15_EXPLICIT" = "$RIG/explicit.sock" ] || fail H15 "explicit --socket was not honoured ($H15_EXPLICIT)"
+pass H15 "an inherited CLAUDE_CODE_MESSAGING_SOCKET never re-points an existing registration; explicit --socket does"
 stop_pid "$H4_CONDUIT_PID"
 stop_pid "$OWNER_PID"
 stop_pid "$CLAIM_PID"
