@@ -400,6 +400,16 @@ func loadClaudeRegistries() ([]claudeRegistry, error) {
 	return result, nil
 }
 
+func flagPassed(fs *flag.FlagSet, name string) bool {
+	passed := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			passed = true
+		}
+	})
+	return passed
+}
+
 func matchingRegistry(reg sessionRegistration, registries []claudeRegistry) (claudeRegistry, bool) {
 	for _, candidate := range registries {
 		if reg.SocketPath != "" && candidate.Socket != reg.SocketPath {
@@ -548,7 +558,16 @@ func runtimeRegister(args []string, publicBind bool) error {
 		}
 	}
 	reg.ClaudeSessionID = firstNonempty(*sessionID, reg.ClaudeSessionID)
-	reg.SocketPath = firstNonempty(*socketPath, reg.SocketPath)
+	// A socket inherited from the environment (CLAUDE_CODE_MESSAGING_SOCKET
+	// reaches every Bash child of a session) must not replace the socket an
+	// existing registration already binds — a session running `khala bind` on
+	// behalf of another instance would otherwise re-point that instance at its
+	// own inbox. Only an explicit --socket, or a first registration, sets it.
+	if exists && reg.SocketPath != "" && !flagPassed(fs, "socket") {
+		// keep reg.SocketPath
+	} else {
+		reg.SocketPath = firstNonempty(*socketPath, reg.SocketPath)
+	}
 	reg.Kind = *kind
 	reg.ReceiveOptIn = *receiveOptIn || reg.ReceiveOptIn
 	reg.Phase = *phase
