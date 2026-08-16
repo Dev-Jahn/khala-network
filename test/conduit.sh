@@ -195,8 +195,34 @@ sleep 0.15
 [ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed outstanding backoff"
 wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not ring after backoff"
 pass H2 "generation changes ring once and a burst remains coalesced until backoff"
+
 stop_pid "$H1_CONDUIT_PID"
 stop_pid "$H1_LISTENER_PID"
+
+# H13 — a written doorbell is the one outstanding wake: the same generation is
+# not rung again on the fast backoff (measured 2026-08-16: 6 attempts / 4
+# visible duplicates in a 23-second turn). Only a generation change re-rings.
+H13_HOME=$RIG/h13-home
+init_home "$H13_HOME"
+start_listener h13 h13-session
+H13_LISTENER_PID=$LISTENER_PID
+H13_SOCKET=$LISTENER_SOCKET
+H13_FRAMES=$LISTENER_OUTPUT
+register_session "$H13_HOME" h13id h13-session "$H13_LISTENER_PID" \
+    "$H13_SOCKET" interactive ready >/dev/null || fail H13 "ready registration failed"
+stage_letter "$H13_HOME" h13id 1 reel@bw2
+start_conduit "$H13_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms KHALA_CONDUIT_TEST_REWRITE_AFTER=30s
+H13_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H13_FRAMES" 1 40 || fail H13 "no frame within 2s"
+sleep 3
+[ "$(line_count "$H13_FRAMES")" -eq 1 ] || fail H13 "written generation was re-rung within 3s (got $(line_count "$H13_FRAMES") frames)"
+stage_letter "$H13_HOME" h13id 2 clawd@mini
+wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change did not ring"
+sleep 1
+[ "$(line_count "$H13_FRAMES")" -eq 2 ] || fail H13 "second written generation was re-rung"
+stop_pid "$H13_CONDUIT_PID"
+stop_pid "$H13_LISTENER_PID"
+pass H13 "a written doorbell is not re-rung on the fast backoff; only a generation change rings again"
 
 # H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
 H3_HOME=$RIG/h3-home
