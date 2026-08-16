@@ -319,6 +319,9 @@ func (c *conduit) scan() {
 				regs[instance] = committed
 			}
 		}
+		if verified {
+			c.healLease(regs[instance])
+		}
 		if !verified && reason != "" {
 			c.logger.Printf("registration %s not verified: %s", instance, reason)
 		}
@@ -409,6 +412,41 @@ func (c *conduit) verifyRegistration(reg sessionRegistration, registries []claud
 		}
 	}
 	return resolved, verified, reason
+}
+
+// healLease copies a verified registration's pid/pidStart into the identity
+// lease it owns when the lease recorded none. On `claude --resume` the Claude
+// registry file can land after the hook's binds, so the lease captured pid 0;
+// the ring gate then never matches (measured 2026-08-16, ink resume). Only the
+// same instance/epoch/session is healed; nothing else about the lease changes.
+func (c *conduit) healLease(reg sessionRegistration) {
+	if reg.PID <= 1 || reg.PIDStart == "" || reg.LeaseEpoch == 0 {
+		return
+	}
+	leasePath := filepath.Join(c.runtime, "identities", reg.Identity+".lease")
+	err := withRuntimeLock(filepath.Join(c.runtime, "identities", ".leases.lock"), c.bootID, func() error {
+		var lease identityLease
+		if err := readJSON(leasePath, &lease); err != nil {
+			return err
+		}
+		if lease.BootID != c.bootID || lease.State != "owned" || lease.InstanceID != reg.InstanceID ||
+			lease.Epoch != reg.LeaseEpoch || lease.ClaudeSessionID != reg.ClaudeSessionID {
+			return nil
+		}
+		if lease.PID == reg.PID && lease.PIDStart == reg.PIDStart {
+			return nil
+		}
+		if lease.PID > 1 && lease.PID != reg.PID {
+			return nil // a real different pid is a collision, not a gap
+		}
+		lease.PID = reg.PID
+		lease.PIDStart = reg.PIDStart
+		c.logger.Printf("healed lease %s: pid %d start %s", reg.Identity, reg.PID, reg.PIDStart)
+		return writeAtomicJSON(leasePath, lease, 0600)
+	})
+	if err != nil {
+		c.logger.Printf("heal lease %s failed: %v", reg.Identity, err)
+	}
 }
 
 func (c *conduit) pending(identity string) []pendingLetter {
