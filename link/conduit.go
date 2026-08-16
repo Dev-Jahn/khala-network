@@ -190,6 +190,22 @@ func newConduitLogger(home string) (*log.Logger, error) {
 		"khala-conduit: ", log.LstdFlags|log.Lmicroseconds), nil
 }
 
+// conduitRewrittenAfter is how long a generation whose doorbell was already
+// written waits before it may be rung again. A written frame is queued in the
+// session's Claude Code inbox and is read at the head of its next turn, so
+// re-ringing on the fast failure backoff only stacks duplicates behind a long
+// turn (measured 2026-08-16: 6 attempts / 4 visible duplicates in a 23-second
+// turn). Invariant 5: at most one outstanding wake per session — a written
+// doorbell IS the outstanding wake until the generation changes.
+func conduitRewrittenAfter() time.Duration {
+	if value := os.Getenv("KHALA_CONDUIT_TEST_REWRITE_AFTER"); value != "" {
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 10 * time.Minute
+}
+
 func conduitBackoff() []time.Duration {
 	defaults := []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, time.Second, 3 * time.Second, 10 * time.Second, 30 * time.Second}
 	value := os.Getenv("KHALA_CONDUIT_TEST_BACKOFF")
@@ -529,15 +545,18 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 
 	c.statesMu.Lock()
 	state.lastAttempt = now
-	delayIndex := attemptIndex - 1
-	if delayIndex >= len(c.backoff) {
-		delayIndex = len(c.backoff) - 1
-	}
-	state.nextAttempt = now.Add(c.backoff[delayIndex])
-	if journal.Status == "failed" {
-		state.failures++
-	} else {
+	if journal.Status == "written" {
+		// The doorbell is queued in the session; it is the one outstanding
+		// wake for this generation. Re-ring only much later (missed/dropped).
+		state.nextAttempt = now.Add(conduitRewrittenAfter())
 		state.failures = 0
+	} else {
+		delayIndex := attemptIndex - 1
+		if delayIndex >= len(c.backoff) {
+			delayIndex = len(c.backoff) - 1
+		}
+		state.nextAttempt = now.Add(c.backoff[delayIndex])
+		state.failures++
 	}
 	failures := state.failures
 	c.statesMu.Unlock()
@@ -585,6 +604,10 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 	}
 	state.attemptIndex = latest.journal.AttemptIndex
 	state.lastAttempt = latest.at
+	if latest.journal.Status == "written" {
+		state.nextAttempt = latest.at.Add(conduitRewrittenAfter())
+		return state
+	}
 	index := state.attemptIndex - 1
 	if index < 0 {
 		index = 0
