@@ -35,10 +35,12 @@ to make those slices converge.
 - **The conduit — `khala-link conduit`** (0.5.0): the node's resident ear.
   Sessions arm nothing. When mail lands in `inbox/<session>/new`, the conduit
   rings that session's own Claude Code inbox socket with one coalesced
-  plaintext doorbell (`KHALA-CONDUIT/1`, priority *later*), and the session
-  reads it as a `<cross-session-message>` at the head of its next turn and
-  runs `khala inbox --drain`. The doorbell is lossy by design; the letter in
-  `new/` is the truth and only the drain moves it. With a live nerve,
+  plaintext doorbell (`KHALA-CONDUIT/1`, priority *next* — it lands between
+  tool calls of a running turn, as Claude Code's own SendMessage does; a letter
+  sent with `khala send --later` waits for idle instead), and the session
+  reads it as a `<cross-session-message>` and runs `khala inbox --drain`. The
+  doorbell is lossy by design; the letter in `new/` is the truth and only the
+  drain moves it. With a live nerve,
   send-to-doorbell is second-scale end to end.
 
 Severing the nerve cord does not cast a node out of the communion — it
