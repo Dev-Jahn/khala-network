@@ -375,6 +375,40 @@ PY
 )
 [ "$H15_EXPLICIT" = "$RIG/explicit.sock" ] || fail H15 "explicit --socket was not honoured ($H15_EXPLICIT)"
 pass H15 "an inherited CLAUDE_CODE_MESSAGING_SOCKET never re-points an existing registration; explicit --socket does"
+
+# H16 — bind --release by Claude session id must not remove a LIVE registration
+# owned by another process. `claude --resume` reuses the session id, so a late
+# SessionEnd of the old process would otherwise delete the new session's
+# registration (measured 2026-08-17: steno resumed 4x and was left deaf).
+H16_HOME=$RIG/h16-home
+init_home "$H16_HOME"
+start_listener h16 h16-session
+H16_PID=$LISTENER_PID; H16_SOCKET=$LISTENER_SOCKET
+H16_REG=$(register_session "$H16_HOME" resumer h16-session "$H16_PID" "$H16_SOCKET" interactive ready) || \
+    fail H16 "registration failed"
+H16_INSTANCE=$(printf '%s\n' "$H16_REG" | sed -n 's/^instance //p')
+# foreign caller (this shell is not an ancestor of the listener's registration pid) releases by session id
+runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --session-id h16-session >/dev/null || \
+    fail H16 "release by session id errored"
+[ -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE.json" ] || fail H16 "release by session id deleted a live foreign registration"
+uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumer.lease" <<'PY' || fail H16 "lease was released under a live owner"
+import json, sys
+lease = json.load(open(sys.argv[1]))
+assert lease["state"] == "owned", lease
+PY
+# explicit instance still releases
+runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --instance "$H16_INSTANCE" >/dev/null || \
+    fail H16 "release by instance errored"
+[ ! -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE.json" ] || fail H16 "release by explicit instance did not remove"
+# a registration whose process has since died releases by session id
+H16_REG2=$(register_session "$H16_HOME" resumer h16-session "$H16_PID" "$H16_SOCKET" interactive ready) || \
+    fail H16 "second registration failed"
+H16_INSTANCE2=$(printf '%s\n' "$H16_REG2" | sed -n 's/^instance //p')
+stop_pid "$H16_PID"
+runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --session-id h16-session >/dev/null || \
+    fail H16 "release of dead-pid registration errored"
+[ ! -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE2.json" ] || fail H16 "dead-pid registration was not released by session id"
+pass H16 "release by session id spares a live foreign registration; explicit instance and dead pids still release"
 stop_pid "$H4_CONDUIT_PID"
 stop_pid "$OWNER_PID"
 stop_pid "$CLAIM_PID"
