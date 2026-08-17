@@ -59,6 +59,9 @@ type pendingLetter struct {
 	id      string
 	from    string
 	subject string
+	// later is set when the envelope carries "Priority: later" — the sender
+	// asked for the doorbell to wait until the session is idle.
+	later bool
 }
 
 type conduit struct {
@@ -483,6 +486,9 @@ func (c *conduit) pending(identity string) []pendingLetter {
 				if strings.HasPrefix(line, "Subject: ") {
 					letter.subject = sanitizePreview(strings.TrimPrefix(line, "Subject: "), 256)
 				}
+				if strings.HasPrefix(line, "Priority: ") && strings.TrimSpace(strings.TrimPrefix(line, "Priority: ")) == "later" {
+					letter.later = true
+				}
 			}
 			_ = f.Close()
 		}
@@ -712,8 +718,28 @@ func (c *conduit) frame(identity, generation, attempt string, letters []pendingL
 	return map[string]any{
 		"type":    "user",
 		"message": map[string]string{"role": "user", "content": content},
-		"from":    "khala:conduit@" + c.self, "priority": "later", "msg_id": generation + ":" + attempt,
+		"from":    "khala:conduit@" + c.self, "priority": doorbellPriority(letters), "msg_id": generation + ":" + attempt,
 	}
+}
+
+// doorbellPriority is the Claude Code inbox priority of one doorbell. The
+// default is "next": Claude Code dequeues next between tool calls of a running
+// turn, exactly as its own SendMessage does, while "later" waits for idle —
+// and an autonomous turn can run for tens of minutes (user decision
+// 2026-08-17, superseding the 0.5.0 default). A doorbell drops to "later" only
+// when every pending letter carries "Priority: later" (khala send --later);
+// one ordinary letter in the batch keeps the batch prompt. "now" is never
+// minted here.
+func doorbellPriority(letters []pendingLetter) string {
+	if len(letters) == 0 {
+		return "next"
+	}
+	for _, letter := range letters {
+		if !letter.later {
+			return "next"
+		}
+	}
+	return "later"
 }
 
 func (c *conduit) pendingStreams(identity string) int {

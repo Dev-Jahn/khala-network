@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.5.4
+KHALA_VERSION=0.5.5
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -46,7 +46,7 @@ usage() {
         version) printf '%s\n' 'usage: khala version'; return 0 ;;
         init) printf '%s\n' 'usage: khala init <node>'; return 0 ;;
         send)
-            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--as session]'
+            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]'
             return 0
             ;;
         say)
@@ -85,7 +85,7 @@ usage() {
 usage:
   khala version
   khala init <node>
-  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--as session]
+  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]
   khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]
   khala join <stream> [--from-start] [--quiet]
   khala leave <stream>
@@ -2389,7 +2389,7 @@ cmd_send() {
     shift
     case "$send_to" in
         --*)
-            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --as"
+            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --as"
             return 1
             ;;
     esac
@@ -2404,6 +2404,7 @@ cmd_send() {
     send_as=
     send_as_set=0
     send_reply_to=
+    send_later=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -s|--subject)
@@ -2427,6 +2428,10 @@ cmd_send() {
                 send_reply_to=$2
                 shift 2
                 ;;
+            --later)
+                send_later=1
+                shift
+                ;;
             --as)
                 [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
                 send_as=$2
@@ -2434,7 +2439,7 @@ cmd_send() {
                 shift 2
                 ;;
             --*)
-                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --as"
+                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --as"
                 return 1
                 ;;
             *)
@@ -2481,6 +2486,9 @@ cmd_send() {
         fi
         if [ -n "$send_reply_to" ]; then
             printf 'In-Reply-To: %s\n' "$send_reply_to"
+        fi
+        if [ "$send_later" -eq 1 ]; then
+            printf 'Priority: later\n'
         fi
         printf 'Expires: %s\n' "$send_expires"
         printf '\n'
