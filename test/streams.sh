@@ -11,7 +11,7 @@ GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
 
 cleanup() {
-    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+    for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
         [ -f "$cleanup_status" ] || continue
         cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
         [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
@@ -118,7 +118,7 @@ run_start() {
     # stdin closed: SessionStart reads its payload with `cat`, and an inherited
     # open stdin (terminal or background-shell pipe) hangs the hook forever.
     HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
-        XDG_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=streams-test-boot \
+        KHALA_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=streams-test-boot \
         KHALA_CLAUDE_SESSION_ID=$(basename "$start_output") KHALA_SESSION_PID=$$ \
         KHALA_SESSION_KIND=interactive \
         PATH=$HOOK_SHIM:/usr/bin:/bin "$START" < /dev/null \

@@ -12,7 +12,7 @@ SHIM=$RIG/shim
 LINK_BIN=$RIG/khala-link
 
 cleanup() {
-    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+    for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
         [ -f "$cleanup_status" ] || continue
         cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
         [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
@@ -97,7 +97,7 @@ run_start_without_env() {
         # an open one (a terminal, or a background shell's pipe) blocks the
         # hook's `cat` forever. Closed here, at every invocation.
         HOME=$FAKE_HOME KHALA_HOME=$run_home CLAUDE_PROJECT_DIR=$run_project \
-            XDG_RUNTIME_DIR=$run_home/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+            KHALA_RUNTIME_DIR=$run_home/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
             KHALA_CLAUDE_SESSION_ID=$(basename "$run_project")-test KHALA_SESSION_PID=$$ \
             KHALA_SESSION_KIND=interactive \
             PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null
@@ -199,7 +199,7 @@ stage_letter "$PRE_HOME" env-session env-wins
 stage_letter "$PRE_HOME" file-session file-next
 stage_letter "$PRE_HOME" base-session basename-last
 HOME=$FAKE_HOME KHALA_HOME=$PRE_HOME CLAUDE_PROJECT_DIR=$PRE_PROJECT KHALA_SESSION=env-session \
-    XDG_RUNTIME_DIR=$PRE_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+    KHALA_RUNTIME_DIR=$PRE_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
     KHALA_CLAUDE_SESSION_ID=precedence-env-test KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     PATH=$SHIM:/usr/bin:/bin "$START" < /dev/null \
     > "$RIG/precedence-env.out" 2> "$RIG/precedence-env.err" || \
@@ -232,7 +232,7 @@ init_home "$ARM_HOME"
 make_project "$ARM_PROJECT" arm-session
 run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/ready.out" || fail 6 "ready run failed"
 grep -q 'registration ready, lease yes' "$RIG/ready.out" || fail 6 "ready/lease status missing"
-grep -R -q '"phase":"ready"' "$ARM_HOME/runtime-root/khala/sessions" || \
+grep -R -q '"phase":"ready"' "$ARM_HOME/runtime-root/sessions" || \
     fail 6 "registration did not reach ready"
 grep -R -q 'run_in_background\|watch --session\|재무장' "$RIG/ready.out" && \
     fail 6 "SessionStart retained arm/re-arm guidance"
@@ -247,7 +247,7 @@ grep -q 'node ensure started conduit,link' "$RIG/node-first.out" || fail 7 "cond
 grep -q 'crossSessionInbound.*accept' "$RIG/node-first.out.err" || fail 7 "accept setting instruction missing"
 [ ! -e "$FAKE_HOME/.claude/settings.json" ] || fail 7 "hook edited user settings"
 node_wait=0
-while ! XDG_RUNTIME_DIR=$LINK_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+while ! KHALA_RUNTIME_DIR=$LINK_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
     KHALA_HOME=$LINK_HOME "$LINK_HOME/bin/khala-link" runtime daemon-status >/dev/null 2>&1 && \
     [ "$node_wait" -lt 40 ]; do
     sleep 0.05
@@ -296,12 +296,12 @@ init_home "$END_HOME"
 make_project "$END_PROJECT" end-session
 run_start_without_env "$END_HOME" "$END_PROJECT" "$RIG/end-start.out" || fail 9 "SessionStart for end fixture failed"
 printf '%s\n' '{"session_id":"end-session-test"}' | HOME=$FAKE_HOME KHALA_HOME=$END_HOME \
-    XDG_RUNTIME_DIR=$END_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
+    KHALA_RUNTIME_DIR=$END_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test-boot \
     KHALA_CLAUDE_SESSION_ID=end-session-test CLAUDE_PROJECT_DIR=$END_PROJECT \
     PATH=$SHIM:/usr/bin:/bin "$END" >"$RIG/end.out" 2>"$RIG/end.err" || fail 9 "SessionEnd failed"
-[ -z "$(find "$END_HOME/runtime-root/khala/sessions" -name '*.json' -print -quit)" ] || \
+[ -z "$(find "$END_HOME/runtime-root/sessions" -name '*.json' -print -quit)" ] || \
     fail 9 "SessionEnd left its registration"
-grep -q '"state":"released"' "$END_HOME/runtime-root/khala/identities/end-session.lease" || \
+grep -q '"state":"released"' "$END_HOME/runtime-root/identities/end-session.lease" || \
     fail 9 "SessionEnd did not release the lease"
 pass 9 "SessionEnd removes registration and releases its lease"
 
@@ -309,13 +309,13 @@ COLLIDE_HOME=$RIG/collide-home
 COLLIDE_PROJECT=$RIG/collide-session
 init_home "$COLLIDE_HOME"
 make_project "$COLLIDE_PROJECT" collide
-HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME XDG_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
+HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME KHALA_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
     KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=owner-session KHALA_SESSION_PID=$$ \
     KHALA_SESSION_KIND=interactive \
     CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" </dev/null \
     >"$RIG/collide-owner.out" 2>"$RIG/collide-owner.err" || fail 10 "owner hook failed"
 stage_letter "$COLLIDE_HOME" collide collision-body
-HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME XDG_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
+HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME KHALA_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
     KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=other-session KHALA_SESSION_PID=$$ \
     KHALA_SESSION_KIND=interactive \
     CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" \

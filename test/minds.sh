@@ -12,7 +12,7 @@ GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
 
 cleanup() {
-    for cleanup_status in "$RIG"/*/runtime-root/khala/conduit.status.json; do
+    for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
         [ -f "$cleanup_status" ] || continue
         cleanup_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$cleanup_status")
         [ -z "$cleanup_pid" ] || kill "$cleanup_pid" 2>/dev/null || :
@@ -152,7 +152,7 @@ run_start() {
     printf '%s\n' "$start_input" | \
         env -u KHALA_SESSION \
         HOME=$HOOK_HOME KHALA_HOME=$start_home CLAUDE_PROJECT_DIR=$start_project \
-        XDG_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=minds-test-boot \
+        KHALA_RUNTIME_DIR=$start_home/runtime-root KHALA_TEST_BOOT_ID=minds-test-boot \
         KHALA_CLAUDE_SESSION_ID=$(basename "$start_output") KHALA_SESSION_PID=$$ \
         KHALA_SESSION_KIND=interactive \
         PATH=$HOOK_SHIM:/usr/bin:/bin "$START" > "$start_output" 2> "$start_output.err"
@@ -349,9 +349,9 @@ property_m9() {
     [ "$(sed -n 's/^Generation: //p' "$current_file")" = "$current" ] || die "Generation header differs from filename"
     [ "$(sed -n 's/^Session: //p' "$current_file")" = joined ] || die "Session header differs"
     [ "$(sed -n 's/^Node: //p' "$current_file")" = alpha ] || die "Node header differs"
-    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.5.0' ] || die "brain version is not 0.5.0"
-    grep -q '"version": "0.5.0"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
-        die "plugin version is not 0.5.0"
+    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.5.4' ] || die "brain version is not 0.5.4"
+    grep -q '"version": "0.5.4"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
+        die "plugin version is not 0.5.4"
     grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && die "plugin manifest contains forbidden hooks key"
     return 0
 }

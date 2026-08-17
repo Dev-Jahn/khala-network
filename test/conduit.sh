@@ -78,7 +78,7 @@ init_home() {
 }
 
 runtime_env() {
-    env XDG_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
+    env KHALA_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
         KHALA_CLAUDE_SESSIONS_DIR="$RIG/cc-sessions" "$@"
 }
 
@@ -142,7 +142,7 @@ EOF
 start_conduit() {
     conduit_home=$1
     shift
-    env XDG_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
+    env KHALA_RUNTIME_DIR="$RUNTIME_BASE" KHALA_TEST_BOOT_ID=conduit-test-boot \
         KHALA_CLAUDE_SESSIONS_DIR="$RIG/cc-sessions" KHALA_HOME="$conduit_home" \
         KHALA_CONDUIT_TEST_SCAN_INTERVAL=50ms \
         "$@" "$BIN" conduit &
@@ -239,7 +239,7 @@ start_conduit "$H3_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms
 H3_CONDUIT_PID=$CONDUIT_PID
 sleep 0.3
 [ "$(line_count "$H3_FRAMES")" -eq 0 ] || fail H3 "starting registration received a frame"
-find "$RUNTIME_BASE/khala/deliveries/late/$H3_INSTANCE" -name '*.json' \
+find "$RUNTIME_BASE/deliveries/late/$H3_INSTANCE" -name '*.json' \
     -exec grep -l '"status":"failed"' {} \; > "$RIG/h3-failed-journals"
 [ -s "$RIG/h3-failed-journals" ] || fail H3 "failed attempt was not journaled"
 register_session "$H3_HOME" late h3-session "$H3_PID" "$H3_SOCKET" interactive ready \
@@ -264,7 +264,7 @@ H14_REG=$(register_session "$H14_HOME" resumed h14-session 0 "$H14_SOCKET" inter
     fail H14 "registration without registry failed"
 H14_INSTANCE=$(printf '%s\n' "$H14_REG" | sed -n 's/^instance //p')
 printf '%s\n' "$H14_REG" | grep -q '^owner yes$' || fail H14 "did not own lease"
-uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumed.lease" <<'PY' || fail H14 "lease unexpectedly already carried a pid"
+uv run --no-project python - "$RUNTIME_BASE/identities/resumed.lease" <<'PY' || fail H14 "lease unexpectedly already carried a pid"
 import json, sys
 lease = json.load(open(sys.argv[1]))
 assert lease["pid"] == 0, lease
@@ -275,7 +275,7 @@ stage_letter "$H14_HOME" resumed 5
 start_conduit "$H14_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms
 H14_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H14_FRAMES" 1 60 || fail H14 "conduit never rang after the registry landed (lease pid stayed 0)"
-uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumed.lease" "$H14_PID" <<'PY' || fail H14 "lease was not healed with the live pid"
+uv run --no-project python - "$RUNTIME_BASE/identities/resumed.lease" "$H14_PID" <<'PY' || fail H14 "lease was not healed with the live pid"
 import json, sys
 lease = json.load(open(sys.argv[1]))
 assert lease["pid"] == int(sys.argv[2]), lease
@@ -309,7 +309,7 @@ wait_lines "$OWNER_FRAMES" 1 40 || fail H4 "lease owner was not rung"
 H4_PROJECT=$RIG/h4-project
 mkdir -p "$H4_PROJECT"
 printf '%s\n' shared > "$H4_PROJECT/.khala-session"
-HOME=$RIG KHALA_HOME=$H4_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+HOME=$RIG KHALA_HOME=$H4_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_CLAUDE_SESSION_ID=h4-hook-session KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     CLAUDE_PROJECT_DIR=$H4_PROJECT PATH=$H4_HOME/bin:$ROOT/bin:/usr/bin:/bin \
     "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h4-hook-session"}' \
@@ -323,7 +323,7 @@ WORKER_REG=$(register_session "$H4_HOME" worker worker-session "$CLAIM_PID" "$CL
 printf '%s\n' "$WORKER_REG" | grep -q '^owner no$' || fail H5 "worker owned lease without opt-in"
 pass H5 "non-interactive registration cannot acquire a lease without opt-in"
 
-old_epoch=$(uv run --no-project python - "$RUNTIME_BASE/khala/identities/shared.lease" <<'PY'
+old_epoch=$(uv run --no-project python - "$RUNTIME_BASE/identities/shared.lease" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["epoch"])
 PY
@@ -331,7 +331,7 @@ PY
 runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$CLAIM_INSTANCE" \
     KHALA_CLAUDE_SESSION_ID=claimant-session "$KHALA" bind --takeover >/dev/null || \
     fail H6 "takeover failed"
-new_epoch=$(uv run --no-project python - "$RUNTIME_BASE/khala/identities/shared.lease" <<'PY'
+new_epoch=$(uv run --no-project python - "$RUNTIME_BASE/identities/shared.lease" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["epoch"])
 PY
@@ -348,7 +348,7 @@ pass H6 "takeover bumps only the epoch, reroutes delivery, and sends no signal"
 # does) must not re-point an existing registration at that foreign socket.
 # Measured 2026-08-16: this suite, run from a live session, silently rewired
 # the takeover claimant to the runner's own inbox.
-H15_REG_SOCKET=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+H15_REG_SOCKET=$(uv run --no-project python - "$RUNTIME_BASE/sessions/$CLAIM_INSTANCE.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["socketPath"])
 PY
@@ -358,7 +358,7 @@ runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$
     KHALA_CLAUDE_SESSION_ID=claimant-session CLAUDE_CODE_MESSAGING_SOCKET="$RIG/foreign.sock" \
     "$KHALA" bind --register ready --instance "$CLAIM_INSTANCE" --session-id claimant-session \
     --pid "$CLAIM_PID" --kind interactive --cc-version 2.1.233 >/dev/null || fail H15 "re-bind failed"
-H15_AFTER=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+H15_AFTER=$(uv run --no-project python - "$RUNTIME_BASE/sessions/$CLAIM_INSTANCE.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["socketPath"])
 PY
@@ -368,7 +368,7 @@ runtime_env KHALA_HOME="$H4_HOME" KHALA_SESSION=shared KHALA_SESSION_INSTANCE="$
     KHALA_CLAUDE_SESSION_ID=claimant-session CLAUDE_CODE_MESSAGING_SOCKET="$RIG/foreign.sock" \
     "$KHALA" bind --register ready --instance "$CLAIM_INSTANCE" --session-id claimant-session \
     --pid "$CLAIM_PID" --socket "$RIG/explicit.sock" --kind interactive --cc-version 2.1.233 >/dev/null || fail H15 "explicit re-bind failed"
-H15_EXPLICIT=$(uv run --no-project python - "$RUNTIME_BASE/khala/sessions/$CLAIM_INSTANCE.json" <<'PY'
+H15_EXPLICIT=$(uv run --no-project python - "$RUNTIME_BASE/sessions/$CLAIM_INSTANCE.json" <<'PY'
 import json, sys
 print(json.load(open(sys.argv[1]))["socketPath"])
 PY
@@ -390,8 +390,8 @@ H16_INSTANCE=$(printf '%s\n' "$H16_REG" | sed -n 's/^instance //p')
 # foreign caller (this shell is not an ancestor of the listener's registration pid) releases by session id
 runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --session-id h16-session >/dev/null || \
     fail H16 "release by session id errored"
-[ -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE.json" ] || fail H16 "release by session id deleted a live foreign registration"
-uv run --no-project python - "$RUNTIME_BASE/khala/identities/resumer.lease" <<'PY' || fail H16 "lease was released under a live owner"
+[ -f "$RUNTIME_BASE/sessions/$H16_INSTANCE.json" ] || fail H16 "release by session id deleted a live foreign registration"
+uv run --no-project python - "$RUNTIME_BASE/identities/resumer.lease" <<'PY' || fail H16 "lease was released under a live owner"
 import json, sys
 lease = json.load(open(sys.argv[1]))
 assert lease["state"] == "owned", lease
@@ -399,7 +399,7 @@ PY
 # explicit instance still releases
 runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --instance "$H16_INSTANCE" >/dev/null || \
     fail H16 "release by instance errored"
-[ ! -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE.json" ] || fail H16 "release by explicit instance did not remove"
+[ ! -f "$RUNTIME_BASE/sessions/$H16_INSTANCE.json" ] || fail H16 "release by explicit instance did not remove"
 # a registration whose process has since died releases by session id
 H16_REG2=$(register_session "$H16_HOME" resumer h16-session "$H16_PID" "$H16_SOCKET" interactive ready) || \
     fail H16 "second registration failed"
@@ -407,7 +407,7 @@ H16_INSTANCE2=$(printf '%s\n' "$H16_REG2" | sed -n 's/^instance //p')
 stop_pid "$H16_PID"
 runtime_env KHALA_HOME="$H16_HOME" KHALA_SESSION=resumer "$KHALA" bind --release --session-id h16-session >/dev/null || \
     fail H16 "release of dead-pid registration errored"
-[ ! -f "$RUNTIME_BASE/khala/sessions/$H16_INSTANCE2.json" ] || fail H16 "dead-pid registration was not released by session id"
+[ ! -f "$RUNTIME_BASE/sessions/$H16_INSTANCE2.json" ] || fail H16 "dead-pid registration was not released by session id"
 pass H16 "release by session id spares a live foreign registration; explicit instance and dead pids still release"
 stop_pid "$H4_CONDUIT_PID"
 stop_pid "$OWNER_PID"
@@ -419,7 +419,7 @@ H7_HOME=$RIG/h7-home
 init_home "$H7_HOME"
 H7_PROJECT=$RIG/h7-project
 mkdir -p "$H7_PROJECT"
-HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE \
+HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE \
     KHALA_TEST_BOOT_ID=conduit-test-boot CLAUDE_PROJECT_DIR=$H7_PROJECT \
     PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
     "$ROOT/plugin/hooks/session-start.sh" </dev/null >"$RIG/h7.out" 2>"$RIG/h7.err" || \
@@ -459,7 +459,7 @@ stage_letter "$H7_HOME" taken 11
 H7_TAKEN_PROJECT=$RIG/h7-taken-project
 mkdir -p "$H7_TAKEN_PROJECT"
 printf '%s\n' taken > "$H7_TAKEN_PROJECT/.khala-session"
-HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_CLAUDE_SESSION_ID=h7-other KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     CLAUDE_PROJECT_DIR=$H7_TAKEN_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
     "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h7-other"}' \
@@ -472,7 +472,7 @@ import time
 print(time.monotonic())
 PY
 )
-HOME=$RIG KHALA_HOME=$H7_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE \
+HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE \
     KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_SESSION_INSTANCE=h9-instance \
     KHALA_CLAUDE_SESSION_ID=h9-session KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     CLAUDE_PROJECT_DIR=$H9_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
@@ -492,7 +492,7 @@ uv run --no-project python - "$h9_elapsed" <<'PY' || fail H9 "hook exceeded 12s:
 import sys
 assert float(sys.argv[1]) < 12.0
 PY
-grep -R -q '"phase":"ready"' "$RUNTIME_BASE/khala/sessions" || fail H9 "registration never reached ready"
+grep -R -q '"phase":"ready"' "$RUNTIME_BASE/sessions" || fail H9 "registration never reached ready"
 [ -f "$H7_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out drain consumed/misplaced mail"
 rm -rf -- "$H7_HOME/run/brain.lock.d"
 for h9_reconcile_pid in $h9_reconcile_pids; do
@@ -533,18 +533,18 @@ H10_INSTANCE=$(printf '%s\n' "$H10_REG" | sed -n 's/^instance //p')
 start_conduit "$H10_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
 H10_CONDUIT_PID=$CONDUIT_PID
 wait_i=0
-while ! grep -R -q '"conduitVerified":true' "$RUNTIME_BASE/khala/sessions" 2>/dev/null && \
+while ! grep -R -q '"conduitVerified":true' "$RUNTIME_BASE/sessions" 2>/dev/null && \
     [ "$wait_i" -lt 40 ]; do
     sleep 0.05
     wait_i=$((wait_i + 1))
 done
-KHALA_HOME=$H10_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
     "$KHALA" watch --session watcher --interval 1 --max-wait 1 >"$RIG/h10.out" 2>"$RIG/h10.err" || \
     fail H10 "verified watch did not retreat 0"
 grep -Fqx 'conduit has the ear' "$RIG/h10.out" || fail H10 "retreat line differs"
 printf 'self alpha\nmailbox alpha\npeer alpha %s\nttl 120\n' "$H10_HOME" > "$H10_HOME/config"
-KHALA_HOME=$H10_HOME XDG_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_SESSION=legacy "$KHALA" watch --session legacy --interval 1 --max-wait 3 \
     >"$RIG/h10-legacy.out" 2>"$RIG/h10-legacy.err" &
 H10_WATCH_PID=$!
@@ -561,10 +561,10 @@ stop_pid "$H10_PID"
 # H11 — all runtime writers reject a symlink root.
 H11_HOME=$RIG/h11-home
 init_home "$H11_HOME"
-H11_XDG=$RIG/h11-xdg
-mkdir -p "$H11_XDG" "$RIG/h11-target"
-ln -s "$RIG/h11-target" "$H11_XDG/khala"
-if env XDG_RUNTIME_DIR=$H11_XDG KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_HOME=$H11_HOME \
+H11_RUNTIME=$RIG/h11-runtime
+mkdir -p "$RIG/h11-target"
+ln -s "$RIG/h11-target" "$H11_RUNTIME"
+if env KHALA_RUNTIME_DIR=$H11_RUNTIME KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_HOME=$H11_HOME \
     "$BIN" conduit >"$RIG/h11.out" 2>"$RIG/h11.err"; then
     fail H11 "conduit accepted a symlink runtime"
 fi
@@ -572,7 +572,7 @@ grep -qi 'symlink' "$RIG/h11.err" || fail H11 "symlink refusal was unclear"
 H11_PROJECT=$RIG/h11-project
 mkdir -p "$H11_PROJECT"
 printf '%s\n' symlinked > "$H11_PROJECT/.khala-session"
-HOME=$RIG KHALA_HOME=$H11_HOME XDG_RUNTIME_DIR=$H11_XDG \
+HOME=$RIG KHALA_HOME=$H11_HOME KHALA_RUNTIME_DIR=$H11_RUNTIME \
     KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
     KHALA_CLAUDE_SESSION_ID=h11-session CLAUDE_PROJECT_DIR=$H11_PROJECT \
     PATH=$H11_HOME/bin:$ROOT/bin:/usr/bin:/bin "$ROOT/plugin/hooks/session-start.sh" \
@@ -617,9 +617,118 @@ while [ "$(date +%s)" -lt "$h12_end" ]; do
 done
 pass H12 "dial alone reconciles and duplicate per-peer serve exits 0"
 
+# H17 — XDG_RUNTIME_DIR belongs to the caller, not the node singleton. An
+# explicit KHALA_RUNTIME_DIR must select one plane across differing XDG values.
+H17_RIG=$RIG/h17
+H17_HOME=$H17_RIG/home
+H17_RUNTIME=$H17_RIG/rt
+H17_XDG_A=$H17_RIG/xdg-a
+H17_XDG_B=$H17_RIG/xdg-b
+mkdir -p "$H17_RUNTIME" "$H17_XDG_A" "$H17_XDG_B"
+init_home "$H17_HOME"
+env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_A \
+    KHALA_TEST_BOOT_ID=h17-test-boot KHALA_CONDUIT_TEST_SCAN_INTERVAL=50ms \
+    "$BIN" conduit >"$H17_RIG/a.out" 2>"$H17_RIG/a.err" &
+H17_CONDUIT_PID=$!
+PIDS="$PIDS $H17_CONDUIT_PID"
+wait_file "$H17_RUNTIME/conduit.status.json" 100 || fail H17 "conduit A wrote no status"
+h17_wait=0
+while ! grep -q 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null && \
+    [ "$h17_wait" -lt 100 ]; do
+    sleep 0.05
+    h17_wait=$((h17_wait + 1))
+done
+[ "$h17_wait" -lt 100 ] || fail H17 "conduit A did not log its start"
+env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_B \
+    KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" runtime daemon-status >/dev/null 2>"$H17_RIG/daemon-b.err" || \
+    fail H17 "runtime daemon-status from XDG environment B did not see conduit A"
+find "$RIG" -name conduit.status.json -type f -print | sort > "$H17_RIG/status.before"
+h17_started_before=$(grep -c 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null || :)
+env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_B \
+    KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" conduit \
+    >"$H17_RIG/b.out" 2>"$H17_RIG/b.err" &
+H17_SECOND_PID=$!
+PIDS="$PIDS $H17_SECOND_PID"
+h17_wait=0
+while kill -0 "$H17_SECOND_PID" 2>/dev/null && [ "$h17_wait" -lt 40 ]; do
+    sleep 0.05
+    h17_wait=$((h17_wait + 1))
+done
+if kill -0 "$H17_SECOND_PID" 2>/dev/null; then
+    stop_pid "$H17_SECOND_PID"
+    fail H17 "second conduit from XDG environment B did not exit immediately"
+fi
+wait "$H17_SECOND_PID"
+h17_second_status=$?
+[ "$h17_second_status" -eq 0 ] || fail H17 "second conduit exited $h17_second_status"
+find "$RIG" -name conduit.status.json -type f -print | sort > "$H17_RIG/status.after"
+cmp -s "$H17_RIG/status.before" "$H17_RIG/status.after" || fail H17 "second conduit wrote another status file"
+h17_started_after=$(grep -c 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null || :)
+[ "$h17_started_after" -eq "$h17_started_before" ] || fail H17 "second conduit logged started pid="
+env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_A \
+    KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" runtime status > "$H17_RIG/status-a.out" || \
+    fail H17 "runtime status failed in environment A"
+env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_B \
+    KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" runtime status > "$H17_RIG/status-b.out" || \
+    fail H17 "runtime status failed in environment B"
+h17_runtime_a=$(sed -n '1p' "$H17_RIG/status-a.out")
+h17_runtime_b=$(sed -n '1p' "$H17_RIG/status-b.out")
+[ "$h17_runtime_a" = "runtime: $H17_RUNTIME" ] || fail H17 "environment A printed $h17_runtime_a"
+[ "$h17_runtime_a" = "$h17_runtime_b" ] || fail H17 "runtime lines differ across XDG environments"
+grep -Fq "\"runtime\":\"$H17_RUNTIME\"" "$H17_RUNTIME/conduit.status.json" || \
+    fail H17 "conduit status omitted the chosen runtime root"
+stop_pid "$H17_CONDUIT_PID"
+pass H17 "one explicit runtime plane survives differing XDG environments and rejects a second conduit"
+
+# H18 — even after obtaining a replacement lock inode, a live status record
+# prevents a second conduit from overwriting the singleton's state.
+H18_RIG=$RIG/h18
+H18_HOME=$H18_RIG/home
+H18_RUNTIME=$H18_RIG/rt
+mkdir -p "$H18_RUNTIME"
+init_home "$H18_HOME"
+H18_SHELL_START=$(env KHALA_TEST_BOOT_ID=h18-test-boot "$BIN" runtime process-start --pid $$) || \
+    fail H18 "could not read the test shell process start"
+printf '{"bootId":"h18-test-boot","pid":%s,"pidStart":"%s","runtime":"%s"}\n' \
+    "$$" "$H18_SHELL_START" "$H18_RUNTIME" > "$H18_RUNTIME/conduit.status.json"
+cp "$H18_RUNTIME/conduit.status.json" "$H18_RIG/status.before"
+env KHALA_HOME=$H18_HOME KHALA_RUNTIME_DIR=$H18_RUNTIME KHALA_TEST_BOOT_ID=h18-test-boot \
+    "$BIN" conduit >"$H18_RIG/live.out" 2>"$H18_RIG/live.err" || \
+    fail H18 "live-status guard did not exit 0"
+grep -Fq "another conduit is live (pid=$$); exiting" "$H18_HOME/log/conduit.log" || \
+    fail H18 "live-status guard log is missing"
+grep -q 'started pid=' "$H18_HOME/log/conduit.log" && fail H18 "guarded conduit logged a start"
+cmp -s "$H18_RIG/status.before" "$H18_RUNTIME/conduit.status.json" || \
+    fail H18 "guarded conduit overwrote the live status"
+sleep 30 &
+H18_DEAD_PID=$!
+PIDS="$PIDS $H18_DEAD_PID"
+H18_DEAD_START=$(env KHALA_TEST_BOOT_ID=h18-test-boot "$BIN" runtime process-start --pid "$H18_DEAD_PID") || \
+    fail H18 "could not read the fixture process start"
+stop_pid "$H18_DEAD_PID"
+printf '{"bootId":"h18-test-boot","pid":%s,"pidStart":"%s","runtime":"%s"}\n' \
+    "$H18_DEAD_PID" "$H18_DEAD_START" "$H18_RUNTIME" > "$H18_RUNTIME/conduit.status.json"
+env KHALA_HOME=$H18_HOME KHALA_RUNTIME_DIR=$H18_RUNTIME KHALA_TEST_BOOT_ID=h18-test-boot \
+    KHALA_CONDUIT_TEST_SCAN_INTERVAL=50ms "$BIN" conduit \
+    >"$H18_RIG/dead.out" 2>"$H18_RIG/dead.err" &
+H18_CONDUIT_PID=$!
+PIDS="$PIDS $H18_CONDUIT_PID"
+h18_wait=0
+while ! grep -q "\"pid\":$H18_CONDUIT_PID" "$H18_RUNTIME/conduit.status.json" 2>/dev/null && \
+    [ "$h18_wait" -lt 100 ]; do
+    sleep 0.05
+    h18_wait=$((h18_wait + 1))
+done
+[ "$h18_wait" -lt 100 ] || fail H18 "dead status did not allow a fresh conduit to start"
+kill -0 "$H18_CONDUIT_PID" 2>/dev/null || fail H18 "fresh conduit is not live"
+grep -Fq "started pid=$H18_CONDUIT_PID runtime=$H18_RUNTIME" "$H18_HOME/log/conduit.log" || \
+    fail H18 "fresh conduit did not log its start"
+stop_pid "$H18_CONDUIT_PID"
+pass H18 "a live status survives a replaced lock inode; a dead status permits startup"
+
 bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-start.sh" "$ROOT/plugin/hooks/stop.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H12 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'
+printf 'Conduit H1-H18 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'
