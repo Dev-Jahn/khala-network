@@ -179,6 +179,8 @@ locked `setsid` fallback), never as a child of the session that ran it:
   time, socket, session id — never a bare pid), rings its inbox socket, and
   journals every attempt under the runtime dir. It never moves mail.
 
+The runtime plane is chosen once per node without consulting `XDG_RUNTIME_DIR` (`/run/user/<uid>/khala` when valid, otherwise the platform temp root); set an absolute `KHALA_RUNTIME_DIR` only for an explicit override such as an isolated test rig.
+
 Doorbells reach a session that bypasses permission prompts only when Claude
 Code's `crossSessionInbound` is `accept`; `node ensure` says so, once, when it
 is not (it never edits your settings). Note that `accept` admits any same-user

@@ -109,18 +109,26 @@ func runConduit(args []string) int {
 	if err != nil {
 		return conduitFatalf("open log/conduit.log: %v", err)
 	}
+	statusPath := filepath.Join(runtimePath, "conduit.status.json")
+	var previous conduitStatus
+	statusErr := readJSON(statusPath, &previous)
+	if statusErr != nil && !os.IsNotExist(statusErr) {
+		return conduitFatalf("read conduit status: %v", statusErr)
+	}
+	if statusErr == nil && previous.PID != os.Getpid() && previous.BootID == bootID &&
+		processAliveWithStart(previous.PID, previous.PIDStart, bootID) {
+		logger.Printf("another conduit is live (pid=%d); exiting", previous.PID)
+		return 0
+	}
 	pidStart, err := processStart(os.Getpid(), bootID)
 	if err != nil {
 		return conduitFatalf("read own process start: %v", err)
 	}
-	status := struct {
-		BootID    string `json:"bootId"`
-		PID       int    `json:"pid"`
-		PIDStart  string `json:"pidStart"`
-		Adapter   string `json:"adapter"`
-		StartedAt string `json:"startedAt"`
-	}{bootID, os.Getpid(), pidStart, conduitAdapterVersion, time.Now().UTC().Format(time.RFC3339Nano)}
-	if err := writeAtomicJSON(filepath.Join(runtimePath, "conduit.status.json"), status, 0600); err != nil {
+	status := conduitStatus{
+		BootID: bootID, PID: os.Getpid(), PIDStart: pidStart, Runtime: runtimePath,
+		Adapter: conduitAdapterVersion, StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := writeAtomicJSON(statusPath, status, 0600); err != nil {
 		return conduitFatalf("write conduit status: %v", err)
 	}
 	watcher, err := fsnotify.NewWatcher()
