@@ -123,6 +123,7 @@ stage_letter() {
     stage_identity=$2
     stage_seq=$3
     stage_from=${4-sender@alpha}
+    stage_extra=${5-}
     stage_dir=$stage_home/inbox/$stage_identity/new
     mkdir -p "$stage_dir"
     cat > "$stage_dir/1700000000.1.$stage_seq.sender@alpha" <<EOF
@@ -132,7 +133,8 @@ From: $stage_from
 To: $stage_identity@alpha
 Date: 2026-08-16T00:00:00Z
 Type: message
-Subject: conduit-$stage_seq
+Subject: conduit-$stage_seq${stage_extra:+
+$stage_extra}
 Expires: 1999999999
 
 body-$stage_seq
@@ -183,10 +185,10 @@ frame = json.loads(open(sys.argv[1], encoding="utf-8").readline())
 assert frame["type"] == "user"
 assert frame["message"]["role"] == "user"
 assert frame["message"]["content"].startswith("KHALA-CONDUIT/1")
-assert frame["priority"] == "later"
+assert frame["priority"] == "next", frame["priority"]
 assert ":" in frame["msg_id"]
 PY
-pass H1 "one valid doorbell arrived and the letter remained in new/"
+pass H1 "one valid doorbell arrived (priority next) and the letter remained in new/"
 
 stage_letter "$H1_HOME" eddy 2 clawd@mini
 wait_lines "$H1_FRAMES" 2 40 || fail H2 "second generation did not ring"
@@ -198,6 +200,60 @@ pass H2 "generation changes ring once and a burst remains coalesced until backof
 
 stop_pid "$H1_CONDUIT_PID"
 stop_pid "$H1_LISTENER_PID"
+
+# H19 — doorbell priority: next by default; later only when every pending
+# letter carries "Priority: later" (khala send --later); one ordinary letter in
+# the batch keeps next; the header is read from the envelope, never the body.
+H19_HOME=$RIG/h19-home
+init_home "$H19_HOME"
+start_listener h19 h19-session
+H19_LISTENER_PID=$LISTENER_PID
+H19_SOCKET=$listener_socket
+H19_FRAMES=$LISTENER_OUTPUT
+register_session "$H19_HOME" quiet h19-session "$H19_LISTENER_PID" \
+    "$H19_SOCKET" interactive ready >/dev/null || fail H19 "ready registration failed"
+stage_letter "$H19_HOME" quiet 1 reel@bw2 "Priority: later"
+start_conduit "$H19_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
+H19_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H19_FRAMES" 1 40 || fail H19 "later-only generation did not ring"
+uv run --no-project python - "$H19_FRAMES" 1 later <<'PY' || fail H19 "later-only batch was not rung as later"
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+frame = json.loads(lines[int(sys.argv[2]) - 1])
+assert frame["priority"] == sys.argv[3], frame["priority"]
+PY
+stage_letter "$H19_HOME" quiet 2 clawd@mini
+wait_lines "$H19_FRAMES" 2 40 || fail H19 "mixed generation did not ring"
+uv run --no-project python - "$H19_FRAMES" 2 next <<'PY' || fail H19 "one ordinary letter did not lift the batch to next"
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+frame = json.loads(lines[int(sys.argv[2]) - 1])
+assert frame["priority"] == sys.argv[3], frame["priority"]
+PY
+stop_pid "$H19_CONDUIT_PID"
+stop_pid "$H19_LISTENER_PID"
+# a body line "Priority: later" is not a header
+H19B_HOME=$RIG/h19b-home
+init_home "$H19B_HOME"
+start_listener h19b h19b-session
+H19B_LISTENER_PID=$LISTENER_PID
+H19B_FRAMES=$LISTENER_OUTPUT
+register_session "$H19B_HOME" bodyonly h19b-session "$H19B_LISTENER_PID" \
+    "$listener_socket" interactive ready >/dev/null || fail H19 "ready registration failed (body case)"
+stage_letter "$H19B_HOME" bodyonly 1 reel@bw2
+printf 'Priority: later\n' >> "$H19B_HOME/inbox/bodyonly/new/1700000000.1.1.sender@alpha"
+start_conduit "$H19B_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
+H19B_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H19B_FRAMES" 1 40 || fail H19 "body-case generation did not ring"
+uv run --no-project python - "$H19B_FRAMES" 1 next <<'PY' || fail H19 "a body line was honoured as a Priority header"
+import json, sys
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+frame = json.loads(lines[int(sys.argv[2]) - 1])
+assert frame["priority"] == sys.argv[3], frame["priority"]
+PY
+stop_pid "$H19B_CONDUIT_PID"
+stop_pid "$H19B_LISTENER_PID"
+pass H19 "doorbell is next by default, later only when every letter asks, and only via the envelope"
 
 # H13 — a written doorbell is the one outstanding wake: the same generation is
 # not rung again on the fast backoff (measured 2026-08-16: 6 attempts / 4
@@ -731,4 +787,4 @@ bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H18 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'
+printf 'Conduit H1-H19 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'
