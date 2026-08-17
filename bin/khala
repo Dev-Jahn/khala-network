@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.5.2
+KHALA_VERSION=0.5.3
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -547,7 +547,8 @@ valid_generation() {
 valid_mind_value() {
     case "$1" in
         *'
-'*|*''*) return 1 ;;
+'*|*'
+'*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -3227,7 +3228,7 @@ cmd_bind() {
             error "잘못된 세션 이름: $bind_identity"
             return 1
         fi
-        "$LINK_BINARY" runtime release --identity "$bind_identity" "$@"
+        "$LINK_BINARY" runtime release --identity "$bind_identity" --caller-pid "$$" "$@"
         return $?
     fi
     if [ "$#" -ge 1 ] && [ "$1" = --native-warning ]; then
