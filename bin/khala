@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.5.3
+KHALA_VERSION=0.5.4
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -3277,8 +3277,8 @@ node_write_systemd_units() {
     if ! {
         printf '%s\n' '[Unit]' 'Description=Khala conduit doorbell' '' '[Service]' 'Type=simple'
         printf 'Environment="KHALA_HOME=%s"\n' "$KHALA_ROOT"
-        if [ -n "${XDG_RUNTIME_DIR-}" ]; then
-            printf 'Environment="XDG_RUNTIME_DIR=%s"\n' "$XDG_RUNTIME_DIR"
+        if [ -n "${KHALA_RUNTIME_DIR-}" ]; then
+            printf 'Environment="KHALA_RUNTIME_DIR=%s"\n' "$KHALA_RUNTIME_DIR"
         fi
         printf 'ExecStart="%s" conduit\n' "$LINK_BINARY"
         printf 'StandardOutput=append:%s\n' "$KHALA_ROOT/log/conduit.log"
@@ -3311,8 +3311,8 @@ node_write_launch_agents() {
         printf '<string>%s</string><string>conduit</string>\n' "$LINK_BINARY"
         printf '%s\n' '</array>'
         printf '<key>EnvironmentVariables</key><dict><key>KHALA_HOME</key><string>%s</string>\n' "$KHALA_ROOT"
-        if [ -n "${XDG_RUNTIME_DIR-}" ]; then
-            printf '<key>XDG_RUNTIME_DIR</key><string>%s</string>\n' "$XDG_RUNTIME_DIR"
+        if [ -n "${KHALA_RUNTIME_DIR-}" ]; then
+            printf '<key>KHALA_RUNTIME_DIR</key><string>%s</string>\n' "$KHALA_RUNTIME_DIR"
         fi
         printf '%s\n' '</dict>'
         printf '<key>StandardOutPath</key><string>%s</string>\n' "$KHALA_ROOT/log/conduit.log"

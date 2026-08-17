@@ -52,6 +52,15 @@ type identityLease struct {
 	State           string `json:"state"`
 }
 
+type conduitStatus struct {
+	BootID    string `json:"bootId"`
+	PID       int    `json:"pid"`
+	PIDStart  string `json:"pidStart"`
+	Runtime   string `json:"runtime"`
+	Adapter   string `json:"adapter"`
+	StartedAt string `json:"startedAt"`
+}
+
 type claudeRegistry struct {
 	PID       int
 	SessionID string
@@ -78,6 +87,8 @@ func runRuntime(args []string) int {
 		err = runtimeWatchReady(args[1:])
 	case "daemon-status":
 		err = runtimeDaemonStatus(args[1:])
+	case "process-start":
+		err = runtimeProcessStart(args[1:])
 	case "native-warning":
 		err = runtimeNativeWarning(args[1:])
 	default:
@@ -96,12 +107,26 @@ func runtimeFatalf(format string, args ...any) int {
 
 func runtimeRoot() (string, error) {
 	var root string
-	if xdg := os.Getenv("XDG_RUNTIME_DIR"); xdg != "" {
-		root = filepath.Join(xdg, "khala")
+	if override := os.Getenv("KHALA_RUNTIME_DIR"); override != "" {
+		root = override
+	} else if runtime.GOOS == "linux" {
+		base := filepath.Join("/run/user", strconv.Itoa(os.Geteuid()))
+		info, err := os.Lstat(base)
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("inspect node runtime directory %s: %w", base, err)
+		}
+		if err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() {
+			if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) == os.Geteuid() {
+				root = filepath.Join(base, "khala")
+			}
+		}
+		if root == "" {
+			root = filepath.Join("/tmp", fmt.Sprintf("khala-%d", os.Geteuid()))
+		}
 	} else if runtime.GOOS == "darwin" {
 		tmp := os.Getenv("TMPDIR")
 		if tmp == "" {
-			return "", errors.New("TMPDIR is not set on macOS")
+			tmp = "/tmp"
 		}
 		root = filepath.Join(tmp, fmt.Sprintf("khala-%d", os.Geteuid()))
 	} else {
@@ -902,6 +927,7 @@ func runtimeStatus(args []string) error {
 	}
 	sort.Strings(names)
 	home, _ := khalaHome()
+	fmt.Fprintf(os.Stdout, "runtime: %s\n", root)
 	fmt.Fprintln(os.Stdout, "IDENTITY\tPENDING\tOWNER\tINSTANCE\tPHASE\tSOCKET\tCC_VERSION\tADAPTER\tLAST_ATTEMPT\tLAST_STATUS\tACK\tNATIVE")
 	for _, identity := range names {
 		pending := countRegularFiles(filepath.Join(home, "inbox", identity, "new"))
@@ -1024,17 +1050,32 @@ func runtimeDaemonStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	var status struct {
-		BootID   string `json:"bootId"`
-		PID      int    `json:"pid"`
-		PIDStart string `json:"pidStart"`
-	}
+	var status conduitStatus
 	if err := readJSON(filepath.Join(root, "conduit.status.json"), &status); err != nil {
 		return err
 	}
 	if status.BootID != bootID || !processAliveWithStart(status.PID, status.PIDStart, bootID) {
 		return errors.New("conduit is not live")
 	}
+	return nil
+}
+
+func runtimeProcessStart(args []string) error {
+	fs := flag.NewFlagSet("process-start", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pid := fs.Int("pid", 0, "")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *pid <= 1 {
+		return errors.New("process-start needs --pid N")
+	}
+	bootID, err := currentBootID()
+	if err != nil {
+		return err
+	}
+	start, err := processStart(*pid, bootID)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, start)
 	return nil
 }
 
