@@ -788,6 +788,7 @@ func runtimeRelease(args []string) error {
 	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
 	instance := fs.String("instance", os.Getenv("KHALA_SESSION_INSTANCE"), "")
 	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
+	callerPIDFlag := fs.Int("caller-pid", os.Getppid(), "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return errors.New("invalid release arguments")
 	}
@@ -796,6 +797,13 @@ func runtimeRelease(args []string) error {
 	}
 	if *instance == "" && *sessionID == "" {
 		return errors.New("release requires an instance or Claude session id")
+	}
+	// An explicit instance is the whole address. Do not additionally filter by
+	// a session id that merely leaked in from the environment (every Bash
+	// child of a Claude Code session carries CLAUDE_CODE_SESSION_ID) — that
+	// would silently match nothing when releasing another instance.
+	if *instance != "" && !flagPassed(fs, "session-id") {
+		*sessionID = ""
 	}
 	root, err := runtimeRoot()
 	if err != nil {
@@ -809,6 +817,7 @@ func runtimeRelease(args []string) error {
 	if err != nil {
 		return err
 	}
+	callerPID := *callerPIDFlag
 	var targets []sessionRegistration
 	for _, reg := range regs {
 		if *instance != "" && reg.InstanceID != *instance {
@@ -818,6 +827,17 @@ func runtimeRelease(args []string) error {
 			continue
 		}
 		if *identity != "" && reg.Identity != *identity {
+			continue
+		}
+		// A session-id match alone is not ownership: `claude --resume` gives
+		// the new process the same Claude session id as the one it resumed,
+		// so a late SessionEnd of the old process would delete the live
+		// registration (measured 2026-08-17: steno resumed 4x, left deaf).
+		// Without an explicit --instance, release only what this caller
+		// owns: a registration whose pid is dead, or one whose pid is this
+		// process's own ancestor.
+		if *instance == "" && reg.PID > 1 && !processIsAncestor(reg.PID, callerPID) &&
+			processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
 			continue
 		}
 		targets = append(targets, reg)
