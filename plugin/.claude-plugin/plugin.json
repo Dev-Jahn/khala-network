@@ -1,6 +1,6 @@
 {
   "name": "khala",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Khala conduit last mile: node-owned CC inbox doorbells, durable mail, streams, minds, session leases, and usage skill.",
   "author": { "name": "Dev-Jahn" }
 }
