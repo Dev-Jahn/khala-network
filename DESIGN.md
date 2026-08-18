@@ -26,7 +26,7 @@
 | dgx spark | 연구실 VLA 개발기 | 개인 net | ❓ |
 | macbook | 개인 노트북 | 개인 net | 이동 잦음, 자주 잠듦 |
 | 집 WSL | 집 데스크탑 | 개인 net | 간헐 |
-| proxmox | 홈서버(Proxmox; ccbroker가 2026-08-17 편입, uid jahn, systemd --user) | 개인 net (100.73.204.94) | 상시 — 우체통 예비 후보 |
+| proxmox | 홈서버(Proxmox; ccbroker가 2026-08-17 편입, uid jahn, systemd --user; 관리 세션 주소 `homelab-admin@proxmox` — 초기 `prox`는 같은 날 retire) | 개인 net (100.73.204.94) | 상시 — 우체통 예비 후보 |
 
 스토리지 사실 (D1 확정): **함대에 공유 홈은 없다.** "모든 머신은 별개의 home을 가진다고
 생각해야 해."(유저) /NHNHOME은 이 클라우드 컨테이너 전용 경로이고, Lustre는 GPU 클라우드

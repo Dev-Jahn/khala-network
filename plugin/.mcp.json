@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "khala": {
+      "command": "bun",
+      "args": ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}/channel", "--shell=bun", "--silent", "start"]
+    }
+  }
+}

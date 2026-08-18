@@ -39,6 +39,8 @@ type deliveryJournal struct {
 	Status       string   `json:"status"`
 	PeerStatus   string   `json:"peerStatus"`
 	CCVersion    string   `json:"ccVersion"`
+	Via          string   `json:"via,omitempty"`
+	ChannelError string   `json:"channelError,omitempty"`
 	Error        string   `json:"error,omitempty"`
 }
 
@@ -575,7 +577,23 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		deliveryErr = errors.New(journal.Error)
 	} else {
 		frame := c.frame(identity, generation, attemptID, letters)
-		deliveryErr = writeDoorbell(reg.SocketPath, frame)
+		if reg.ChannelSocket != "" {
+			deliveryErr = c.verifyChannelSocket(reg)
+			if deliveryErr == nil {
+				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, letters))
+			}
+			if deliveryErr == nil {
+				journal.Via = "channel"
+			} else {
+				journal.ChannelError = deliveryErr.Error()
+				c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
+				journal.Via = "socket"
+				deliveryErr = writeDoorbell(reg.SocketPath, frame)
+			}
+		} else {
+			journal.Via = "socket"
+			deliveryErr = writeDoorbell(reg.SocketPath, frame)
+		}
 		if deliveryErr != nil {
 			journal.Status = "failed"
 			journal.Error = deliveryErr.Error()
@@ -692,20 +710,7 @@ func (c *conduit) updateNativeStatus(reg sessionRegistration, failures int) {
 }
 
 func (c *conduit) frame(identity, generation, attempt string, letters []pendingLetter) map[string]any {
-	fromSet := make(map[string]struct{})
-	var from []string
-	var subjects []string
-	for _, letter := range letters {
-		if letter.from != "" {
-			if _, seen := fromSet[letter.from]; !seen && len(from) < 8 {
-				fromSet[letter.from] = struct{}{}
-				from = append(from, letter.from)
-			}
-		}
-		if letter.subject != "" && len(subjects) < 8 {
-			subjects = append(subjects, letter.subject)
-		}
-	}
+	from, subjects := doorbellDisplay(letters)
 	streamPending := c.pendingStreams(identity)
 	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nstreams: %d\nfrom: %s\nsubjects: %s\ngeneration: %s\nattempt: %s\nread: khala inbox --drain",
 		identity, c.self, len(letters), streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), generation, attempt)
@@ -720,6 +725,85 @@ func (c *conduit) frame(identity, generation, attempt string, letters []pendingL
 		"message": map[string]string{"role": "user", "content": content},
 		"from":    "khala:conduit@" + c.self, "priority": doorbellPriority(letters), "msg_id": generation + ":" + attempt,
 	}
+}
+
+func doorbellDisplay(letters []pendingLetter) ([]string, []string) {
+	fromSet := make(map[string]struct{})
+	var from []string
+	var subjects []string
+	for _, letter := range letters {
+		if letter.from != "" {
+			if _, seen := fromSet[letter.from]; !seen && len(from) < 8 {
+				fromSet[letter.from] = struct{}{}
+				from = append(from, letter.from)
+			}
+		}
+		if letter.subject != "" && len(subjects) < 8 {
+			subjects = append(subjects, letter.subject)
+		}
+	}
+	return from, subjects
+}
+
+func (c *conduit) channelRequest(generation, attempt string, letters []pendingLetter) map[string]any {
+	from, subjects := doorbellDisplay(letters)
+	meta := map[string]string{
+		"from":       strings.Join(from, ", "),
+		"subject":    strings.Join(subjects, "; "),
+		"pending":    strconv.Itoa(len(letters)),
+		"generation": generation,
+		"attempt":    attempt,
+	}
+	if len(from) == 1 {
+		meta["user"] = from[0]
+	} else {
+		meta["user"] = fmt.Sprintf("%d senders", len(from))
+	}
+	if doorbellPriority(letters) == "later" {
+		meta["later"] = "1"
+	}
+	lines := make([]string, 0, len(letters)+1)
+	for _, letter := range letters {
+		lines = append(lines, fmt.Sprintf("%s · %s", letter.from, letter.subject))
+	}
+	noun := "letters"
+	if len(letters) == 1 {
+		noun = "letter"
+	}
+	lines = append(lines, fmt.Sprintf("%d %s — run khala_drain", len(letters), noun))
+	return map[string]any{"v": 1, "content": strings.Join(lines, "\n"), "meta": meta}
+}
+
+func (c *conduit) verifyChannelSocket(reg sessionRegistration) error {
+	if !processAliveWithStart(reg.ChannelPID, reg.ChannelPIDStart, c.bootID) {
+		return errors.New("channel pid/start mismatch")
+	}
+	dir := filepath.Join(c.runtime, "channels")
+	expected := filepath.Join(dir, reg.InstanceID+".sock")
+	if filepath.Clean(reg.ChannelSocket) != expected {
+		return fmt.Errorf("channel socket is outside runtime channels: %s", reg.ChannelSocket)
+	}
+	dirInfo, err := os.Lstat(dir)
+	if err != nil {
+		return fmt.Errorf("inspect channel directory: %w", err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0700 {
+		return errors.New("channel directory is not a real 0700 directory")
+	}
+	if stat, ok := dirInfo.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Geteuid() {
+		return errors.New("channel directory uid mismatch")
+	}
+	info, err := os.Lstat(expected)
+	if err != nil {
+		return fmt.Errorf("inspect channel socket: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		return errors.New("channel socket is not a real Unix socket")
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Geteuid() {
+		return errors.New("channel socket uid mismatch")
+	}
+	return nil
 }
 
 // doorbellPriority is the Claude Code inbox priority of one doorbell. The
@@ -833,6 +917,47 @@ func writeDoorbell(socketPath string, frame map[string]any) error {
 			return err
 		}
 		data = data[written:]
+	}
+	return nil
+}
+
+func writeChannelDoorbell(socketPath string, request map[string]any) error {
+	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if err := connection.SetDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		return err
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	for len(data) > 0 {
+		written, err := connection.Write(data)
+		if err != nil {
+			return err
+		}
+		data = data[written:]
+	}
+	responseData, err := bufio.NewReader(io.LimitReader(connection, 4097)).ReadBytes('\n')
+	if err != nil {
+		return fmt.Errorf("read channel response: %w", err)
+	}
+	if len(responseData) > 4096 {
+		return errors.New("channel response exceeds 4096 bytes")
+	}
+	var response struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(responseData, &response); err != nil {
+		return fmt.Errorf("parse channel response: %w", err)
+	}
+	if !response.OK {
+		return fmt.Errorf("channel rejected doorbell: %s", firstNonempty(response.Error, "unspecified error"))
 	}
 	return nil
 }

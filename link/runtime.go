@@ -27,6 +27,9 @@ type sessionRegistration struct {
 	PIDStart           string `json:"pidStart"`
 	ClaudeSessionID    string `json:"claudeSessionId"`
 	SocketPath         string `json:"socketPath,omitempty"`
+	ChannelSocket      string `json:"channelSocket,omitempty"`
+	ChannelPID         int    `json:"channelPID,omitempty"`
+	ChannelPIDStart    string `json:"channelPIDStart,omitempty"`
 	Kind               string `json:"kind"`
 	ReceiveOptIn       bool   `json:"receiveOptIn"`
 	Phase              string `json:"phase"`
@@ -83,6 +86,12 @@ func runRuntime(args []string) int {
 		err = runtimeRelease(args[1:])
 	case "status":
 		err = runtimeStatus(args[1:])
+	case "root":
+		err = runtimePrintRoot(args[1:])
+	case "whoami":
+		err = runtimeWhoami(args[1:])
+	case "register-channel":
+		err = runtimeRegisterChannel(args[1:])
 	case "watch-ready":
 		err = runtimeWatchReady(args[1:])
 	case "daemon-status":
@@ -138,7 +147,7 @@ func runtimeRoot() (string, error) {
 	if err := secureDirectory(root); err != nil {
 		return "", err
 	}
-	for _, name := range []string{"sessions", "identities", "deliveries"} {
+	for _, name := range []string{"sessions", "identities", "deliveries", "channels"} {
 		if err := secureDirectory(filepath.Join(root, name)); err != nil {
 			return "", err
 		}
@@ -502,6 +511,122 @@ func mutateRegistration(root, bootID, instance string, fn func(*sessionRegistrat
 			return err
 		}
 		return writeAtomicJSON(path, reg, 0600)
+	})
+}
+
+func runtimePrintRoot(args []string) error {
+	if len(args) != 0 {
+		return errors.New("root takes no arguments")
+	}
+	root, err := runtimeRoot()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(os.Stdout, root)
+	return nil
+}
+
+func runtimeWhoami(args []string) error {
+	fs := flag.NewFlagSet("runtime whoami", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	identity := fs.String("identity", "", "")
+	sessionID := fs.String("session-id", "", "")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validNode(*identity) || *sessionID == "" {
+		return errors.New("whoami needs a valid --identity and --session-id")
+	}
+	root, err := runtimeRoot()
+	if err != nil {
+		return err
+	}
+	bootID, err := currentBootID()
+	if err != nil {
+		return err
+	}
+	regs, err := loadRegistrations(root, bootID)
+	if err != nil {
+		return err
+	}
+	var instance string
+	for _, reg := range regs {
+		if reg.Identity != *identity || reg.ClaudeSessionID != *sessionID {
+			continue
+		}
+		if instance != "" && instance != reg.InstanceID {
+			return errors.New("multiple registrations match identity and Claude session id")
+		}
+		instance = reg.InstanceID
+	}
+	if instance == "" {
+		return errors.New("no registration matches identity and Claude session id")
+	}
+	fmt.Fprintln(os.Stdout, instance)
+	return nil
+}
+
+func runtimeRegisterChannel(args []string) error {
+	fs := flag.NewFlagSet("runtime register-channel", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	instance := fs.String("instance", "", "")
+	sessionID := fs.String("session-id", "", "")
+	channelSocket := fs.String("channel-socket", "", "")
+	callerPID := fs.Int("caller-pid", os.Getppid(), "")
+	clearChannel := fs.Bool("clear", false, "")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validInstanceID(*instance) || *sessionID == "" {
+		return errors.New("register-channel needs a valid --instance and --session-id")
+	}
+	root, err := runtimeRoot()
+	if err != nil {
+		return err
+	}
+	bootID, err := currentBootID()
+	if err != nil {
+		return err
+	}
+	return mutateRegistration(root, bootID, *instance, func(reg *sessionRegistration) error {
+		if reg.ClaudeSessionID != *sessionID {
+			return errors.New("channel caller Claude session id does not match registration")
+		}
+		if *clearChannel {
+			if reg.ChannelPID == 0 {
+				return nil
+			}
+			callerStart, err := processStart(*callerPID, bootID)
+			if err != nil {
+				return fmt.Errorf("read channel caller pid start: %w", err)
+			}
+			if reg.ChannelPID != *callerPID || reg.ChannelPIDStart != callerStart {
+				return nil // a stale child must not clear its replacement
+			}
+			reg.ChannelSocket = ""
+			reg.ChannelPID = 0
+			reg.ChannelPIDStart = ""
+			return nil
+		}
+		if *callerPID <= 1 || *channelSocket == "" {
+			return errors.New("register-channel needs --channel-socket and --caller-pid")
+		}
+		expectedSocket := filepath.Join(root, "channels", reg.InstanceID+".sock")
+		if filepath.Clean(*channelSocket) != expectedSocket {
+			return fmt.Errorf("channel socket must be %s", expectedSocket)
+		}
+		info, err := os.Lstat(expectedSocket)
+		if err != nil {
+			return fmt.Errorf("inspect channel socket: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+			return errors.New("channel socket is not a real Unix socket")
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Geteuid() {
+			return errors.New("channel socket uid mismatch")
+		}
+		pidStart, err := processStart(*callerPID, bootID)
+		if err != nil {
+			return fmt.Errorf("read channel pid start: %w", err)
+		}
+		reg.ChannelSocket = expectedSocket
+		reg.ChannelPID = *callerPID
+		reg.ChannelPIDStart = pidStart
+		return nil
 	})
 }
 
@@ -928,7 +1053,7 @@ func runtimeStatus(args []string) error {
 	sort.Strings(names)
 	home, _ := khalaHome()
 	fmt.Fprintf(os.Stdout, "runtime: %s\n", root)
-	fmt.Fprintln(os.Stdout, "IDENTITY\tPENDING\tOWNER\tINSTANCE\tPHASE\tSOCKET\tCC_VERSION\tADAPTER\tLAST_ATTEMPT\tLAST_STATUS\tACK\tNATIVE")
+	fmt.Fprintln(os.Stdout, "IDENTITY\tPENDING\tOWNER\tINSTANCE\tPHASE\tSOCKET\tCHANNEL\tCC_VERSION\tADAPTER\tLAST_ATTEMPT\tLAST_STATUS\tACK\tNATIVE")
 	for _, identity := range names {
 		pending := countRegularFiles(filepath.Join(home, "inbox", identity, "new"))
 		var lease identityLease
@@ -937,6 +1062,10 @@ func runtimeStatus(args []string) error {
 		socket := "-"
 		if reg.SocketPath != "" {
 			socket = "yes"
+		}
+		channel := "-"
+		if reg.ChannelSocket != "" {
+			channel = "yes"
 		}
 		native := firstNonempty(reg.NativeStatus, "-")
 		adapter := "-"
@@ -957,9 +1086,9 @@ func runtimeStatus(args []string) error {
 				}
 			}
 		}
-		fmt.Fprintf(os.Stdout, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", identity, pending,
+		fmt.Fprintf(os.Stdout, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", identity, pending,
 			yesNo(lease.BootID == bootID && lease.InstanceID != "" && lease.State == "owned"), firstNonempty(lease.InstanceID, "-"),
-			firstNonempty(reg.Phase, "-"), socket, firstNonempty(reg.CCVersion, "-"), adapter,
+			firstNonempty(reg.Phase, "-"), socket, channel, firstNonempty(reg.CCVersion, "-"), adapter,
 			lastAttempt, lastStatus, ack, native)
 	}
 	return nil

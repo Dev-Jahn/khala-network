@@ -32,7 +32,7 @@ to make those slices converge.
   seconds. It runs over a plain ssh pipe — spokes dial
   `ssh <hub> khala link --serve` — so the hub runs no daemon, opens no new
   port, and mints no new credentials.
-- **The conduit — `khala-link conduit`** (0.5.0): the node's resident ear.
+- **The conduit — `khala-link conduit`** (0.6.0): the node's resident ear.
   Sessions arm nothing. When mail lands in `inbox/<session>/new`, the conduit
   rings that session's own Claude Code inbox socket with one coalesced
   plaintext doorbell (`KHALA-CONDUIT/1`, priority *next* — it lands between
@@ -182,6 +182,17 @@ locked `setsid` fallback), never as a child of the session that ran it:
   journals every attempt under the runtime dir. It never moves mail.
 
 The runtime plane is chosen once per node without consulting `XDG_RUNTIME_DIR` (`/run/user/<uid>/khala` when valid, otherwise the platform temp root); set an absolute `KHALA_RUNTIME_DIR` only for an explicit override such as an isolated test rig.
+
+The plugin also provides an opt-in Claude Code Channel display adapter. Start
+an interactive session with
+`claude --dangerously-load-development-channels plugin:khala@jahns-cc-marketplace`;
+when its channel child is live, the conduit sends the one outstanding doorbell
+there instead of the CC inbox socket, rendering a short `← khala · sender: …`
+without the socket protocol header and exposing `khala_drain` / `khala_reply`.
+A failed channel attempt is logged and journaled before that attempt falls back
+to the socket. Channel events are always `next`, so `--later` is represented as
+`later="1"` metadata for the model to defer rather than changing the channel
+queue priority.
 
 Doorbells reach a session that bypasses permission prompts only when Claude
 Code's `crossSessionInbound` is `accept`; `node ensure` says so, once, when it
