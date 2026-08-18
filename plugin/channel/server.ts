@@ -10,14 +10,18 @@ import { createServer, type Server as UnixServer, type Socket } from 'node:net'
 
 const VALID_IDENTITY = /^[a-z0-9][a-z0-9-]*$/
 const VALID_META_KEY = /^[a-zA-Z_][a-zA-Z0-9_]*$/
-const SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID ?? ''
 
-function resolveIdentity(): string | undefined {
+// Claude Code spawns a plugin MCP server with the plugin directory as cwd and
+// without CLAUDE_CODE_SESSION_ID, so the session and its project directory are
+// learned from the parent Claude process's own registry entry
+// (khala-link runtime session --pid <ppid>), never from cwd or env guesses.
+// KHALA_SESSION in the environment still wins when the user set it.
+function resolveIdentity(projectDir: string): string | undefined {
   if (process.env.KHALA_SESSION !== undefined) {
     return VALID_IDENTITY.test(process.env.KHALA_SESSION) ? process.env.KHALA_SESSION : undefined
   }
   try {
-    const lines = readFileSync(join(process.cwd(), '.khala-session'), 'utf8').split(/\r?\n/)
+    const lines = readFileSync(join(projectDir, '.khala-session'), 'utf8').split(/\r?\n/)
     if (lines.at(-1) === '') lines.pop()
     return lines.length === 1 && VALID_IDENTITY.test(lines[0]) ? lines[0] : undefined
   } catch {
@@ -41,7 +45,7 @@ function resolveBinary(name: 'khala' | 'khala-link'): string {
 
 async function run(command: string, args: string[], identity: string): Promise<string> {
   const child = Bun.spawn([command, ...args], {
-    env: { ...process.env, KHALA_SESSION: identity },
+    env: identity ? { ...process.env, KHALA_SESSION: identity } : { ...process.env },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -78,17 +82,22 @@ function stringArgument(args: Record<string, unknown>, name: string, required: b
 }
 
 async function main(): Promise<void> {
-  const identity = resolveIdentity()
-  if (!identity) {
-    process.stderr.write('khala channel: no valid session identity; channel disabled\n')
-    return
-  }
-  if (!SESSION_ID) throw new Error('CLAUDE_CODE_SESSION_ID is missing')
-
   const khala = resolveBinary('khala')
   const khalaLink = resolveBinary('khala-link')
+  let SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID ?? ''
+  let projectDir = process.env.CLAUDE_PROJECT_DIR ?? ''
+  if (!SESSION_ID || !projectDir) {
+    try {
+      const line = (await run(khalaLink, ['runtime', 'session', '--pid', String(process.ppid)], '')).trimEnd()
+      const [sessionID, cwd] = line.split('\t')
+      if (!SESSION_ID) SESSION_ID = sessionID ?? ''
+      if (!projectDir) projectDir = cwd ?? ''
+    } catch {
+      // not spawned by a registered Claude session — decided below
+    }
+  }
   const mcp = new Server(
-    { name: 'khala', version: '0.6.0' },
+    { name: 'khala', version: '0.6.1' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
@@ -99,8 +108,10 @@ async function main(): Promise<void> {
     },
   )
 
+  const identity = resolveIdentity(projectDir || process.cwd())
+  const activeIdentity = identity && SESSION_ID ? identity : ''
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+    tools: !activeIdentity ? [] : [
       {
         name: 'khala_drain',
         description: 'Drain this session identity\'s durable Khala inbox now.',
@@ -126,9 +137,12 @@ async function main(): Promise<void> {
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
     const args = (request.params.arguments ?? {}) as Record<string, unknown>
+    if (!activeIdentity) {
+      return { content: [{ type: 'text', text: 'khala channel is idle: this session has no khala identity' }], isError: true }
+    }
     try {
       if (request.params.name === 'khala_drain') {
-        const output = await run(khala, ['inbox', '--drain'], identity)
+        const output = await run(khala, ['inbox', '--drain'], activeIdentity)
         return { content: [{ type: 'text', text: output }] }
       }
       if (request.params.name === 'khala_reply') {
@@ -140,7 +154,7 @@ async function main(): Promise<void> {
         if (replyTo !== undefined) commandArgs.push('--reply-to', replyTo)
         if (subject !== undefined) commandArgs.push('-s', subject)
         commandArgs.push('-m', text)
-        const letterID = (await run(khala, commandArgs, identity)).trim()
+        const letterID = (await run(khala, commandArgs, activeIdentity)).trim()
         return { content: [{ type: 'text', text: letterID }] }
       }
       return {
@@ -155,6 +169,25 @@ async function main(): Promise<void> {
       }
     }
   })
+
+  if (!identity || !SESSION_ID) {
+    // Stay connected as an inert MCP server. Claude Code quarantines a plugin
+    // server that closes its stdio right after connecting (it is recorded in
+    // ~/.claude/mcp-needs-auth-cache.json and never spawned again), so a
+    // session without a khala identity must keep the transport open and simply
+    // never emit a channel event or register a socket.
+    process.stderr.write(identity
+      ? 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n'
+      : 'khala channel: no valid session identity; channel idle\n')
+    await mcp.connect(new StdioServerTransport())
+    await new Promise<void>(resolve => {
+      process.stdin.on('end', resolve)
+      process.stdin.on('close', resolve)
+      process.on('SIGTERM', resolve)
+      process.on('SIGINT', resolve)
+    })
+    return
+  }
 
   await mcp.connect(new StdioServerTransport())
 

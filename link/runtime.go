@@ -70,6 +70,7 @@ type claudeRegistry struct {
 	Name      string
 	Version   string
 	Socket    string
+	Cwd       string
 }
 
 func runRuntime(args []string) int {
@@ -90,6 +91,8 @@ func runRuntime(args []string) int {
 		err = runtimePrintRoot(args[1:])
 	case "whoami":
 		err = runtimeWhoami(args[1:])
+	case "session":
+		err = runtimeSession(args[1:])
 	case "register-channel":
 		err = runtimeRegisterChannel(args[1:])
 	case "watch-ready":
@@ -426,6 +429,7 @@ func loadClaudeRegistries() ([]claudeRegistry, error) {
 			Name:      jsonString(raw, "name"),
 			Version:   jsonString(raw, "version"),
 			Socket:    jsonString(raw, "messagingSocketPath"),
+			Cwd:       jsonString(raw, "cwd"),
 		}
 		if registry.PID > 1 && registry.Socket != "" {
 			result = append(result, registry)
@@ -524,6 +528,39 @@ func runtimePrintRoot(args []string) error {
 	}
 	fmt.Fprintln(os.Stdout, root)
 	return nil
+}
+
+// runtimeSession prints "<claudeSessionId>\t<cwd>" for the nearest ancestor
+// (starting at --pid itself) that Claude Code registered in its sessions
+// directory. A plugin MCP child is spawned by the session process, so this is
+// how it learns which session and project it belongs to without trusting env.
+func runtimeSession(args []string) error {
+	fs := flag.NewFlagSet("runtime session", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	pid := fs.Int("pid", os.Getppid(), "")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *pid <= 1 {
+		return errors.New("session needs --pid N")
+	}
+	registries, err := loadClaudeRegistries()
+	if err != nil {
+		return err
+	}
+	byPID := make(map[int]claudeRegistry, len(registries))
+	for _, registry := range registries {
+		byPID[registry.PID] = registry
+	}
+	for cursor, hops := *pid, 0; cursor > 1 && hops < 32; hops++ {
+		if registry, ok := byPID[cursor]; ok && registry.SessionID != "" {
+			fmt.Fprintf(os.Stdout, "%s\t%s\n", registry.SessionID, registry.Cwd)
+			return nil
+		}
+		parent, err := processParent(cursor)
+		if err != nil || parent == cursor {
+			break
+		}
+		cursor = parent
+	}
+	return errors.New("no ancestor is a registered Claude session")
 }
 
 func runtimeWhoami(args []string) error {
