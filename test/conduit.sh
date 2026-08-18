@@ -8,6 +8,7 @@ RIG=${KHALA_TEST_ROOT:-${HOME}/.khala-conduit-test-$$}
 BIN=$RIG/khala-link
 RUNTIME_BASE=$RIG/runtime
 LISTENER=$ROOT/test/conduit-listener.py
+CHANNEL_LISTENER=$ROOT/test/channel-listener.py
 PIDS=
 
 cleanup() {
@@ -102,6 +103,22 @@ start_listener() {
     LISTENER_OUTPUT=$listener_output
 }
 
+start_channel_listener() {
+    channel_name=$1
+    channel_instance=$2
+    channel_socket=$RUNTIME_BASE/channels/$channel_instance.sock
+    channel_output=$RIG/$channel_name.channel-frames
+    channel_ready=$RIG/$channel_name.channel-ready
+    "$RIG/venv/bin/python" "$CHANNEL_LISTENER" "$channel_socket" "$channel_output" \
+        "$channel_ready" >"$RIG/$channel_name.channel.out" \
+        2>"$RIG/$channel_name.channel.err" &
+    CHANNEL_LISTENER_PID=$!
+    PIDS="$PIDS $CHANNEL_LISTENER_PID"
+    wait_file "$channel_ready" 100 || fail setup "$channel_name channel listener did not bind"
+    CHANNEL_SOCKET=$channel_socket
+    CHANNEL_OUTPUT=$channel_output
+}
+
 register_session() {
     register_home=$1
     register_identity=$2
@@ -162,6 +179,75 @@ mkdir -p "$RIG" "$RUNTIME_BASE" "$RIG/cc-sessions" || fail setup "fixture mkdir 
 trap cleanup EXIT HUP INT TERM
 (uv venv --python 3.13 "$RIG/venv" >/dev/null) || fail setup "test Python venv failed"
 (cd "$ROOT/link" && CGO_ENABLED=0 "$GO" build -o "$BIN" .) || fail setup "Go build failed"
+
+# H20 — a live channel child replaces the CC socket doorbell for the
+# generation. A dead channel is recorded and falls back to the CC socket for
+# the next generation, never delivering through both paths.
+H20_HOME=$RIG/h20-home
+init_home "$H20_HOME"
+start_listener h20-cc h20-session
+H20_CC_PID=$LISTENER_PID
+H20_CC_SOCKET=$LISTENER_SOCKET
+H20_CC_FRAMES=$LISTENER_OUTPUT
+H20_REG=$(register_session "$H20_HOME" channelled h20-session "$H20_CC_PID" \
+    "$H20_CC_SOCKET" interactive ready) || fail H20 "ready registration failed"
+H20_INSTANCE=$(printf '%s\n' "$H20_REG" | sed -n 's/^instance //p')
+start_channel_listener h20 "$H20_INSTANCE"
+H20_CHANNEL_PID=$CHANNEL_LISTENER_PID
+H20_CHANNEL_SOCKET=$CHANNEL_SOCKET
+H20_CHANNEL_FRAMES=$CHANNEL_OUTPUT
+runtime_env "$BIN" runtime register-channel --instance "$H20_INSTANCE" \
+    --session-id h20-session --channel-socket "$H20_CHANNEL_SOCKET" \
+    --caller-pid "$H20_CHANNEL_PID" >/dev/null || fail H20 "channel registration failed"
+stage_letter "$H20_HOME" channelled 20 reel@bw2 "Priority: later"
+start_conduit "$H20_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
+H20_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H20_CHANNEL_FRAMES" 1 40 || fail H20 "live channel did not receive doorbell"
+sleep 0.15
+[ "$(line_count "$H20_CC_FRAMES")" -eq 0 ] || fail H20 "CC socket also received successful channel generation"
+uv run --no-project python - "$H20_CHANNEL_FRAMES" <<'PY' || fail H20 "channel request JSON/shape invalid"
+import json, sys
+request = json.loads(open(sys.argv[1], encoding="utf-8").readline())
+assert request["v"] == 1
+assert request["content"] == "reel@bw2 · conduit-20\n1 letter — run khala_drain"
+assert "KHALA-CONDUIT/1" not in request["content"]
+assert "generation" not in request["content"]
+assert "attempt" not in request["content"]
+assert request["meta"]["from"] == "reel@bw2"
+assert request["meta"]["subject"] == "conduit-20"
+assert request["meta"]["pending"] == "1"
+assert request["meta"]["user"] == "reel@bw2"
+assert len(request["meta"]["generation"]) == 64
+assert request["meta"]["attempt"]
+assert request["meta"]["later"] == "1"
+PY
+grep -R -q '"via":"channel"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" || \
+    fail H20 "channel delivery journal omitted via=channel"
+runtime_env KHALA_HOME="$H20_HOME" "$BIN" runtime status > "$RIG/h20-status.out" || \
+    fail H20 "runtime status failed"
+grep -q $'SOCKET\tCHANNEL\tCC_VERSION' "$RIG/h20-status.out" || fail H20 "status omitted CHANNEL column"
+grep -q $'channelled\t.*\tyes\tyes\t2.1.233' "$RIG/h20-status.out" || fail H20 "status did not show the registered channel"
+
+stop_pid "$H20_CHANNEL_PID"
+stage_letter "$H20_HOME" channelled 21 clawd@mini
+wait_lines "$H20_CC_FRAMES" 1 40 || fail H20 "dead channel did not fall back to CC socket"
+[ "$(line_count "$H20_CHANNEL_FRAMES")" -eq 1 ] || fail H20 "dead channel recorded another request"
+uv run --no-project python - "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" <<'PY' || \
+    fail H20 "socket fallback journal omitted channelError"
+import glob, json, os, sys
+journals = []
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    with open(path, encoding="utf-8") as journal_file:
+        journals.append(json.load(journal_file))
+latest = max(journals, key=lambda journal: journal["attemptedAt"])
+assert latest["via"] == "socket", latest
+assert latest["status"] == "written", latest
+assert latest["channelError"], latest
+PY
+grep -q 'channel doorbell.*failed' "$H20_HOME/log/conduit.log" || fail H20 "channel failure was not logged"
+pass H20 "live channel replaces the socket; dead channel is journaled and falls back once"
+stop_pid "$H20_CONDUIT_PID"
+stop_pid "$H20_CC_PID"
 
 # H1/H2 — durable new/ remains authoritative and generations coalesce.
 H1_HOME=$RIG/h1-home
@@ -787,4 +873,4 @@ bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H19 delivery, lease, hook, restart, watch, runtime, and link properties passed\n'
+printf 'Conduit H1-H20 delivery, channel routing, lease, hook, restart, watch, runtime, and link properties passed\n'

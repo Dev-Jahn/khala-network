@@ -135,13 +135,24 @@ uv run --no-project python -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/.claude-plugin/plugin.json" || fail 1 "plugin.json is invalid"
 uv run --no-project python -c 'import json,sys; json.load(open(sys.argv[1]))' \
     "$ROOT/plugin/hooks/hooks.json" || fail 1 "hooks.json is invalid"
+uv run --no-project python - "$ROOT/plugin/.mcp.json" "$ROOT/plugin/channel/package.json" <<'PY' || \
+    fail 1 "channel MCP/package manifests are invalid"
+import json, sys
+mcp = json.load(open(sys.argv[1], encoding="utf-8"))
+package = json.load(open(sys.argv[2], encoding="utf-8"))
+assert set(mcp["mcpServers"]) == {"khala"}
+assert mcp["mcpServers"]["khala"]["command"] == "bun"
+assert set(package["dependencies"]) == {"@modelcontextprotocol/sdk"}
+assert package["scripts"]["start"] == "bun install --no-summary 1>&2 && bun server.ts"
+PY
+[ -f "$ROOT/plugin/channel/bun.lock" ] || fail 1 "channel bun.lock is missing"
 cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || \
     fail 1 "plugin/bin/khala drifted from bin/khala"
 # CC auto-loads hooks/hooks.json; a manifest "hooks" key naming it again is a
 # duplicate that fails the whole plugin load (fleet-observed, 2026-08-13).
 grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && \
     fail 1 "plugin.json references hooks (auto-loaded path must not be repeated)"
-pass 1 "plugin manifests are valid JSON, no duplicate hooks ref, bundled CLI matches bin/khala"
+pass 1 "plugin/channel manifests are valid, no duplicate hooks ref, bundled CLI matches bin/khala"
 
 UNINIT=$RIG/uninitialized
 UNINIT_PROJECT=$RIG/uninit-session
