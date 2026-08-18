@@ -1,0 +1,12 @@
+{
+  "name": "khala-channel",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun install --no-summary 1>&2 && bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  }
+}
