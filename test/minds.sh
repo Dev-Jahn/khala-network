@@ -349,9 +349,9 @@ property_m9() {
     [ "$(sed -n 's/^Generation: //p' "$current_file")" = "$current" ] || die "Generation header differs from filename"
     [ "$(sed -n 's/^Session: //p' "$current_file")" = joined ] || die "Session header differs"
     [ "$(sed -n 's/^Node: //p' "$current_file")" = alpha ] || die "Node header differs"
-    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.6.0' ] || die "brain version is not 0.6.0"
-    grep -q '"version": "0.6.0"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
-        die "plugin version is not 0.6.0"
+    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.6.1' ] || die "brain version is not 0.6.1"
+    grep -q '"version": "0.6.1"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
+        die "plugin version is not 0.6.1"
     grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && die "plugin manifest contains forbidden hooks key"
     return 0
 }

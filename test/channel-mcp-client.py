@@ -28,7 +28,19 @@ def main() -> None:
     parser.add_argument("--inbox", required=True)
     parser.add_argument("--outbox", required=True)
     parser.add_argument("--stderr", required=True)
+    parser.add_argument("--cwd", default=None,
+                        help="spawn the child with this cwd (Claude Code uses the plugin dir, not the project)")
+    parser.add_argument("--registry-pid-file", default=None,
+                        help="write this client's pid into the Claude registry entry at this path, so the "
+                             "child (whose parent is this client) resolves session id and project cwd via "
+                             "khala-link runtime session, exactly as under Claude Code")
     args = parser.parse_args()
+
+    if args.registry_pid_file:
+        entry = json.load(open(args.registry_pid_file, encoding="utf-8"))
+        entry["pid"] = os.getpid()
+        with open(args.registry_pid_file, "w", encoding="utf-8") as handle:
+            json.dump(entry, handle)
 
     with open(args.stderr, "w", encoding="utf-8") as stderr:
         child = subprocess.Popen(
@@ -39,6 +51,7 @@ def main() -> None:
             text=True,
             bufsize=1,
             env=os.environ.copy(),
+            cwd=args.cwd,
         )
 
         assert child.stdin is not None

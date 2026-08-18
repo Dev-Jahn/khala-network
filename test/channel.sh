@@ -13,6 +13,7 @@ RUNTIME=$RIG/runtime
 CC_SESSIONS=$RIG/cc-sessions
 SESSION_ID=h21-session
 IDENTITY=h21
+PROJECT_DIR=$RIG/project
 PIDS=
 
 cleanup() {
@@ -42,6 +43,7 @@ wait_file() {
 mkdir -p "$RIG/bin" "$HOME_RIG" "$CC_SESSIONS" "$HOME/.cache/khala-go-tmp" \
     "$HOME/.cache/khala-go-build" || exit 1
 trap cleanup EXIT HUP INT TERM
+mkdir -p "$PROJECT_DIR" && printf '%s\n' "$IDENTITY" > "$PROJECT_DIR/.khala-session" || fail "project fixture"
 
 (cd "$ROOT/link" && GOTMPDIR=$HOME/.cache/khala-go-tmp \
     GOCACHE=$HOME/.cache/khala-go-build CGO_ENABLED=0 "$GO" build -o "$BIN" .) || \
@@ -59,8 +61,15 @@ CC_SOCKET=$RIG/cc.sock
 CC_PID=$!
 PIDS="$PIDS $CC_PID"
 wait_file "$RIG/cc.ready" || fail "CC socket listener did not bind"
-printf '{"pid":%s,"sessionId":"%s","name":"h21","version":"2.1.234","messagingSocketPath":"%s"}\n' \
-    "$CC_PID" "$SESSION_ID" "$CC_SOCKET" > "$CC_SESSIONS/$CC_PID.json"
+printf '{"pid":%s,"sessionId":"%s","name":"h21","version":"2.1.234","messagingSocketPath":"%s","cwd":"%s"}\n' \
+    "$CC_PID" "$SESSION_ID" "$CC_SOCKET" "$PROJECT_DIR" > "$CC_SESSIONS/$CC_PID.json"
+# The channel child under Claude Code runs with the plugin directory as cwd and
+# without CLAUDE_CODE_SESSION_ID/KHALA_SESSION; it must find its session and
+# project through its parent process's registry entry. The MCP client below
+# rewrites this second registry entry to its own pid before spawning the child.
+CHILD_REGISTRY=$CC_SESSIONS/child-parent.json
+printf '{"pid":0,"sessionId":"%s","name":"h21","version":"2.1.234","messagingSocketPath":"%s","cwd":"%s"}\n' \
+    "$SESSION_ID" "$CC_SOCKET" "$PROJECT_DIR" > "$CHILD_REGISTRY"
 
 REGISTER=$(env KHALA_HOME=$KHALA_HOME_RIG KHALA_RUNTIME_DIR=$RUNTIME \
     KHALA_TEST_BOOT_ID=channel-test-boot KHALA_CLAUDE_SESSIONS_DIR=$CC_SESSIONS \
@@ -75,11 +84,16 @@ SDK_ROOT=$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/node
 [ -d "$SDK_ROOT/@modelcontextprotocol/sdk" ] || fail "telegram MCP SDK cache missing"
 ln -s "$SDK_ROOT" "$RIG/node_modules" || fail "MCP SDK rig symlink failed"
 
+# A child without a khala identity must stay connected as an inert MCP server
+# (Claude Code quarantines a plugin server that closes stdio right after
+# connecting: ~/.claude/mcp-needs-auth-cache.json), log one line, write no
+# MCP frames on its own, and exit 0 when stdin closes.
 mkdir -p "$RIG/no-identity"
-(cd "$RIG/no-identity" && env -u KHALA_SESSION HOME=$HOME_RIG NODE_PATH=$RIG/node_modules \
-    PATH=$RIG/bin:/usr/bin:/bin "$BUN" "$ROOT/plugin/channel/server.ts" \
-    >"$RIG/no-identity.out" 2>"$RIG/no-identity.err") || fail "no-identity child did not exit 0"
-[ ! -s "$RIG/no-identity.out" ] || fail "no-identity child wrote MCP stdout"
+(cd "$RIG/no-identity" && env -u KHALA_SESSION -u CLAUDE_CODE_SESSION_ID HOME=$HOME_RIG NODE_PATH=$RIG/node_modules \
+    KHALA_CLAUDE_SESSIONS_DIR=$RIG/empty-sessions PATH=$RIG/bin:/usr/bin:/bin \
+    "$BUN" "$ROOT/plugin/channel/server.ts" \
+    >"$RIG/no-identity.out" 2>"$RIG/no-identity.err") < <(sleep 2) || fail "no-identity child did not exit 0 on stdin close"
+[ ! -s "$RIG/no-identity.out" ] || fail "no-identity child wrote MCP stdout unprompted"
 [ "$(wc -l < "$RIG/no-identity.err" | tr -d ' ')" -eq 1 ] || fail "no-identity child did not log exactly one line"
 grep -q 'no valid session identity' "$RIG/no-identity.err" || fail "no-identity explanation differs"
 
@@ -98,16 +112,19 @@ Expires: 1999999999
 body from H21 inbox
 EOF
 
-env HOME=$HOME_RIG KHALA_HOME=$KHALA_HOME_RIG KHALA_RUNTIME_DIR=$RUNTIME \
+PLUGIN_CWD=$RIG/plugin-cwd
+mkdir -p "$PLUGIN_CWD"
+env -u KHALA_SESSION -u CLAUDE_CODE_SESSION_ID -u CLAUDE_PROJECT_DIR \
+    HOME=$HOME_RIG KHALA_HOME=$KHALA_HOME_RIG KHALA_RUNTIME_DIR=$RUNTIME \
     KHALA_TEST_BOOT_ID=channel-test-boot KHALA_CLAUDE_SESSIONS_DIR=$CC_SESSIONS \
-    KHALA_SESSION=$IDENTITY CLAUDE_CODE_SESSION_ID=$SESSION_ID \
     NODE_PATH=$RIG/node_modules PATH=$RIG/bin:/usr/bin:/bin \
     "$RIG/venv/bin/python" "$ROOT/test/channel-mcp-client.py" \
     --bun "$BUN" --server "$ROOT/plugin/channel/server.ts" \
     --registration "$REGISTRATION" --inbox "$H21_INBOX" \
     --outbox "$KHALA_HOME_RIG/outbox/new" \
+    --cwd "$PLUGIN_CWD" --registry-pid-file "$CHILD_REGISTRY" \
     --stderr "$RIG/channel.err" || fail "MCP/channel/reply protocol failed"
 
-printf 'ok H21 — MCP child registered its socket, forwarded a notification, drained, replied, and cleaned up\n'
+printf 'ok H21 — MCP child found its session via the parent registry (plugin cwd, no env), registered its socket, forwarded a notification, drained, replied, and cleaned up\n'
 printf 'RESULT: PASS\n'
 printf 'Channel H21 MCP stdio, Unix doorbell, tools, and cleanup properties passed\n'
