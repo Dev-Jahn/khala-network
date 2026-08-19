@@ -3,7 +3,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type Server as UnixServer, type Socket } from 'node:net'
@@ -12,10 +12,10 @@ const VALID_IDENTITY = /^[a-z0-9][a-z0-9-]*$/
 const VALID_META_KEY = /^[a-zA-Z_][a-zA-Z0-9_]*$/
 
 // Claude Code spawns a plugin MCP server with the plugin directory as cwd and
-// without CLAUDE_CODE_SESSION_ID, so the session and its project directory are
-// learned from the parent Claude process's own registry entry
-// (khala-link runtime session --pid <ppid>), never from cwd or env guesses.
-// KHALA_SESSION in the environment still wins when the user set it.
+// without CLAUDE_CODE_SESSION_ID. The parent registry is re-read on every poll
+// because --resume can rewrite its session id after this child starts.
+// KHALA_CHANNEL_POLL_MS is a test-only override for both polling intervals;
+// production uses the fixed intervals below.
 function resolveIdentity(projectDir: string): string | undefined {
   if (process.env.KHALA_SESSION !== undefined) {
     return VALID_IDENTITY.test(process.env.KHALA_SESSION) ? process.env.KHALA_SESSION : undefined
@@ -61,6 +61,52 @@ async function run(command: string, args: string[], identity: string): Promise<s
   return stdout
 }
 
+type SessionContext = {
+  sessionId: string
+  projectDir: string
+  identity?: string
+}
+
+type Attachment = {
+  identity: string
+  sessionId: string
+  instance: string
+  listener: UnixServer
+  socketPath: string
+  socketIno?: number
+  registered: boolean
+  registering?: Promise<void>
+}
+
+async function resolveSessionContext(khalaLink: string): Promise<SessionContext> {
+  let sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? ''
+  let projectDir = process.env.CLAUDE_PROJECT_DIR ?? ''
+  if (!sessionId || !projectDir) {
+    try {
+      const line = (await run(khalaLink, ['runtime', 'session', '--pid', String(process.ppid)], '')).trimEnd()
+      const [resolvedSessionID, resolvedProjectDir] = line.split('\t')
+      if (!sessionId) sessionId = resolvedSessionID ?? ''
+      if (!projectDir) projectDir = resolvedProjectDir ?? ''
+    } catch {
+      // The registry may not exist yet, especially while Claude Code resumes.
+    }
+  }
+  return {
+    sessionId,
+    projectDir,
+    identity: resolveIdentity(projectDir || process.cwd()),
+  }
+}
+
+function testPollInterval(): number | undefined {
+  const raw = process.env.KHALA_CHANNEL_POLL_MS
+  if (raw === undefined) return undefined
+  if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    throw new Error('KHALA_CHANNEL_POLL_MS must be a positive integer')
+  }
+  return Number(raw)
+}
+
 function sanitizeMeta(meta: unknown): Record<string, string> {
   if (meta === null || typeof meta !== 'object' || Array.isArray(meta)) return {}
   const sanitized: Record<string, string> = {}
@@ -82,22 +128,74 @@ function stringArgument(args: Record<string, unknown>, name: string, required: b
 }
 
 async function main(): Promise<void> {
-  const khala = resolveBinary('khala')
-  const khalaLink = resolveBinary('khala-link')
-  let SESSION_ID = process.env.CLAUDE_CODE_SESSION_ID ?? ''
-  let projectDir = process.env.CLAUDE_PROJECT_DIR ?? ''
-  if (!SESSION_ID || !projectDir) {
+  let khalaLink = ''
+  let attachment: Attachment | undefined
+  let shuttingDown = false
+
+  const closeAndRemove = (target: Attachment): void => {
     try {
-      const line = (await run(khalaLink, ['runtime', 'session', '--pid', String(process.ppid)], '')).trimEnd()
-      const [sessionID, cwd] = line.split('\t')
-      if (!SESSION_ID) SESSION_ID = sessionID ?? ''
-      if (!projectDir) projectDir = cwd ?? ''
+      target.listener.close()
     } catch {
-      // not spawned by a registered Claude session — decided below
+      // The listener may not have reached listen() yet.
+    }
+    if (target.socketIno === undefined) return
+    try {
+      if (statSync(target.socketPath).ino === target.socketIno) {
+        rmSync(target.socketPath)
+      }
+    } catch {
+      // A missing or replaced path is not ours to remove.
     }
   }
+
+  const clearRegistration = async (target: Attachment): Promise<void> => {
+    if (target.registering) {
+      await target.registering
+      target.registering = undefined
+    }
+    if (!target.registered || !khalaLink) return
+    await run(
+      khalaLink,
+      [
+        'runtime', 'register-channel', '--instance', target.instance,
+        '--session-id', target.sessionId, '--caller-pid', String(process.pid), '--clear',
+      ],
+      target.identity,
+    )
+    target.registered = false
+  }
+
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return
+    shuttingDown = true
+    const target = attachment
+    if (target) {
+      closeAndRemove(target)
+      try {
+        await clearRegistration(target)
+      } catch (error) {
+        process.stderr.write(`khala channel: cleanup failed: ${error}\n`)
+      }
+    }
+    process.exit(0)
+  }
+
+  const requestShutdown = (): void => { void shutdown() }
+  process.stdin.on('end', requestShutdown)
+  process.stdin.on('close', requestShutdown)
+  process.on('SIGTERM', requestShutdown)
+  process.on('SIGINT', requestShutdown)
+  process.on('SIGHUP', requestShutdown)
+  const watchdog = setInterval(() => {
+    if (process.stdin.destroyed || process.stdin.readableEnded) requestShutdown()
+  }, 5_000)
+  watchdog.unref()
+
+  const khala = resolveBinary('khala')
+  khalaLink = resolveBinary('khala-link')
+  const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.6.1' },
+    { name: 'khala', version: '0.6.2' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
@@ -108,10 +206,8 @@ async function main(): Promise<void> {
     },
   )
 
-  const identity = resolveIdentity(projectDir || process.cwd())
-  const activeIdentity = identity && SESSION_ID ? identity : ''
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: !activeIdentity ? [] : [
+    tools: [
       {
         name: 'khala_drain',
         description: 'Drain this session identity\'s durable Khala inbox now.',
@@ -137,12 +233,13 @@ async function main(): Promise<void> {
 
   mcp.setRequestHandler(CallToolRequestSchema, async request => {
     const args = (request.params.arguments ?? {}) as Record<string, unknown>
-    if (!activeIdentity) {
+    const { identity } = await resolveSessionContext(khalaLink)
+    if (!identity) {
       return { content: [{ type: 'text', text: 'khala channel is idle: this session has no khala identity' }], isError: true }
     }
     try {
       if (request.params.name === 'khala_drain') {
-        const output = await run(khala, ['inbox', '--drain'], activeIdentity)
+        const output = await run(khala, ['inbox', '--drain'], identity)
         return { content: [{ type: 'text', text: output }] }
       }
       if (request.params.name === 'khala_reply') {
@@ -154,7 +251,7 @@ async function main(): Promise<void> {
         if (replyTo !== undefined) commandArgs.push('--reply-to', replyTo)
         if (subject !== undefined) commandArgs.push('-s', subject)
         commandArgs.push('-m', text)
-        const letterID = (await run(khala, commandArgs, activeIdentity)).trim()
+        const letterID = (await run(khala, commandArgs, identity)).trim()
         return { content: [{ type: 'text', text: letterID }] }
       }
       return {
@@ -170,101 +267,162 @@ async function main(): Promise<void> {
     }
   })
 
-  if (!identity || !SESSION_ID) {
-    // Stay connected as an inert MCP server. Claude Code quarantines a plugin
-    // server that closes its stdio right after connecting (it is recorded in
-    // ~/.claude/mcp-needs-auth-cache.json and never spawned again), so a
-    // session without a khala identity must keep the transport open and simply
-    // never emit a channel event or register a socket.
-    process.stderr.write(identity
-      ? 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n'
-      : 'khala channel: no valid session identity; channel idle\n')
-    await mcp.connect(new StdioServerTransport())
-    await new Promise<void>(resolve => {
-      process.stdin.on('end', resolve)
-      process.stdin.on('close', resolve)
-      process.on('SIGTERM', resolve)
-      process.on('SIGINT', resolve)
-    })
-    return
-  }
-
   await mcp.connect(new StdioServerTransport())
 
-  const runtimeRoot = (await run(khalaLink, ['runtime', 'root'], identity)).trim()
-  const deadline = Date.now() + 60_000
-  let instance = ''
-  while (instance === '') {
-    try {
-      instance = (await run(
-        khalaLink,
-        ['runtime', 'whoami', '--identity', identity, '--session-id', SESSION_ID],
-        identity,
-      )).trim()
-    } catch (error) {
-      if (Date.now() >= deadline) throw error
-      await Bun.sleep(2_000)
-    }
+  let state = ''
+  const enterState = (next: string, message?: string): void => {
+    if (state === next) return
+    state = next
+    if (message) process.stderr.write(message)
   }
 
-  const channelDirectory = join(runtimeRoot, 'channels')
-  mkdirSync(channelDirectory, { recursive: true, mode: 0o700 })
-  chmodSync(channelDirectory, 0o700)
-  const channelSocket = join(channelDirectory, `${instance}.sock`)
-  rmSync(channelSocket, { force: true })
+  const bindAndRegister = async (context: SessionContext, instance: string): Promise<Attachment> => {
+    const identity = context.identity!
+    const runtimeRoot = (await run(khalaLink, ['runtime', 'root'], identity)).trim()
+    if (!runtimeRoot) throw new Error('khala-link runtime root returned an empty path')
+    const channelDirectory = join(runtimeRoot, 'channels')
+    mkdirSync(channelDirectory, { recursive: true, mode: 0o700 })
+    chmodSync(channelDirectory, 0o700)
+    const socketPath = join(channelDirectory, `${instance}.sock`)
+    rmSync(socketPath, { force: true })
 
-  const listener = createServer(connection => handleDoorbell(connection, mcp))
-  await listen(listener, channelSocket)
-  chmodSync(channelSocket, 0o600)
-
-  try {
-    await run(
-      khalaLink,
-      [
-        'runtime', 'register-channel', '--instance', instance,
-        '--session-id', SESSION_ID, '--channel-socket', channelSocket,
-        '--caller-pid', String(process.pid),
-      ],
+    const target: Attachment = {
       identity,
-    )
-  } catch (error) {
-    listener.close()
-    rmSync(channelSocket, { force: true })
-    throw error
-  }
-
-  let shuttingDown = false
-  const shutdown = async (): Promise<void> => {
-    if (shuttingDown) return
-    shuttingDown = true
-    listener.close()
-    rmSync(channelSocket, { force: true })
+      sessionId: context.sessionId,
+      instance,
+      listener: createServer(connection => handleDoorbell(connection, mcp)),
+      socketPath,
+      registered: false,
+    }
+    attachment = target
     try {
-      await run(
+      target.socketIno = await listen(target.listener, socketPath)
+      chmodSync(socketPath, 0o600)
+      target.registering = run(
         khalaLink,
         [
           'runtime', 'register-channel', '--instance', instance,
-          '--session-id', SESSION_ID, '--caller-pid', String(process.pid), '--clear',
+          '--session-id', context.sessionId, '--channel-socket', socketPath,
+          '--caller-pid', String(process.pid),
         ],
         identity,
-      )
+      ).then(() => { target.registered = true })
+      await target.registering
+      target.registering = undefined
+      return target
     } catch (error) {
-      process.stderr.write(`khala channel: cleanup failed: ${error}\n`)
+      closeAndRemove(target)
+      if (attachment === target) attachment = undefined
+      throw error
     }
-    process.exit(0)
   }
-  process.stdin.on('end', () => void shutdown())
-  process.stdin.on('close', () => void shutdown())
-  process.on('SIGTERM', () => void shutdown())
-  process.on('SIGINT', () => void shutdown())
+
+  const attachStartedAt = Date.now()
+  while (!shuttingDown && !attachment) {
+    const context = await resolveSessionContext(khalaLink)
+    if (!context.identity) {
+      enterState('no-identity', 'khala channel: no valid session identity; channel idle\n')
+    } else if (!context.sessionId) {
+      enterState('no-session', 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n')
+    } else {
+      let instance: string
+      try {
+        instance = (await run(
+          khalaLink,
+          ['runtime', 'whoami', '--identity', context.identity, '--session-id', context.sessionId],
+          context.identity,
+        )).trim()
+      } catch {
+        enterState(
+          `waiting:${context.identity}:${context.sessionId}`,
+          `khala channel: waiting for registration of ${context.identity}; channel idle\n`,
+        )
+        const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
+        await Bun.sleep(retryInterval)
+        continue
+      }
+      await bindAndRegister(context, instance)
+      enterState(
+        `attached:${context.identity}:${context.sessionId}:${instance}`,
+        `khala channel: attached ${context.identity} instance ${instance}\n`,
+      )
+      break
+    }
+    const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
+    await Bun.sleep(retryInterval)
+  }
+
+  const attachedPollInterval = pollOverride ?? 15_000
+  while (!shuttingDown && attachment) {
+    await Bun.sleep(attachedPollInterval)
+    if (shuttingDown || !attachment) break
+    const current = attachment
+    const context = await resolveSessionContext(khalaLink)
+    if (context.identity === current.identity && context.sessionId === current.sessionId) {
+      enterState(`attached:${current.identity}:${current.sessionId}:${current.instance}`)
+      continue
+    }
+    if (!context.identity) {
+      enterState('changed-no-identity', 'khala channel: no valid session identity; channel idle\n')
+      continue
+    }
+    if (!context.sessionId) {
+      enterState('changed-no-session', 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n')
+      continue
+    }
+
+    let nextInstance: string
+    try {
+      nextInstance = (await run(
+        khalaLink,
+        ['runtime', 'whoami', '--identity', context.identity, '--session-id', context.sessionId],
+        context.identity,
+      )).trim()
+    } catch {
+      enterState(
+        `changed-waiting:${context.identity}:${context.sessionId}`,
+        `khala channel: session changed; waiting for registration of ${context.identity}; keeping current attachment\n`,
+      )
+      continue
+    }
+
+    if (nextInstance === current.instance) {
+      await run(
+        khalaLink,
+        [
+          'runtime', 'register-channel', '--instance', nextInstance,
+          '--session-id', context.sessionId, '--channel-socket', current.socketPath,
+          '--caller-pid', String(process.pid),
+        ],
+        context.identity,
+      )
+      current.identity = context.identity
+      current.sessionId = context.sessionId
+      current.registered = true
+      enterState(
+        `attached:${context.identity}:${context.sessionId}:${nextInstance}`,
+        `khala channel: attached ${context.identity} instance ${nextInstance}\n`,
+      )
+      continue
+    }
+
+    await clearRegistration(current)
+    closeAndRemove(current)
+    if (attachment === current) attachment = undefined
+    await bindAndRegister(context, nextInstance)
+    enterState(
+      `attached:${context.identity}:${context.sessionId}:${nextInstance}`,
+      `khala channel: attached ${context.identity} instance ${nextInstance}\n`,
+    )
+  }
 }
 
-function listen(listener: UnixServer, socketPath: string): Promise<void> {
+function listen(listener: UnixServer, socketPath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     listener.once('error', reject)
     listener.listen(socketPath, () => {
       listener.off('error', reject)
-      resolve()
+      resolve(statSync(socketPath).ino)
     })
   })
 }
