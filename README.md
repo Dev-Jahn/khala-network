@@ -189,7 +189,7 @@ an interactive session with
 when its channel child is live, the conduit sends the one outstanding doorbell
 there instead of the CC inbox socket, rendering a short `← khala · sender: …`
 without the socket protocol header and exposing `khala_drain` / `khala_reply`.
-The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes.
+The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes and trusting the parent's registry over a stale environment session id.
 A failed channel attempt is logged and journaled before that attempt falls back
 to the socket. Channel events are always `next`, so `--later` is represented as
 `later="1"` metadata for the model to defer rather than changing the channel

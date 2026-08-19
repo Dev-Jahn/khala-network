@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.6.2
+KHALA_VERSION=0.6.3
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
