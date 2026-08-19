@@ -19,8 +19,8 @@ PROJECT_DIR=$RIG/project
 PIDS=
 
 case $CASE in
-    all|fast|h21a|h21b|h21c) ;;
-    *) printf 'usage: %s [all|fast|h21a|h21b|h21c]\n' "$0" >&2; exit 2 ;;
+    all|fast|h21a|h21b|h21c|h21d|h21e) ;;
+    *) printf 'usage: %s [all|fast|h21a|h21b|h21c|h21d|h21e]\n' "$0" >&2; exit 2 ;;
 esac
 
 cleanup() {
@@ -138,7 +138,8 @@ set_child_registry() {
 }
 
 PLUGIN_CWD=$RIG/plugin-cwd
-mkdir -p "$PLUGIN_CWD"
+EMPTY_CC_SESSIONS=$RIG/empty-sessions
+mkdir -p "$PLUGIN_CWD" "$EMPTY_CC_SESSIONS"
 
 run_client() {
     client_scenario=$1
@@ -190,5 +191,21 @@ if [ "$CASE" = all ] || [ "$CASE" = h21c ]; then
     printf 'ok H21c — attached child cleared its old instance, moved to the rewritten session, and answered there\n'
 fi
 
+if [ "$CASE" = all ] || [ "$CASE" = h21d ]; then
+    set_child_registry "$SESSION_ID"
+    reset_inbox
+    run_client full --child-session-id h21-env-stale --child-project-dir "$PROJECT_DIR" || \
+        fail "H21d stale env session-id attach failed"
+    printf 'ok H21d — child preferred the live parent registry over a stale exported session id and completed H21\n'
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = h21e ]; then
+    set_child_registry "$SESSION_ID"
+    reset_inbox
+    run_client full --child-session-id "$SESSION_ID" --child-project-dir "$PROJECT_DIR" \
+        --child-sessions-dir "$EMPTY_CC_SESSIONS" || fail "H21e env fallback attach failed"
+    printf 'ok H21e — child used the exported session id when the parent registry walk found nothing and completed H21\n'
+fi
+
 printf 'RESULT: PASS\n'
-printf 'Channel H21 fast, late-resume, socketpair EOF, re-attach, tools, doorbell, and cleanup properties passed\n'
+printf 'Channel H21 fast, late-resume, socketpair EOF, re-attach, stale-env, env-fallback, tools, doorbell, and cleanup properties passed\n'

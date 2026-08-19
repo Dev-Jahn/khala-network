@@ -82,6 +82,13 @@ def spawn_child(args, stderr, *, socket_stdin: bool = False) -> Client:
     if socket_stdin:
         parent_socket, child_socket = socket.socketpair()
         stdin = child_socket
+    child_env = os.environ.copy()
+    if args.child_session_id is not None:
+        child_env["CLAUDE_CODE_SESSION_ID"] = args.child_session_id
+    if args.child_project_dir is not None:
+        child_env["CLAUDE_PROJECT_DIR"] = args.child_project_dir
+    if args.child_sessions_dir is not None:
+        child_env["KHALA_CLAUDE_SESSIONS_DIR"] = args.child_sessions_dir
     child = subprocess.Popen(
         [args.bun, args.server],
         stdin=stdin,
@@ -89,7 +96,7 @@ def spawn_child(args, stderr, *, socket_stdin: bool = False) -> Client:
         stderr=stderr,
         text=True,
         bufsize=1,
-        env=os.environ.copy(),
+        env=child_env,
         cwd=args.cwd,
     )
     if child_socket is not None:
@@ -325,6 +332,9 @@ def main() -> None:
     parser.add_argument("--registration-2")
     parser.add_argument("--next-session-id")
     parser.add_argument("--late-session-id")
+    parser.add_argument("--child-session-id")
+    parser.add_argument("--child-project-dir")
+    parser.add_argument("--child-sessions-dir")
     parser.add_argument("--inbox")
     parser.add_argument("--outbox")
     parser.add_argument("--channels-dir")
