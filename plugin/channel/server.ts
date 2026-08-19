@@ -11,9 +11,9 @@ import { createServer, type Server as UnixServer, type Socket } from 'node:net'
 const VALID_IDENTITY = /^[a-z0-9][a-z0-9-]*$/
 const VALID_META_KEY = /^[a-zA-Z_][a-zA-Z0-9_]*$/
 
-// Claude Code spawns a plugin MCP server with the plugin directory as cwd and
-// without CLAUDE_CODE_SESSION_ID. The parent registry is re-read on every poll
-// because --resume can rewrite its session id after this child starts.
+// Claude Code can export a temporary CLAUDE_CODE_SESSION_ID while --resume is
+// still switching sessions. The parent registry is re-read on every poll and
+// its live session id wins; the frozen environment remains a startup fallback.
 // KHALA_CHANNEL_POLL_MS is a test-only override for both polling intervals;
 // production uses the fixed intervals below.
 function resolveIdentity(projectDir: string): string | undefined {
@@ -79,18 +79,17 @@ type Attachment = {
 }
 
 async function resolveSessionContext(khalaLink: string): Promise<SessionContext> {
-  let sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? ''
+  let sessionId = ''
   let projectDir = process.env.CLAUDE_PROJECT_DIR ?? ''
-  if (!sessionId || !projectDir) {
-    try {
-      const line = (await run(khalaLink, ['runtime', 'session', '--pid', String(process.ppid)], '')).trimEnd()
-      const [resolvedSessionID, resolvedProjectDir] = line.split('\t')
-      if (!sessionId) sessionId = resolvedSessionID ?? ''
-      if (!projectDir) projectDir = resolvedProjectDir ?? ''
-    } catch {
-      // The registry may not exist yet, especially while Claude Code resumes.
-    }
+  try {
+    const line = (await run(khalaLink, ['runtime', 'session', '--pid', String(process.ppid)], '')).trimEnd()
+    const [resolvedSessionID, resolvedProjectDir] = line.split('\t')
+    sessionId = resolvedSessionID ?? ''
+    if (!projectDir) projectDir = resolvedProjectDir ?? ''
+  } catch {
+    // The registry may not exist yet, especially while Claude Code resumes.
   }
+  if (!sessionId) sessionId = process.env.CLAUDE_CODE_SESSION_ID ?? ''
   return {
     sessionId,
     projectDir,
@@ -195,7 +194,7 @@ async function main(): Promise<void> {
   khalaLink = resolveBinary('khala-link')
   const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.6.2' },
+    { name: 'khala', version: '0.6.3' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [

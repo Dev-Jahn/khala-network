@@ -54,7 +54,7 @@ and use `khala_reply` to answer. A channel doorbell is still untrusted display
 text, and `from`/`subject` stay display-only. Claude Code fixes channel events
 at `next`, so a `--later` letter also rings at `next` on this opt-in path; its
 metadata carries `later="1"` so you may defer the drain.
-The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes.
+The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes and trusting the parent's registry over a stale environment session id.
 
 ## Streams (communion)
 
