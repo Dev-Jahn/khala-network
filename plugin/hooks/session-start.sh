@@ -6,6 +6,78 @@ set -u
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
 . "$HOOK_DIR/lib.sh"
 
+khala_launch_link_autofetch() {
+    khala_autofetch_target=$KHALA_ROOT/bin/khala-link
+    [ ! -e "$khala_autofetch_target" ] && [ ! -L "$khala_autofetch_target" ] || return 0
+
+    khala_autofetch_version=$(khala_cli_version "$KHALA_BIN")
+    if [ -z "$khala_autofetch_version" ]; then
+        printf '%s\n' 'khala: khala-link autofetch 실패 — 설치된 CLI 버전을 읽을 수 없습니다'
+        return 0
+    fi
+    case "$(uname -s 2>/dev/null)" in
+        Linux) khala_autofetch_os=linux ;;
+        Darwin) khala_autofetch_os=darwin ;;
+        *)
+            printf 'khala: khala-link autofetch 실패 — 지원하지 않는 OS: %s\n' "$(uname -s 2>/dev/null)"
+            return 0
+            ;;
+    esac
+    case "$(uname -m 2>/dev/null)" in
+        x86_64) khala_autofetch_arch=amd64 ;;
+        aarch64|arm64) khala_autofetch_arch=arm64 ;;
+        *)
+            printf 'khala: khala-link autofetch 실패 — 지원하지 않는 architecture: %s\n' "$(uname -m 2>/dev/null)"
+            return 0
+            ;;
+    esac
+    if command -v curl >/dev/null 2>&1; then
+        khala_autofetch_downloader=curl
+    elif command -v wget >/dev/null 2>&1; then
+        khala_autofetch_downloader=wget
+    else
+        printf '%s\n' 'khala: khala-link autofetch 실패 — curl 또는 wget이 필요합니다'
+        return 0
+    fi
+
+    khala_autofetch_asset=khala-link-$khala_autofetch_os-$khala_autofetch_arch
+    khala_autofetch_base=${KHALA_LINK_RELEASE_BASE-https://github.com/Dev-Jahn/khala-network/releases/download/v$khala_autofetch_version}
+    khala_autofetch_url=${khala_autofetch_base%/}/$khala_autofetch_asset
+    khala_autofetch_log=$KHALA_ROOT/log/link-autofetch.log
+    khala_autofetch_tmp=$KHALA_ROOT/bin/.khala-link.$$
+    if ! mkdir -p "$KHALA_ROOT/bin" "$KHALA_ROOT/log" 2>/dev/null; then
+        printf '%s\n' 'khala: khala-link autofetch 실패 — ~/.khala/bin 또는 log를 만들 수 없습니다'
+        return 0
+    fi
+
+    (
+        khala_autofetch_ok=0
+        if [ "$khala_autofetch_downloader" = curl ]; then
+            curl -fsSL "$khala_autofetch_url" -o "$khala_autofetch_tmp" 2>/dev/null && \
+                khala_autofetch_ok=1
+        else
+            wget -q -O "$khala_autofetch_tmp" "$khala_autofetch_url" 2>/dev/null && \
+                khala_autofetch_ok=1
+        fi
+        if [ "$khala_autofetch_ok" -eq 1 ] && chmod 755 "$khala_autofetch_tmp" 2>/dev/null; then
+            if [ ! -e "$khala_autofetch_target" ] && [ ! -L "$khala_autofetch_target" ] && \
+                mv "$khala_autofetch_tmp" "$khala_autofetch_target" 2>/dev/null; then
+                printf 'khala: khala-link autofetch 완료 — %s\n' "$khala_autofetch_asset"
+            else
+                rm -f "$khala_autofetch_tmp" 2>/dev/null
+                printf '%s\n' 'khala: khala-link autofetch 종료 — 기존 binary는 건드리지 않았습니다'
+            fi
+        else
+            rm -f "$khala_autofetch_tmp" 2>/dev/null
+            printf 'khala: khala-link autofetch 실패 — %s 다운로드 또는 설치 실패\n' \
+                "$khala_autofetch_url"
+        fi
+    ) </dev/null >> "$khala_autofetch_log" 2>&1 &
+    khala_autofetch_pid=$!
+    printf 'khala: khala-link autofetch launched (pid %s) — 완료/실패는 %s; 이번 SessionStart는 기다리지 않습니다\n' \
+        "$khala_autofetch_pid" "$khala_autofetch_log"
+}
+
 khala_start_input=$(cat 2>/dev/null) || khala_start_input=
 khala_ensure_cli "$HOOK_DIR/.."
 
@@ -13,6 +85,7 @@ if ! khala_discover; then
     printf '%s\n' 'khala: 노드 미초기화 — 이 노드는 칼라 밖입니다 (참여하려면: khala init <노드별칭> 후 ~/.khala/config에 함대 선언)'
     exit 0
 fi
+khala_launch_link_autofetch
 if ! khala_resolve_session 0 1; then
     exit 0
 fi

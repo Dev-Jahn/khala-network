@@ -120,37 +120,32 @@ letters belong to their recipients.
 
 ## Install
 
-```sh
-claude plugin marketplace add Dev-Jahn/jahns-cc-marketplace
-claude plugin install khala@jahns-cc-marketplace
-```
-
-That is the whole install. The plugin bundles the `khala` CLI and its
-SessionStart hook keeps `~/.local/bin/khala` installed and up to date (it
-never touches a symlink or a manually installed copy — it says so instead).
-The CLI still needs the fixed path because ssh remote commands and cron
-entries on other machines refer to it by that name.
-
-Then, once per machine, join the fleet:
+Bootstrap a new fleet; this node becomes its mailbox:
 
 ```sh
-khala init laptop        # your node alias: [a-z0-9][a-z0-9-]*
+curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/khala-network/main/install.sh | sh -s -- --name hub --bootstrap
 ```
 
-and declare your fleet in `~/.khala/config` (one line = one fact; endpoint
-candidates may be ssh aliases from `~/.ssh/config`, host coordinates, or
-absolute paths for same-machine testing):
+Join an existing fleet directly on the new node:
 
-```
-self laptop
-peer laptop laptop
-peer hub hub                # ssh alias defined in ~/.ssh/config
-mailbox hub                 # post-office priority; delete the self entry
-ttl 120                     # presence freshness in seconds
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dev-Jahn/khala-network/main/install.sh | sh -s -- --name laptop --mailbox hub user@hub
 ```
 
-The hub is just any node the others can reach over ssh — its own config says
-`self hub` and `mailbox hub`, and it simply waits.
+Or invite the new node from any joined node with a portable mailbox coordinate:
+
+```sh
+khala invite user@laptop --name laptop
+```
+
+The installer checks Claude Code rather than installing it, installs or updates
+the plugin and CLI, fetches the matching `khala-link` GitHub Release asset,
+configures the node, and verifies its runtime. The plugin still bundles the
+`khala` CLI: its SessionStart hook keeps `~/.local/bin/khala` installed and up
+to date without touching a symlink or divergent manual copy. When
+`~/.khala/bin/khala-link` is missing, the hook also launches a detached release
+fetch so session startup never waits for the network. The fixed CLI path remains
+important because ssh remote commands and cron entries refer to it by name.
 
 Daily use:
 
@@ -164,7 +159,6 @@ khala presence                              # who is alive / asleep / watching
 ## The nerve cord and the conduit (`khala node ensure`)
 
 ```sh
-cd link && go build -o ~/.khala/bin/khala-link .   # or cross-build with GOOS/GOARCH
 khala node ensure                                   # idempotent; the plugin hook runs it too
 ```
 
