@@ -194,7 +194,7 @@ async function main(): Promise<void> {
   khalaLink = resolveBinary('khala-link')
   const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.6.3' },
+    { name: 'khala', version: '0.7.0' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [

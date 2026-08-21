@@ -5,6 +5,11 @@ description: Cross-machine session mail and streams over the khala network — s
 
 # Khala
 
+From a joined node, `khala invite <ssh-target> --name <alias>` streams the
+bundled installer over SSH, then reports the remote status and sync results.
+If the configured mailbox coordinate is only a local SSH alias, pass the
+portable address explicitly with `--mailbox-coord <user@host>`.
+
 Use the session identity in this order: `KHALA_SESSION`, then the single-line
 `.khala-session` in `CLAUDE_PROJECT_DIR`. Never infer it from a directory basename.
 Names must match `[a-z0-9][a-z0-9-]*`; never lowercase or otherwise rewrite an
