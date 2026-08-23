@@ -249,23 +249,51 @@ func (c *conduit) run(ctx context.Context) error {
 	c.scan()
 	ticker := time.NewTicker(c.scanEvery)
 	defer ticker.Stop()
+	debounce := time.NewTimer(time.Hour)
+	if !debounce.Stop() {
+		<-debounce.C
+	}
+	defer debounce.Stop()
+	var debounceC <-chan time.Time
+	cancelDebounce := func() {
+		if !debounce.Stop() {
+			select {
+			case <-debounce.C:
+			default:
+			}
+		}
+		debounceC = nil
+	}
+	scheduleScan := func() {
+		cancelDebounce()
+		debounce.Reset(200 * time.Millisecond)
+		debounceC = debounce.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+			cancelDebounce()
+			c.scan()
+		case <-debounceC:
+			debounceC = nil
 			c.scan()
 		case err, ok := <-c.watcher.Errors:
 			if !ok {
 				return nil
 			}
 			c.logger.Printf("fsnotify error; full rescan: %v", err)
+			cancelDebounce()
 			c.scan()
-		case _, ok := <-c.watcher.Events:
+		case event, ok := <-c.watcher.Events:
 			if !ok {
 				return nil
 			}
-			c.scan()
+			if strings.HasPrefix(filepath.Base(event.Name), ".") {
+				continue
+			}
+			scheduleScan()
 		}
 	}
 }
@@ -310,6 +338,7 @@ func (c *conduit) scan() {
 		c.logger.Printf("load Claude registry failed: %v", err)
 		return
 	}
+	verifiedRegs := make(map[string]bool, len(regs))
 	for instance, reg := range regs {
 		resolved, verified, reason := c.verifyRegistration(reg, registries)
 		if resolved != reg {
@@ -333,12 +362,14 @@ func (c *conduit) scan() {
 			}
 		}
 		if verified {
+			verifiedRegs[instance] = true
 			c.healLease(regs[instance])
 		}
 		if !verified && reason != "" {
 			c.logger.Printf("registration %s not verified: %s", instance, reason)
 		}
 	}
+	c.reclaimLeases(regs, verifiedRegs)
 	leaseEntries, err := os.ReadDir(filepath.Join(c.runtime, "identities"))
 	if err != nil {
 		c.logger.Printf("load leases failed: %v", err)
@@ -437,20 +468,21 @@ func (c *conduit) healLease(reg sessionRegistration) {
 		return
 	}
 	leasePath := filepath.Join(c.runtime, "identities", reg.Identity+".lease")
+	var current identityLease
+	if err := readJSON(leasePath, &current); err != nil {
+		c.logger.Printf("heal lease %s failed: %v", reg.Identity, err)
+		return
+	}
+	if !leaseNeedsHeal(current, reg) {
+		return
+	}
 	err := withRuntimeLock(filepath.Join(c.runtime, "identities", ".leases.lock"), c.bootID, func() error {
 		var lease identityLease
 		if err := readJSON(leasePath, &lease); err != nil {
 			return err
 		}
-		if lease.BootID != c.bootID || lease.State != "owned" || lease.InstanceID != reg.InstanceID ||
-			lease.Epoch != reg.LeaseEpoch || lease.ClaudeSessionID != reg.ClaudeSessionID {
+		if !leaseNeedsHeal(lease, reg) {
 			return nil
-		}
-		if lease.PID == reg.PID && lease.PIDStart == reg.PIDStart {
-			return nil
-		}
-		if lease.PID > 1 && lease.PID != reg.PID {
-			return nil // a real different pid is a collision, not a gap
 		}
 		lease.PID = reg.PID
 		lease.PIDStart = reg.PIDStart
@@ -459,6 +491,79 @@ func (c *conduit) healLease(reg sessionRegistration) {
 	})
 	if err != nil {
 		c.logger.Printf("heal lease %s failed: %v", reg.Identity, err)
+	}
+}
+
+func leaseNeedsHeal(lease identityLease, reg sessionRegistration) bool {
+	if lease.BootID != reg.BootID || lease.State != "owned" || lease.InstanceID != reg.InstanceID ||
+		lease.Epoch != reg.LeaseEpoch || lease.ClaudeSessionID != reg.ClaudeSessionID {
+		return false
+	}
+	if lease.PID == reg.PID && lease.PIDStart == reg.PIDStart {
+		return false
+	}
+	return lease.PID <= 1 || lease.PID == reg.PID
+}
+
+func (c *conduit) reclaimLeases(regs map[string]sessionRegistration, verified map[string]bool) {
+	byIdentity := make(map[string][]sessionRegistration)
+	for instance, reg := range regs {
+		if verified[instance] && (reg.Kind == "interactive" || reg.ReceiveOptIn) {
+			byIdentity[reg.Identity] = append(byIdentity[reg.Identity], reg)
+		}
+	}
+	identities := make([]string, 0, len(byIdentity))
+	for identity := range byIdentity {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+	for _, identity := range identities {
+		leasePath := filepath.Join(c.runtime, "identities", identity+".lease")
+		var lease identityLease
+		if err := readJSON(leasePath, &lease); err != nil && !os.IsNotExist(err) {
+			c.logger.Printf("reclaim lease %s failed: %v", identity, err)
+			continue
+		}
+		if leaseOwnerLive(c.runtime, c.bootID, lease) {
+			continue
+		}
+		candidates := byIdentity[identity]
+		sort.Slice(candidates, func(i, j int) bool {
+			left, leftErr := time.Parse(time.RFC3339Nano, candidates[i].StartedAt)
+			right, rightErr := time.Parse(time.RFC3339Nano, candidates[j].StartedAt)
+			if leftErr == nil && rightErr == nil && !left.Equal(right) {
+				return left.After(right)
+			}
+			if leftErr == nil && rightErr != nil {
+				return true
+			}
+			if leftErr != nil && rightErr == nil {
+				return false
+			}
+			if candidates[i].StartedAt != candidates[j].StartedAt {
+				return candidates[i].StartedAt > candidates[j].StartedAt
+			}
+			return candidates[i].InstanceID < candidates[j].InstanceID
+		})
+		candidate := candidates[0]
+		owner, epoch, err := claimLease(c.runtime, c.bootID, &candidate, false)
+		if err != nil {
+			c.logger.Printf("reclaim lease %s failed: %v", identity, err)
+			continue
+		}
+		if !owner {
+			continue
+		}
+		if err := mutateRegistration(c.runtime, c.bootID, candidate.InstanceID, func(reg *sessionRegistration) error {
+			reg.LeaseEpoch = epoch
+			return nil
+		}); err != nil {
+			c.logger.Printf("reclaim lease %s registration update failed: %v", identity, err)
+			continue
+		}
+		candidate.LeaseEpoch = epoch
+		regs[candidate.InstanceID] = candidate
+		c.logger.Printf("reclaimed lease %s for instance %s", identity, candidate.InstanceID)
 	}
 }
 
@@ -634,7 +739,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 }
 
 func (c *conduit) restoreState(identity, instance, generation string) *conduitState {
-	state := &conduitState{generation: generation, nextAttempt: time.Now()}
+	state := &conduitState{generation: generation}
 	dir := filepath.Join(c.runtime, "deliveries", identity, instance)
 	entries, err := os.ReadDir(dir)
 	if err != nil {

@@ -832,6 +832,9 @@ func processArgs(pid int) []string {
 }
 
 func detectSessionKind(pid int) string {
+	// A fork flag can live on a bg-pty-host ancestor above the registered
+	// Claude process, so worker markers take precedence across the whole walk.
+	foundClaude := false
 	for current, depth := pid, 0; current > 1 && depth < 12; depth++ {
 		args := processArgs(current)
 		isClaude := false
@@ -840,18 +843,22 @@ func detectSessionKind(pid int) string {
 			if base == "claude" || strings.HasPrefix(base, "claude-") {
 				isClaude = true
 			}
-			if arg == "-p" || arg == "--print" || arg == "--fork-session" {
+			if arg == "-p" || arg == "--print" || arg == "--fork-session" ||
+				strings.HasPrefix(arg, "--fork-session=") {
 				return "worker"
 			}
 		}
 		if isClaude {
-			return "interactive"
+			foundClaude = true
 		}
 		parent, err := processParent(current)
 		if err != nil || parent == current {
 			break
 		}
 		current = parent
+	}
+	if foundClaude {
+		return "interactive"
 	}
 	return "unknown"
 }
@@ -887,14 +894,24 @@ func withRuntimeLock(path, bootID string, fn func() error) error {
 		return err
 	}
 	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
-	if err := f.Truncate(0); err != nil {
+	want := fmt.Sprintf("{\"bootId\":%q}\n", bootID)
+	current, err := io.ReadAll(f)
+	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(f, "{\"bootId\":%q}\n", bootID); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
+	if string(current) != want {
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(f, want); err != nil {
+			return err
+		}
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
 	return fn()
 }
@@ -919,6 +936,11 @@ func claimLease(root, bootID string, reg *sessionRegistration, takeover bool) (b
 		if takeover {
 			if !eligible {
 				return errors.New("non-interactive registration requires receive opt-in for takeover")
+			}
+			if reg.Kind != "interactive" {
+				if current, live := liveLeaseOwnerRegistration(root, bootID, lease); live && current.Kind == "interactive" {
+					return errors.New("non-interactive registration cannot take over a live interactive owner")
+				}
 			}
 			if hasCurrentEpoch {
 				epoch++
@@ -955,18 +977,24 @@ func claimLease(root, bootID string, reg *sessionRegistration, takeover bool) (b
 }
 
 func leaseOwnerLive(root, bootID string, lease identityLease) bool {
+	_, live := liveLeaseOwnerRegistration(root, bootID, lease)
+	return live
+}
+
+func liveLeaseOwnerRegistration(root, bootID string, lease identityLease) (sessionRegistration, bool) {
 	if lease.BootID != bootID || lease.InstanceID == "" || lease.State != "owned" {
-		return false
+		return sessionRegistration{}, false
 	}
 	var reg sessionRegistration
-	if readJSON(filepath.Join(root, "sessions", lease.InstanceID+".json"), &reg) != nil || reg.BootID != bootID {
-		return false
+	if readJSON(filepath.Join(root, "sessions", lease.InstanceID+".json"), &reg) != nil ||
+		reg.BootID != bootID || reg.InstanceID != lease.InstanceID || reg.Identity != lease.Identity {
+		return sessionRegistration{}, false
 	}
 	if processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
-		return true
+		return reg, true
 	}
 	started, err := time.Parse(time.RFC3339Nano, reg.StartedAt)
-	return err == nil && reg.PID <= 1 && time.Since(started) < 30*time.Second
+	return reg, err == nil && reg.PID <= 1 && time.Since(started) < 30*time.Second
 }
 
 func runtimeRelease(args []string) error {
@@ -1041,15 +1069,27 @@ func runtimeRelease(args []string) error {
 		leasePath := filepath.Join(root, "identities", reg.Identity+".lease")
 		if err := withRuntimeLock(filepath.Join(root, "identities", ".leases.lock"), bootID, func() error {
 			var lease identityLease
-			if readJSON(leasePath, &lease) != nil || lease.InstanceID != reg.InstanceID || lease.BootID != bootID {
+			if readJSON(leasePath, &lease) != nil || lease.InstanceID != reg.InstanceID ||
+				lease.BootID != bootID || lease.State != "owned" {
 				return nil
+			}
+			home, err := khalaHome()
+			if err != nil {
+				return err
+			}
+			logger, err := newConduitLogger(home)
+			if err != nil {
+				return err
 			}
 			lease.InstanceID = ""
 			lease.PID = 0
 			lease.PIDStart = ""
 			lease.ClaudeSessionID = ""
 			lease.State = "released"
-			return writeAtomicJSON(leasePath, lease, 0600)
+			if err := writeAtomicJSON(leasePath, lease, 0600); err != nil {
+				return err
+			}
+			return logger.Output(2, fmt.Sprintf("released lease %s for instance %s", reg.Identity, reg.InstanceID))
 		}); err != nil {
 			return err
 		}
