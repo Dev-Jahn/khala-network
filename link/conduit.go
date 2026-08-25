@@ -67,18 +67,19 @@ type pendingLetter struct {
 }
 
 type conduit struct {
-	home       string
-	runtime    string
-	bootID     string
-	self       string
-	logger     *log.Logger
-	scanEvery  time.Duration
-	backoff    []time.Duration
-	degradeAt  int
-	statesMu   sync.Mutex
-	states     map[string]*conduitState
-	watcher    *fsnotify.Watcher
-	watchedDir map[string]struct{}
+	home                string
+	runtime             string
+	bootID              string
+	self                string
+	logger              *log.Logger
+	scanEvery           time.Duration
+	backoff             []time.Duration
+	degradeAt           int
+	statesMu            sync.Mutex
+	states              map[string]*conduitState
+	verificationReasons map[string]string
+	watcher             *fsnotify.Watcher
+	watchedDir          map[string]struct{}
 }
 
 func runConduit(args []string) int {
@@ -145,7 +146,8 @@ func runConduit(args []string) int {
 		home: home, runtime: runtimePath, bootID: bootID, self: cfg.self, logger: logger,
 		scanEvery: durationEnv("KHALA_CONDUIT_TEST_SCAN_INTERVAL", time.Second),
 		backoff:   conduitBackoff(), degradeAt: 3, states: make(map[string]*conduitState),
-		watcher: watcher, watchedDir: make(map[string]struct{}),
+		verificationReasons: make(map[string]string),
+		watcher:             watcher, watchedDir: make(map[string]struct{}),
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -333,6 +335,7 @@ func (c *conduit) scan() {
 		c.logger.Printf("load registrations failed: %v", err)
 		return
 	}
+	c.pruneVerificationReasons(regs)
 	registries, err := loadClaudeRegistries()
 	if err != nil {
 		c.logger.Printf("load Claude registry failed: %v", err)
@@ -365,11 +368,10 @@ func (c *conduit) scan() {
 			verifiedRegs[instance] = true
 			c.healLease(regs[instance])
 		}
-		if !verified && reason != "" {
-			c.logger.Printf("registration %s not verified: %s", instance, reason)
-		}
+		c.logVerification(instance, verified, reason)
 	}
 	c.reclaimLeases(regs, verifiedRegs)
+	c.reapDeadRegistrations(regs)
 	leaseEntries, err := os.ReadDir(filepath.Join(c.runtime, "identities"))
 	if err != nil {
 		c.logger.Printf("load leases failed: %v", err)
@@ -401,6 +403,32 @@ func (c *conduit) scan() {
 			continue
 		}
 		c.maybeRing(identity, lease, reg, letters)
+	}
+}
+
+func (c *conduit) pruneVerificationReasons(regs map[string]sessionRegistration) {
+	for instance := range c.verificationReasons {
+		if _, exists := regs[instance]; !exists {
+			delete(c.verificationReasons, instance)
+		}
+	}
+}
+
+func (c *conduit) logVerification(instance string, verified bool, reason string) {
+	if c.verificationReasons == nil {
+		c.verificationReasons = make(map[string]string)
+	}
+	previous, wasUnverified := c.verificationReasons[instance]
+	if verified {
+		if wasUnverified {
+			c.logger.Printf("registration %s verified", instance)
+			delete(c.verificationReasons, instance)
+		}
+		return
+	}
+	if reason != "" && (!wasUnverified || previous != reason) {
+		c.logger.Printf("registration %s not verified: %s", instance, reason)
+		c.verificationReasons[instance] = reason
 	}
 }
 
@@ -564,6 +592,76 @@ func (c *conduit) reclaimLeases(regs map[string]sessionRegistration, verified ma
 		candidate.LeaseEpoch = epoch
 		regs[candidate.InstanceID] = candidate
 		c.logger.Printf("reclaimed lease %s for instance %s", identity, candidate.InstanceID)
+	}
+}
+
+const deadRegistrationReapAfter = 10 * time.Minute
+
+func deadRegistrationExpired(reg sessionRegistration, bootID string, now time.Time) bool {
+	if reg.BootID != bootID || reg.PID <= 1 || processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
+		return false
+	}
+	started, err := time.Parse(time.RFC3339Nano, reg.StartedAt)
+	return err == nil && started.Before(now.Add(-deadRegistrationReapAfter))
+}
+
+func registrationOwnsLease(root, bootID string, reg sessionRegistration) (bool, error) {
+	var lease identityLease
+	err := readJSON(filepath.Join(root, "identities", reg.Identity+".lease"), &lease)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return lease.BootID == bootID && lease.State == "owned" && lease.InstanceID == reg.InstanceID, nil
+}
+
+func (c *conduit) reapDeadRegistrations(regs map[string]sessionRegistration) {
+	now := time.Now()
+	instances := make([]string, 0, len(regs))
+	for instance, reg := range regs {
+		if deadRegistrationExpired(reg, c.bootID, now) {
+			instances = append(instances, instance)
+		}
+	}
+	sort.Strings(instances)
+	for _, instance := range instances {
+		var reaped sessionRegistration
+		err := withRegistrationLock(c.runtime, c.bootID, func() error {
+			path := filepath.Join(c.runtime, "sessions", instance+".json")
+			var latest sessionRegistration
+			if err := readJSON(path, &latest); err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
+				return err
+			}
+			if latest.InstanceID != instance || !deadRegistrationExpired(latest, c.bootID, now) {
+				return nil
+			}
+			ownsLease, err := registrationOwnsLease(c.runtime, c.bootID, latest)
+			if err != nil {
+				return err
+			}
+			if ownsLease {
+				return nil
+			}
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			reaped = latest
+			return nil
+		})
+		if err != nil {
+			c.logger.Printf("reap registration %s failed: %v", instance, err)
+			continue
+		}
+		if reaped.InstanceID != "" {
+			delete(regs, instance)
+			delete(c.verificationReasons, instance)
+			c.logger.Printf("reaped dead registration %s (%s)", reaped.InstanceID, reaped.Identity)
+		}
 	}
 }
 

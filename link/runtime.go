@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -189,17 +190,35 @@ func secureDirectory(path string) error {
 	return nil
 }
 
+var bootIDGOOS = runtime.GOOS
+var bootIDReadFile = os.ReadFile
+var bootIDSysctl = func(name string) ([]byte, error) {
+	return exec.Command("sysctl", "-n", name).Output()
+}
+var bootIDFallbackOnce sync.Once
+var bootIDFallbackLog = func() {
+	fmt.Fprintln(os.Stderr, "boot id: kern.bootsessionuuid unavailable; using kern.boottime")
+}
+
 func currentBootID() (string, error) {
 	if value := os.Getenv("KHALA_TEST_BOOT_ID"); value != "" {
 		return value, nil
 	}
-	if data, err := os.ReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
-		if value := strings.TrimSpace(string(data)); value != "" {
-			return value, nil
+	if bootIDGOOS == "linux" {
+		if data, err := bootIDReadFile("/proc/sys/kernel/random/boot_id"); err == nil {
+			if value := strings.TrimSpace(string(data)); value != "" {
+				return value, nil
+			}
 		}
 	}
-	if runtime.GOOS == "darwin" {
-		data, err := exec.Command("sysctl", "-n", "kern.boottime").Output()
+	if bootIDGOOS == "darwin" {
+		if data, err := bootIDSysctl("kern.bootsessionuuid"); err == nil {
+			if value := strings.TrimSpace(string(data)); value != "" {
+				return value, nil
+			}
+		}
+		bootIDFallbackOnce.Do(bootIDFallbackLog)
+		data, err := bootIDSysctl("kern.boottime")
 		if err != nil {
 			return "", fmt.Errorf("read macOS boot id: %w", err)
 		}
