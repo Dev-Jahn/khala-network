@@ -86,7 +86,8 @@ func newConduitFixture(t *testing.T) *conduitFixture {
 		home: home, runtime: runtimeRoot, bootID: f.bootID, self: "alpha",
 		logger: log.New(logs, "", 0), scanEvery: 10 * time.Second,
 		backoff: []time.Duration{time.Second}, degradeAt: 3, states: make(map[string]*conduitState),
-		watcher: watcher, watchedDir: make(map[string]struct{}),
+		verificationReasons: make(map[string]string),
+		watcher:             watcher, watchedDir: make(map[string]struct{}),
 	}
 	t.Cleanup(func() {
 		_ = watcher.Close()
@@ -192,6 +193,240 @@ func waitForTest(timeout time.Duration, condition func() bool) bool {
 	return condition()
 }
 
+func TestCurrentBootIDPrefersDarwinBootSessionUUID(t *testing.T) {
+	originalGOOS := bootIDGOOS
+	originalReadFile := bootIDReadFile
+	originalSysctl := bootIDSysctl
+	originalFallbackLog := bootIDFallbackLog
+	t.Cleanup(func() {
+		bootIDGOOS = originalGOOS
+		bootIDReadFile = originalReadFile
+		bootIDSysctl = originalSysctl
+		bootIDFallbackLog = originalFallbackLog
+		bootIDFallbackOnce = sync.Once{}
+	})
+	t.Setenv("KHALA_TEST_BOOT_ID", "")
+
+	t.Run("darwin uuid", func(t *testing.T) {
+		bootIDGOOS = "darwin"
+		bootIDReadFile = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+		var calls []string
+		bootIDSysctl = func(name string) ([]byte, error) {
+			calls = append(calls, name)
+			switch name {
+			case "kern.bootsessionuuid":
+				return []byte("  7C31CC4D-59BA-4BBB-A613-789DA0AFB3A1\n"), nil
+			case "kern.boottime":
+				return []byte("{ sec = 1786350406, usec = 0 }\n"), nil
+			default:
+				return nil, fmt.Errorf("unexpected sysctl %s", name)
+			}
+		}
+		got, err := currentBootID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "7C31CC4D-59BA-4BBB-A613-789DA0AFB3A1" {
+			t.Fatalf("boot id=%q, want bootsessionuuid; sysctl calls=%v", got, calls)
+		}
+		if len(calls) != 1 || calls[0] != "kern.bootsessionuuid" {
+			t.Fatalf("sysctl calls=%v, want only kern.bootsessionuuid", calls)
+		}
+	})
+
+	t.Run("darwin boottime fallback", func(t *testing.T) {
+		bootIDFallbackOnce = sync.Once{}
+		fallbackLogs := 0
+		bootIDFallbackLog = func() { fallbackLogs++ }
+		bootIDGOOS = "darwin"
+		bootIDReadFile = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+		var calls []string
+		bootIDSysctl = func(name string) ([]byte, error) {
+			calls = append(calls, name)
+			if name == "kern.bootsessionuuid" {
+				return []byte(" \n"), nil
+			}
+			return []byte(" { sec = 1786350406, usec = 0 } \n"), nil
+		}
+		got, err := currentBootID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "{ sec = 1786350406, usec = 0 }" {
+			t.Fatalf("boot id=%q, want trimmed kern.boottime", got)
+		}
+		if want := []string{"kern.bootsessionuuid", "kern.boottime"}; strings.Join(calls, "|") != strings.Join(want, "|") {
+			t.Fatalf("sysctl calls=%v, want %v", calls, want)
+		}
+		if _, err := currentBootID(); err != nil {
+			t.Fatal(err)
+		}
+		if fallbackLogs != 1 {
+			t.Fatalf("fallback log count=%d, want 1", fallbackLogs)
+		}
+	})
+
+	t.Run("linux proc wins", func(t *testing.T) {
+		bootIDGOOS = "linux"
+		bootIDReadFile = func(path string) ([]byte, error) {
+			if path != "/proc/sys/kernel/random/boot_id" {
+				return nil, fmt.Errorf("unexpected path %s", path)
+			}
+			return []byte(" linux-boot-id\n"), nil
+		}
+		bootIDSysctl = func(name string) ([]byte, error) {
+			t.Fatalf("sysctl called on linux: %s", name)
+			return nil, nil
+		}
+		got, err := currentBootID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != "linux-boot-id" {
+			t.Fatalf("boot id=%q, want linux-boot-id", got)
+		}
+	})
+}
+
+func deadRegistration(bootID, identity, instance string, startedAt time.Time) sessionRegistration {
+	return sessionRegistration{
+		BootID: bootID, InstanceID: instance, Identity: identity, PID: os.Getpid(),
+		PIDStart: bootID + ":not-the-current-process-start", ClaudeSessionID: instance + "-session",
+		Kind: "interactive", Phase: "ready", StartedAt: startedAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func writeRegistrationForTest(t *testing.T, root string, reg sessionRegistration) {
+	t.Helper()
+	if err := writeAtomicJSON(filepath.Join(root, "sessions", reg.InstanceID+".json"), reg, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegistrationReappearsAndReclaimsAfterBootIDChange(t *testing.T) {
+	f := newConduitFixture(t)
+	old := deadRegistration("boot-A", "ink", "old", time.Now().Add(-time.Hour))
+	writeRegistrationForTest(t, f.runtime, old)
+	regs, err := loadRegistrations(f.runtime, f.bootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := regs[old.InstanceID]; ok {
+		t.Fatalf("registration under boot id A was visible under boot id B: %+v", regs)
+	}
+	staleLease := identityLease{
+		BootID: old.BootID, Identity: old.Identity, InstanceID: old.InstanceID, Epoch: 7,
+		PID: old.PID, PIDStart: old.PIDStart, ClaudeSessionID: old.ClaudeSessionID,
+		ClaimedAt: time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), State: "owned",
+	}
+	if err := writeAtomicJSON(filepath.Join(f.runtime, "identities", "ink.lease"), staleLease, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fresh := f.addRegistration("ink", "fresh", "interactive", false, time.Now(), 0)
+	f.conduit.scan()
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	if lease.BootID != f.bootID || lease.InstanceID != fresh.InstanceID || lease.State != "owned" || lease.Epoch == 0 {
+		t.Fatalf("fresh boot-B registration did not reclaim stale boot-A lease: %+v", lease)
+	}
+}
+
+func TestConduitReapsOnlyEligibleDeadRegistrations(t *testing.T) {
+	f := newConduitFixture(t)
+	old := deadRegistration(f.bootID, "stale", "dead-old", time.Now().Add(-11*time.Minute))
+	fresh := deadRegistration(f.bootID, "fresh", "dead-fresh", time.Now().Add(-9*time.Minute))
+	foreign := deadRegistration("other-boot", "foreign", "dead-foreign", time.Now().Add(-time.Hour))
+	owned := deadRegistration(f.bootID, "owned", "dead-owned", time.Now().Add(-time.Hour))
+	for _, reg := range []sessionRegistration{old, fresh, foreign, owned} {
+		writeRegistrationForTest(t, f.runtime, reg)
+	}
+	f.writeLease(owned.Identity, &owned, "owned", 1)
+
+	f.conduit.scan()
+	f.conduit.scan()
+	for instance, wantExists := range map[string]bool{
+		old.InstanceID: false, fresh.InstanceID: true, foreign.InstanceID: true, owned.InstanceID: true,
+	} {
+		_, err := os.Stat(filepath.Join(f.runtime, "sessions", instance+".json"))
+		if gotExists := err == nil; gotExists != wantExists {
+			t.Fatalf("registration %s exists=%t want %t (err=%v)", instance, gotExists, wantExists, err)
+		}
+	}
+	wantLog := "reaped dead registration dead-old (stale)"
+	if got := strings.Count(f.logs.String(), wantLog); got != 1 {
+		t.Fatalf("reap log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+}
+
+func TestConduitReclaimsBeforeReapingDeadLeaseOwner(t *testing.T) {
+	f := newConduitFixture(t)
+	dead := deadRegistration(f.bootID, "shared", "dead-owner", time.Now().Add(-time.Hour))
+	writeRegistrationForTest(t, f.runtime, dead)
+	f.writeLease(dead.Identity, &dead, "owned", 3)
+	live := f.addRegistration("shared", "live-candidate", "interactive", false, time.Now(), 0)
+
+	f.conduit.scan()
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "shared.lease"))
+	if lease.InstanceID != live.InstanceID || lease.State != "owned" {
+		t.Fatalf("live registration did not reclaim lease: %+v", lease)
+	}
+	if _, err := os.Stat(filepath.Join(f.runtime, "sessions", dead.InstanceID+".json")); !os.IsNotExist(err) {
+		t.Fatalf("dead former owner still exists after reclaim: %v", err)
+	}
+	logs := f.logs.String()
+	reclaimedAt := strings.Index(logs, "reclaimed lease shared for instance live-candidate")
+	reapedAt := strings.Index(logs, "reaped dead registration dead-owner (shared)")
+	if reclaimedAt < 0 || reapedAt < 0 || reclaimedAt > reapedAt {
+		t.Fatalf("reclaim did not precede reap; logs=%s", logs)
+	}
+}
+
+func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
+	f := newConduitFixture(t)
+	reg := f.addRegistration("ink", "state", "interactive", false, time.Now(), 0)
+	reg.Phase = "starting"
+	reg.ConduitVerified = false
+	reg.VerifiedAt = ""
+	writeRegistrationForTest(t, f.runtime, reg)
+
+	for i := 0; i < 3; i++ {
+		f.conduit.scan()
+	}
+	phaseLog := "registration state not verified: phase is not ready"
+	if got := strings.Count(f.logs.String(), phaseLog); got != 1 {
+		t.Fatalf("unchanged reason log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+	if err := os.Remove(filepath.Join(f.runtime, "sessions", reg.InstanceID+".json")); err != nil {
+		t.Fatal(err)
+	}
+	f.conduit.scan()
+	writeRegistrationForTest(t, f.runtime, reg)
+	f.conduit.scan()
+	if got := strings.Count(f.logs.String(), phaseLog); got != 2 {
+		t.Fatalf("reason was not logged after registration disappeared and returned: got %d; logs=%s", got, f.logs.String())
+	}
+
+	reg.Phase = "ready"
+	reg.Kind = "worker"
+	reg.ReceiveOptIn = false
+	writeRegistrationForTest(t, f.runtime, reg)
+	for i := 0; i < 2; i++ {
+		f.conduit.scan()
+	}
+	reasonLog := "registration state not verified: non-interactive registration lacks opt-in"
+	if got := strings.Count(f.logs.String(), reasonLog); got != 1 {
+		t.Fatalf("changed reason log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+
+	reg.Kind = "interactive"
+	writeRegistrationForTest(t, f.runtime, reg)
+	for i := 0; i < 2; i++ {
+		f.conduit.scan()
+	}
+	if got := strings.Count(f.logs.String(), "registration state verified"); got != 1 {
+		t.Fatalf("recovery log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+}
+
 func TestWithRuntimeLockDoesNotRewriteUnchangedBootID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".leases.lock")
 	if err := withRuntimeLock(path, "test-boot", func() error { return nil }); err != nil {
@@ -251,12 +486,26 @@ func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
 	f := newConduitFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
+	markerPID := os.Getpid()
+	markerStart, err := processStart(markerPID, f.bootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerSocket := filepath.Join(f.runtime, "marker.sock")
 	marker := sessionRegistration{
 		BootID: f.bootID, InstanceID: "marker", Identity: "marker", Kind: "interactive",
-		PID: 2, PIDStart: "test-boot:invalid", Phase: "starting",
+		PID: markerPID, PIDStart: markerStart, ClaudeSessionID: "marker-session",
+		SocketPath: markerSocket, Phase: "ready",
 		StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", "marker.json"), marker, 0600); err != nil {
+		t.Fatal(err)
+	}
+	markerRegistry := map[string]any{
+		"pid": markerPID, "sessionId": marker.ClaudeSessionID, "name": marker.InstanceID,
+		"version": "test", "messagingSocketPath": markerSocket,
+	}
+	if err := writeAtomicJSON(filepath.Join(f.registry, "marker.json"), markerRegistry, 0600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -266,13 +515,18 @@ func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
 		cancel()
 		<-done
 	})
-	countScans := func() int { return strings.Count(f.logs.String(), "registration marker not verified") }
-	if !waitForTest(time.Second, func() bool { return countScans() >= 1 }) {
+	countStates := func() int { return strings.Count(f.logs.String(), "registration marker ") }
+	if !waitForTest(time.Second, func() bool { return countStates() >= 1 }) {
 		t.Fatal("initial scan did not complete")
 	}
-	if waitForTest(300*time.Millisecond, func() bool { return countScans() > 1 }) {
-		t.Fatalf("scan fed its own fsnotify loop: %d scans", countScans())
+	if waitForTest(300*time.Millisecond, func() bool { return countStates() > 1 }) {
+		t.Fatalf("scan fed its own fsnotify loop: %d state changes", countStates())
 	}
+	markerListener, err := net.Listen("unix", markerSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.listeners = append(f.listeners, markerListener)
 	for i := 0; i < 10; i++ {
 		path := filepath.Join(f.runtime, "identities", fmt.Sprintf(".tmp-%d", i))
 		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
@@ -280,21 +534,34 @@ func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
 		}
 	}
 	time.Sleep(300 * time.Millisecond)
-	if got := countScans(); got != 1 {
-		t.Fatalf("dotfile events triggered scans: got %d want 1", got)
+	if got := countStates(); got != 1 {
+		t.Fatalf("dotfile events triggered a verification state change: got %d want 1", got)
 	}
 	for i := 0; i < 10; i++ {
+		if i%2 == 0 {
+			if err := markerListener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			_ = os.Remove(markerSocket)
+		} else {
+			markerListener, err = net.Listen("unix", markerSocket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.listeners = append(f.listeners, markerListener)
+		}
 		path := filepath.Join(f.runtime, "identities", fmt.Sprintf("event-%d", i))
 		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
 			t.Fatal(err)
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if !waitForTest(time.Second, func() bool { return countScans() >= 2 }) {
+	if !waitForTest(time.Second, func() bool { return countStates() >= 2 }) {
 		t.Fatal("visible watcher burst did not trigger a scan")
 	}
 	time.Sleep(300 * time.Millisecond)
-	if got := countScans(); got != 2 {
-		t.Fatalf("watcher burst was not coalesced: got %d scans want 2", got)
+	if got := countStates(); got != 2 {
+		t.Fatalf("watcher burst was not coalesced: got %d state changes want 2", got)
 	}
 }
 
