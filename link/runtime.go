@@ -31,6 +31,7 @@ type sessionRegistration struct {
 	ChannelSocket      string `json:"channelSocket,omitempty"`
 	ChannelPID         int    `json:"channelPID,omitempty"`
 	ChannelPIDStart    string `json:"channelPIDStart,omitempty"`
+	ChannelVerified    bool   `json:"channelVerified,omitempty"`
 	Kind               string `json:"kind"`
 	ReceiveOptIn       bool   `json:"receiveOptIn"`
 	Phase              string `json:"phase"`
@@ -620,12 +621,17 @@ func runtimeWhoami(args []string) error {
 }
 
 func runtimeRegisterChannel(args []string) error {
+	if len(args) == 1 && args[0] == "--help" {
+		fmt.Fprintln(os.Stdout, "usage: khala-link runtime register-channel --instance ID --session-id ID --channel-socket PATH --caller-pid PID [--verified|--clear]")
+		return nil
+	}
 	fs := flag.NewFlagSet("runtime register-channel", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	instance := fs.String("instance", "", "")
 	sessionID := fs.String("session-id", "", "")
 	channelSocket := fs.String("channel-socket", "", "")
 	callerPID := fs.Int("caller-pid", os.Getppid(), "")
+	verified := fs.Bool("verified", false, "")
 	clearChannel := fs.Bool("clear", false, "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validInstanceID(*instance) || *sessionID == "" {
 		return errors.New("register-channel needs a valid --instance and --session-id")
@@ -656,6 +662,7 @@ func runtimeRegisterChannel(args []string) error {
 			reg.ChannelSocket = ""
 			reg.ChannelPID = 0
 			reg.ChannelPIDStart = ""
+			reg.ChannelVerified = false
 			return nil
 		}
 		if *callerPID <= 1 || *channelSocket == "" {
@@ -682,6 +689,7 @@ func runtimeRegisterChannel(args []string) error {
 		reg.ChannelSocket = expectedSocket
 		reg.ChannelPID = *callerPID
 		reg.ChannelPIDStart = pidStart
+		reg.ChannelVerified = *verified
 		return nil
 	})
 }
@@ -1259,6 +1267,9 @@ func runtimeWatchReady(args []string) error {
 		(*sessionID != "" && reg.ClaudeSessionID == *sessionID) || processIsAncestor(reg.PID, *callerPID)
 	if !own {
 		return errors.New("verified registration belongs to another session")
+	}
+	if reg.ChannelSocket != "" && !reg.ChannelVerified {
+		return errors.New("conduit path unverified")
 	}
 	return nil
 }

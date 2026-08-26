@@ -10,12 +10,15 @@ import { createServer, type Server as UnixServer, type Socket } from 'node:net'
 
 const VALID_IDENTITY = /^[a-z0-9][a-z0-9-]*$/
 const VALID_META_KEY = /^[a-zA-Z_][a-zA-Z0-9_]*$/
+const CHANNEL_FLAG = '--dangerously-load-development-channels'
+const channelFlagCache = new Map<number, boolean>()
 
 // Claude Code can export a temporary CLAUDE_CODE_SESSION_ID while --resume is
 // still switching sessions. The parent registry is re-read on every poll and
 // its live session id wins; the frozen environment remains a startup fallback.
 // KHALA_CHANNEL_POLL_MS is a test-only override for both polling intervals;
-// production uses the fixed intervals below.
+// KHALA_CHANNEL_ANCESTRY_STOP_PID bounds the otherwise-real /proc walk at the
+// rig's fake Claude parent. Production uses neither override.
 function resolveIdentity(projectDir: string): string | undefined {
   if (process.env.KHALA_SESSION !== undefined) {
     return VALID_IDENTITY.test(process.env.KHALA_SESSION) ? process.env.KHALA_SESSION : undefined
@@ -97,6 +100,61 @@ async function resolveSessionContext(khalaLink: string): Promise<SessionContext>
   }
 }
 
+function argsEnableKhalaChannel(args: string[]): boolean {
+  return args.some((arg, index) =>
+    (arg === CHANNEL_FLAG && args[index + 1]?.startsWith('plugin:khala')) ||
+    arg.startsWith(`${CHANNEL_FLAG}=plugin:khala`),
+  )
+}
+
+async function processEnablesKhalaChannel(pid: number): Promise<boolean> {
+  const cached = channelFlagCache.get(pid)
+  if (cached !== undefined) return cached
+  let enabled = false
+  if (process.platform === 'linux') {
+    const command = readFileSync(`/proc/${pid}/cmdline`)
+    enabled = argsEnableKhalaChannel(command.toString('utf8').split('\0').filter(Boolean))
+  } else if (process.platform === 'darwin') {
+    const ps = Bun.which('ps') ?? '/bin/ps'
+    const command = (await run(ps, ['-o', 'command=', '-p', String(pid)], '')).trim()
+    const flag = CHANNEL_FLAG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    enabled = new RegExp(`(?:^|\\s)${flag}(?:=|\\s+)["']?plugin:khala(?:@|\\b)`).test(command)
+  }
+  channelFlagCache.set(pid, enabled)
+  return enabled
+}
+
+async function parentPID(pid: number): Promise<number | undefined> {
+  if (process.platform === 'linux') {
+    const match = readFileSync(`/proc/${pid}/status`, 'utf8').match(/^PPid:\s+([0-9]+)$/m)
+    return match ? Number(match[1]) : undefined
+  }
+  if (process.platform === 'darwin') {
+    const ps = Bun.which('ps') ?? '/bin/ps'
+    const output = (await run(ps, ['-o', 'ppid=', '-p', String(pid)], '')).trim()
+    return /^[0-9]+$/.test(output) ? Number(output) : undefined
+  }
+  return undefined
+}
+
+async function ancestryEnablesKhalaChannel(startPID: number): Promise<boolean> {
+  const visited = new Set<number>()
+  const stopRaw = process.env.KHALA_CHANNEL_ANCESTRY_STOP_PID
+  const stopPID = stopRaw && /^[1-9][0-9]*$/.test(stopRaw) ? Number(stopRaw) : undefined
+  let pid: number | undefined = startPID
+  while (pid !== undefined && pid > 1 && !visited.has(pid) && visited.size < 64) {
+    visited.add(pid)
+    try {
+      if (await processEnablesKhalaChannel(pid)) return true
+      if (pid === stopPID) return false
+      pid = await parentPID(pid)
+    } catch {
+      return false
+    }
+  }
+  return false
+}
+
 function testPollInterval(): number | undefined {
   const raw = process.env.KHALA_CHANNEL_POLL_MS
   if (raw === undefined) return undefined
@@ -130,6 +188,8 @@ async function main(): Promise<void> {
   let khalaLink = ''
   let attachment: Attachment | undefined
   let shuttingDown = false
+  let verifiedRegistrationSupport: boolean | undefined
+  let compatibilityWarningShown = false
 
   const closeAndRemove = (target: Attachment): void => {
     try {
@@ -194,7 +254,7 @@ async function main(): Promise<void> {
   khalaLink = resolveBinary('khala-link')
   const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.7.2' },
+    { name: 'khala', version: '0.7.3' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
@@ -204,6 +264,9 @@ async function main(): Promise<void> {
       ].join('\n'),
     },
   )
+  let markMCPInitialized!: () => void
+  const mcpInitialized = new Promise<void>(resolve => { markMCPInitialized = resolve })
+  mcp.oninitialized = markMCPInitialized
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
@@ -297,15 +360,26 @@ async function main(): Promise<void> {
     try {
       target.socketIno = await listen(target.listener, socketPath)
       chmodSync(socketPath, 0o600)
-      target.registering = run(
-        khalaLink,
-        [
-          'runtime', 'register-channel', '--instance', instance,
-          '--session-id', context.sessionId, '--channel-socket', socketPath,
-          '--caller-pid', String(process.pid),
-        ],
-        identity,
-      ).then(() => { target.registered = true })
+      const registerArgs = [
+        'runtime', 'register-channel', '--instance', instance,
+        '--session-id', context.sessionId, '--channel-socket', socketPath,
+        '--caller-pid', String(process.pid),
+      ]
+      if (verifiedRegistrationSupport === undefined) {
+        try {
+          const help = await run(khalaLink, ['runtime', 'register-channel', '--help'], identity)
+          verifiedRegistrationSupport = help.includes('--verified')
+        } catch {
+          verifiedRegistrationSupport = false
+        }
+      }
+      if (verifiedRegistrationSupport) {
+        registerArgs.push('--verified')
+      } else if (!compatibilityWarningShown) {
+        compatibilityWarningShown = true
+        process.stderr.write('khala channel: runtime lacks --verified registration; registering unverified so conduit socket echo remains enabled\n')
+      }
+      target.registering = run(khalaLink, registerArgs, identity).then(() => { target.registered = true })
       await target.registering
       target.registering = undefined
       return target
@@ -316,43 +390,74 @@ async function main(): Promise<void> {
     }
   }
 
-  const attachStartedAt = Date.now()
-  while (!shuttingDown && !attachment) {
-    const context = await resolveSessionContext(khalaLink)
-    if (!context.identity) {
-      enterState('no-identity', 'khala channel: no valid session identity; channel idle\n')
-    } else if (!context.sessionId) {
-      enterState('no-session', 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n')
-    } else {
-      let instance: string
-      try {
-        instance = (await run(
-          khalaLink,
-          ['runtime', 'whoami', '--identity', context.identity, '--session-id', context.sessionId],
-          context.identity,
-        )).trim()
-      } catch {
-        enterState(
-          `waiting:${context.identity}:${context.sessionId}`,
-          `khala channel: waiting for registration of ${context.identity}; channel idle\n`,
-        )
-        const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
-        await Bun.sleep(retryInterval)
-        continue
-      }
-      await bindAndRegister(context, instance)
-      enterState(
-        `attached:${context.identity}:${context.sessionId}:${instance}`,
-        `khala channel: attached ${context.identity} instance ${instance}\n`,
-      )
-      break
+  const channelEnabled = async (): Promise<boolean> => {
+    await mcpInitialized
+    const experimental = mcp.getClientCapabilities()?.experimental
+    if (experimental && Object.prototype.hasOwnProperty.call(experimental, 'claude/channel')) {
+      return true
     }
-    const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
-    await Bun.sleep(retryInterval)
+    return ancestryEnablesKhalaChannel(process.ppid)
   }
 
+  const clearOwnRegistration = async (context: SessionContext, instance: string): Promise<void> => {
+    await run(
+      khalaLink,
+      [
+        'runtime', 'register-channel', '--instance', instance,
+        '--session-id', context.sessionId, '--caller-pid', String(process.pid), '--clear',
+      ],
+      context.identity!,
+    )
+  }
+
+  const attachStartedAt = Date.now()
   const attachedPollInterval = pollOverride ?? 15_000
-  while (!shuttingDown && attachment) {
+  while (!shuttingDown) {
+    if (!attachment) {
+      const context = await resolveSessionContext(khalaLink)
+      if (!context.identity) {
+        enterState('no-identity', 'khala channel: no valid session identity; channel idle\n')
+      } else if (!context.sessionId) {
+        enterState('no-session', 'khala channel: cannot determine the Claude session id of the parent process; channel idle\n')
+      } else {
+        let instance: string
+        try {
+          instance = (await run(
+            khalaLink,
+            ['runtime', 'whoami', '--identity', context.identity, '--session-id', context.sessionId],
+            context.identity,
+          )).trim()
+        } catch {
+          enterState(
+            `waiting:${context.identity}:${context.sessionId}`,
+            `khala channel: waiting for registration of ${context.identity}; channel idle\n`,
+          )
+          const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
+          await Bun.sleep(retryInterval)
+          continue
+        }
+        if (!(await channelEnabled())) {
+          const toolsOnlyState = `tools-only:${context.identity}:${context.sessionId}:${instance}`
+          if (state !== toolsOnlyState) await clearOwnRegistration(context, instance)
+          enterState(
+            toolsOnlyState,
+            'khala channel: session not channel-enabled; tools only, doorbell stays on the socket path\n',
+          )
+          await Bun.sleep(attachedPollInterval)
+          continue
+        }
+        await bindAndRegister(context, instance)
+        enterState(
+          `attached:${context.identity}:${context.sessionId}:${instance}`,
+          `khala channel: attached ${context.identity} instance ${instance}\n`,
+        )
+        continue
+      }
+      const retryInterval = pollOverride ?? (Date.now() - attachStartedAt < 120_000 ? 2_000 : 15_000)
+      await Bun.sleep(retryInterval)
+      continue
+    }
+
     await Bun.sleep(attachedPollInterval)
     if (shuttingDown || !attachment) break
     const current = attachment
@@ -385,16 +490,27 @@ async function main(): Promise<void> {
       continue
     }
 
-    if (nextInstance === current.instance) {
-      await run(
-        khalaLink,
-        [
-          'runtime', 'register-channel', '--instance', nextInstance,
-          '--session-id', context.sessionId, '--channel-socket', current.socketPath,
-          '--caller-pid', String(process.pid),
-        ],
-        context.identity,
+    if (!(await channelEnabled())) {
+      await clearRegistration(current)
+      closeAndRemove(current)
+      if (attachment === current) attachment = undefined
+      const toolsOnlyState = `tools-only:${context.identity}:${context.sessionId}:${nextInstance}`
+      await clearOwnRegistration(context, nextInstance)
+      enterState(
+        toolsOnlyState,
+        'khala channel: session not channel-enabled; tools only, doorbell stays on the socket path\n',
       )
+      continue
+    }
+
+    if (nextInstance === current.instance) {
+      const registerArgs = [
+        'runtime', 'register-channel', '--instance', nextInstance,
+        '--session-id', context.sessionId, '--channel-socket', current.socketPath,
+        '--caller-pid', String(process.pid),
+      ]
+      if (verifiedRegistrationSupport) registerArgs.push('--verified')
+      await run(khalaLink, registerArgs, context.identity)
       current.identity = context.identity
       current.sessionId = context.sessionId
       current.registered = true
