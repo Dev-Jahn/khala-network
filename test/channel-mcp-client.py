@@ -89,6 +89,7 @@ def spawn_child(args, stderr, *, socket_stdin: bool = False) -> Client:
         child_env["CLAUDE_PROJECT_DIR"] = args.child_project_dir
     if args.child_sessions_dir is not None:
         child_env["KHALA_CLAUDE_SESSIONS_DIR"] = args.child_sessions_dir
+    child_env["KHALA_CHANNEL_ANCESTRY_STOP_PID"] = str(os.getpid())
     child = subprocess.Popen(
         [args.bun, args.server],
         stdin=stdin,
@@ -106,7 +107,7 @@ def spawn_child(args, stderr, *, socket_stdin: bool = False) -> Client:
     return Client(child, child.stdin)
 
 
-def initialize(client: Client) -> None:
+def initialize(client: Client, capabilities: dict | None = None) -> None:
     client.send(
         {
             "jsonrpc": "2.0",
@@ -114,13 +115,14 @@ def initialize(client: Client) -> None:
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-06-18",
-                "capabilities": {},
+                "capabilities": capabilities or {},
                 "clientInfo": {"name": "khala-h21", "version": "1"},
             },
         }
     )
     initialized = client.response(1)
     assert initialized["result"]["serverInfo"]["name"] == "khala", initialized
+    assert initialized["result"]["serverInfo"]["version"] == "0.7.3", initialized
     assert "claude/channel" in initialized["result"]["capabilities"]["experimental"]
     client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
@@ -139,6 +141,7 @@ def registered_socket(registration_path: str, child_pid: int):
         channel_socket
         and registration.get("channelPID") == child_pid
         and registration.get("channelPIDStart")
+        and registration.get("channelVerified") is True
         and os.path.exists(channel_socket)
     ):
         return channel_socket
@@ -151,6 +154,7 @@ def assert_registration_cleared(registration_path: str, channel_socket: str | No
         not registration.get("channelSocket")
         and not registration.get("channelPID")
         and not registration.get("channelPIDStart")
+        and not registration.get("channelVerified")
         and (channel_socket is None or not os.path.exists(channel_socket))
     )
 
@@ -191,7 +195,11 @@ def run_full(args, stderr) -> None:
     client = spawn_child(args, stderr)
     child = client.child
     try:
-        initialize(client)
+        capabilities = {"experimental": {"claude/channel": {}}} if args.client_channel_marker else {
+            "elicitation": {"form": {}},
+            "roots": {"listChanged": True},
+        }
+        initialize(client, capabilities)
         if args.late_session_id:
             assert child.poll() is None, "channel child exited before the resumed session id appeared"
             time.sleep(3)
@@ -262,11 +270,76 @@ def run_full(args, stderr) -> None:
             child.wait(timeout=5)
 
 
+def run_tools_only(args, stderr) -> None:
+    client = spawn_child(args, stderr)
+    child = client.child
+    tools_only_line = "session not channel-enabled; tools only, doorbell stays on the socket path"
+    try:
+        initialize(client, {"elicitation": {"form": {}}, "roots": {"listChanged": True}})
+
+        def tools_only_logged():
+            try:
+                with open(args.stderr, encoding="utf-8") as log_file:
+                    return tools_only_line in log_file.read()
+            except FileNotFoundError:
+                return False
+
+        wait_until(tools_only_logged, "channel child did not enter tools-only state", timeout=5)
+        time.sleep(0.5)
+        registration = read_json(args.registration)
+        assert not registration.get("channelSocket"), registration
+        assert not registration.get("channelPID"), registration
+        assert not registration.get("channelPIDStart"), registration
+        assert not registration.get("channelVerified"), registration
+        assert not glob.glob(os.path.join(args.channels_dir, "*.sock"))
+
+        client.send(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "khala_drain", "arguments": {}},
+            }
+        )
+        drained = client.response(3)
+        assert not drained["result"].get("isError", False), drained
+        assert "body from H21 inbox" in drained["result"]["content"][0]["text"]
+
+        client.send(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "khala_reply",
+                    "arguments": {"to": "sender@alpha", "text": "tools-only reply"},
+                },
+            }
+        )
+        replied = client.response(4)
+        assert not replied["result"].get("isError", False), replied
+        letter_id = replied["result"]["content"][0]["text"].strip()
+        wait_until(
+            lambda: os.path.isfile(os.path.join(args.outbox, letter_id)),
+            "tools-only khala_reply wrote no outbox letter",
+        )
+
+        client.close_input()
+        child.wait(timeout=8)
+        assert child.returncode == 0
+        with open(args.stderr, encoding="utf-8") as log_file:
+            assert log_file.read().count(tools_only_line) == 1
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+
+
 def run_orphan(args, stderr) -> None:
     client = spawn_child(args, stderr, socket_stdin=True)
     child = client.child
     try:
-        initialize(client)
+        initialize(client, {"elicitation": {"form": {}}, "roots": {"listChanged": True}})
         time.sleep(2)
         client.close_input()
         try:
@@ -288,7 +361,7 @@ def run_reattach(args, stderr) -> None:
     client = spawn_child(args, stderr)
     child = client.child
     try:
-        initialize(client)
+        initialize(client, {"elicitation": {"form": {}}, "roots": {"listChanged": True}})
         old_socket = wait_until(
             lambda: registered_socket(args.registration, child.pid),
             "channel child did not make its initial attachment",
@@ -335,11 +408,13 @@ def main() -> None:
     parser.add_argument("--child-session-id")
     parser.add_argument("--child-project-dir")
     parser.add_argument("--child-sessions-dir")
+    parser.add_argument("--client-channel-marker", action="store_true")
+    parser.add_argument("--dangerously-load-development-channels")
     parser.add_argument("--inbox")
     parser.add_argument("--outbox")
     parser.add_argument("--channels-dir")
     parser.add_argument("--stderr", required=True)
-    parser.add_argument("--scenario", choices=("full", "orphan", "reattach"), default="full")
+    parser.add_argument("--scenario", choices=("full", "orphan", "reattach", "tools-only"), default="full")
     parser.add_argument("--cwd", default=None,
                         help="spawn the child with this cwd (Claude Code uses the plugin dir, not the project)")
     parser.add_argument("--registry-pid-file", required=True,
@@ -353,6 +428,9 @@ def main() -> None:
             run_orphan(args, stderr)
         elif args.scenario == "reattach":
             run_reattach(args, stderr)
+        elif args.scenario == "tools-only":
+            assert args.inbox and args.outbox and args.channels_dir
+            run_tools_only(args, stderr)
         else:
             assert args.inbox and args.outbox
             run_full(args, stderr)

@@ -144,6 +144,33 @@ func (f *conduitFixture) addRegistration(identity, instance, kind string, receiv
 	return reg
 }
 
+func (f *conduitFixture) addChannel(reg *sessionRegistration) *atomic.Int64 {
+	f.t.Helper()
+	channelPath := filepath.Join(f.runtime, "channels", reg.InstanceID+".sock")
+	channel, err := net.Listen("unix", channelPath)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.listeners = append(f.listeners, channel)
+	deliveries := &atomic.Int64{}
+	go func() {
+		for {
+			conn, acceptErr := channel.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_, _ = bufio.NewReader(conn).ReadBytes('\n')
+			deliveries.Add(1)
+			_, _ = conn.Write([]byte("{\"ok\":true}\n"))
+			_ = conn.Close()
+		}
+	}()
+	reg.ChannelSocket = channelPath
+	reg.ChannelPID = os.Getpid()
+	reg.ChannelPIDStart = reg.PIDStart
+	return deliveries
+}
+
 func (f *conduitFixture) writeLease(identity string, reg *sessionRegistration, state string, epoch uint64) {
 	f.t.Helper()
 	lease := identityLease{
@@ -598,6 +625,70 @@ func TestConduitReclaimsReleasedLeaseAndAttemptsDelivery(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("delivery attempt was not journaled: entries=%d err=%v", len(entries), err)
+	}
+}
+
+func TestUnverifiedChannelEchoesSocketRing(t *testing.T) {
+	f := newConduitFixture(t)
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageLetter("ink")
+
+	channelDeliveries := f.addChannel(&reg)
+
+	letters := f.conduit.pending("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool {
+		return channelDeliveries.Load() == 1 && f.deliveries[reg.InstanceID].Load() == 1
+	}) {
+		t.Fatalf("unverified channel did not use both paths: channel=%d socket=%d logs=%s",
+			channelDeliveries.Load(), f.deliveries[reg.InstanceID].Load(), f.logs.String())
+	}
+	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("delivery journal entries=%d err=%v", len(entries), err)
+	}
+	var journal deliveryJournal
+	if err := readJSON(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID, entries[0].Name()), &journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal.Status != "written" || journal.Via != "channel+socket" {
+		t.Fatalf("journal status=%q via=%q, want written/channel+socket", journal.Status, journal.Via)
+	}
+	if got := strings.Count(f.logs.String(), "channel written; socket ring echoed (opt-in unverified)"); got != 1 {
+		t.Fatalf("echo log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+}
+
+func TestVerifiedChannelDoesNotEchoSocketRing(t *testing.T) {
+	f := newConduitFixture(t)
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageLetter("ink")
+	channelDeliveries := f.addChannel(&reg)
+	reg.ChannelVerified = true
+
+	letters := f.conduit.pending("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return channelDeliveries.Load() == 1 }) {
+		t.Fatal("verified channel did not receive the doorbell")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
+		t.Fatalf("verified channel echoed %d socket rings, want 0", got)
+	}
+	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("delivery journal entries=%d err=%v", len(entries), err)
+	}
+	var journal deliveryJournal
+	if err := readJSON(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID, entries[0].Name()), &journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal.Status != "written" || journal.Via != "channel" {
+		t.Fatalf("journal status=%q via=%q, want written/channel", journal.Status, journal.Via)
 	}
 }
 

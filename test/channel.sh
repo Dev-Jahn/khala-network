@@ -19,8 +19,8 @@ PROJECT_DIR=$RIG/project
 PIDS=
 
 case $CASE in
-    all|fast|h21a|h21b|h21c|h21d|h21e) ;;
-    *) printf 'usage: %s [all|fast|h21a|h21b|h21c|h21d|h21e]\n' "$0" >&2; exit 2 ;;
+    all|fast|e1a|e1b|e1caps|h21a|h21b|h21c|h21d|h21e) ;;
+    *) printf 'usage: %s [all|fast|e1a|e1b|e1caps|h21a|h21b|h21c|h21d|h21e]\n' "$0" >&2; exit 2 ;;
 esac
 
 cleanup() {
@@ -156,7 +156,12 @@ run_client() {
         --stderr "$RIG/channel.err" "$@"
 }
 
-if [ "$CASE" = all ] || [ "$CASE" = fast ]; then
+run_channel_client() {
+    run_client "$@" --dangerously-load-development-channels \
+        plugin:khala@jahns-cc-marketplace
+}
+
+if [ "$CASE" = all ] || [ "$CASE" = fast ] || [ "$CASE" = e1b ]; then
     (cd "$RIG/no-identity" && env -u KHALA_SESSION -u CLAUDE_CODE_SESSION_ID HOME=$HOME_RIG NODE_PATH=$RIG/node_modules \
         KHALA_CLAUDE_SESSIONS_DIR=$RIG/empty-sessions PATH=$RIG/bin:/usr/bin:/bin \
         "$BUN" "$SERVER" >"$RIG/no-identity.out" 2>"$RIG/no-identity.err") < <(sleep 2) || \
@@ -167,26 +172,40 @@ if [ "$CASE" = all ] || [ "$CASE" = fast ]; then
 
     set_child_registry "$SESSION_ID"
     reset_inbox
-    run_client full || fail "fast MCP/channel/reply protocol failed"
-    printf 'ok H21 fast — registry-ready child attached, forwarded, drained, replied, and cleaned up\n'
+    run_channel_client full || fail "fast MCP/channel/reply protocol failed"
+    printf 'ok H21 fast / T-E1b — flagged ancestry attached a verified channel, forwarded, drained, replied, and cleaned up\n'
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = e1a ]; then
+    set_child_registry "$SESSION_ID"
+    reset_inbox
+    run_client tools-only || fail "T-E1a flag-less tools-only attach failed"
+    printf 'ok T-E1a — marker-less capabilities and flag-less ancestry stayed tools-only with drain/reply available\n'
+fi
+
+if [ "$CASE" = all ] || [ "$CASE" = e1caps ]; then
+    set_child_registry "$SESSION_ID"
+    reset_inbox
+    run_client full --client-channel-marker || fail "client capability channel marker was not observed"
+    printf 'ok T-E1caps — getClientCapabilities observed experimental claude/channel as a positive marker\n'
 fi
 
 if [ "$CASE" = all ] || [ "$CASE" = h21a ]; then
     set_child_registry h21-resume-temp
     reset_inbox
-    run_client full --late-session-id "$SESSION_ID" || fail "H21a late session-id attach failed"
+    run_channel_client full --late-session-id "$SESSION_ID" || fail "H21a late session-id attach failed"
     printf 'ok H21a — child stayed connected, listed tools before attach, re-resolved the resumed session id, and completed H21\n'
 fi
 
 if [ "$CASE" = all ] || [ "$CASE" = h21b ]; then
     set_child_registry h21-never-matches
-    run_client orphan --registration-2 "$REGISTRATION_2" || fail "H21b socketpair EOF cleanup failed"
+    run_channel_client orphan --registration-2 "$REGISTRATION_2" || fail "H21b socketpair EOF cleanup failed"
     printf 'ok H21b — socketpair stdin EOF stopped the waiting child without a socket or registration orphan\n'
 fi
 
 if [ "$CASE" = all ] || [ "$CASE" = h21c ]; then
     set_child_registry "$SESSION_ID"
-    run_client reattach --registration-2 "$REGISTRATION_2" --next-session-id "$SESSION_ID_2" || \
+    run_channel_client reattach --registration-2 "$REGISTRATION_2" --next-session-id "$SESSION_ID_2" || \
         fail "H21c session-change re-attach failed"
     printf 'ok H21c — attached child cleared its old instance, moved to the rewritten session, and answered there\n'
 fi
@@ -194,7 +213,7 @@ fi
 if [ "$CASE" = all ] || [ "$CASE" = h21d ]; then
     set_child_registry "$SESSION_ID"
     reset_inbox
-    run_client full --child-session-id h21-env-stale --child-project-dir "$PROJECT_DIR" || \
+    run_channel_client full --child-session-id h21-env-stale --child-project-dir "$PROJECT_DIR" || \
         fail "H21d stale env session-id attach failed"
     printf 'ok H21d — child preferred the live parent registry over a stale exported session id and completed H21\n'
 fi
@@ -202,10 +221,10 @@ fi
 if [ "$CASE" = all ] || [ "$CASE" = h21e ]; then
     set_child_registry "$SESSION_ID"
     reset_inbox
-    run_client full --child-session-id "$SESSION_ID" --child-project-dir "$PROJECT_DIR" \
+    run_channel_client full --child-session-id "$SESSION_ID" --child-project-dir "$PROJECT_DIR" \
         --child-sessions-dir "$EMPTY_CC_SESSIONS" || fail "H21e env fallback attach failed"
     printf 'ok H21e — child used the exported session id when the parent registry walk found nothing and completed H21\n'
 fi
 
 printf 'RESULT: PASS\n'
-printf 'Channel H21 fast, late-resume, socketpair EOF, re-attach, stale-env, env-fallback, tools, doorbell, and cleanup properties passed\n'
+printf 'Channel E1 opt-in/capability gate plus H21 fast, late-resume, socketpair EOF, re-attach, stale-env, env-fallback, tools, doorbell, and cleanup properties passed\n'

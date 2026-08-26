@@ -198,7 +198,7 @@ H20_CHANNEL_SOCKET=$CHANNEL_SOCKET
 H20_CHANNEL_FRAMES=$CHANNEL_OUTPUT
 runtime_env "$BIN" runtime register-channel --instance "$H20_INSTANCE" \
     --session-id h20-session --channel-socket "$H20_CHANNEL_SOCKET" \
-    --caller-pid "$H20_CHANNEL_PID" >/dev/null || fail H20 "channel registration failed"
+    --caller-pid "$H20_CHANNEL_PID" --verified >/dev/null || fail H20 "channel registration failed"
 stage_letter "$H20_HOME" channelled 20 reel@bw2 "Priority: later"
 start_conduit "$H20_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H20_CONDUIT_PID=$CONDUIT_PID
@@ -664,7 +664,7 @@ pass H8 "restart restores written/failed journal state without an immediate dupl
 stop_pid "$H8_CONDUIT_PID"
 stop_pid "$H8_PID"
 
-# H10 — watch retreats only for its own verified, socket-backed registration.
+# H10 — watch retreats only for a verified path that can actually hear.
 H10_HOME=$RIG/h10-home
 init_home "$H10_HOME"
 start_listener h10 h10-session
@@ -680,6 +680,28 @@ while ! grep -R -q '"conduitVerified":true' "$RUNTIME_BASE/sessions" 2>/dev/null
     sleep 0.05
     wait_i=$((wait_i + 1))
 done
+start_channel_listener h10 "$H10_INSTANCE"
+H10_CHANNEL_PID=$CHANNEL_LISTENER_PID
+H10_CHANNEL_SOCKET=$CHANNEL_SOCKET
+runtime_env "$BIN" runtime register-channel --instance "$H10_INSTANCE" \
+    --session-id h10-session --channel-socket "$H10_CHANNEL_SOCKET" \
+    --caller-pid "$H10_CHANNEL_PID" >/dev/null || fail H10 "unverified channel registration failed"
+KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
+    KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
+    "$KHALA" watch --session watcher --interval 1 --max-wait 3 \
+    >"$RIG/h10-unverified.out" 2>"$RIG/h10-unverified.err" &
+H10_WATCH_PID=$!
+PIDS="$PIDS $H10_WATCH_PID"
+sleep 0.2
+kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified channel made watch retreat"
+grep -Fqx 'watch: conduit path unverified; watching directly' "$RIG/h10-unverified.err" || \
+    fail H10 "direct-watch explanation missing"
+stage_letter "$H10_HOME" watcher 10
+wait "$H10_WATCH_PID" || fail H10 "direct watch did not wake on a letter"
+grep -q '^1$' "$RIG/h10-unverified.out" || fail H10 "direct watch output missing letter count"
+runtime_env "$BIN" runtime register-channel --instance "$H10_INSTANCE" \
+    --session-id h10-session --channel-socket "$H10_CHANNEL_SOCKET" \
+    --caller-pid "$H10_CHANNEL_PID" --verified >/dev/null || fail H10 "verified channel registration failed"
 KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
     "$KHALA" watch --session watcher --interval 1 --max-wait 1 >"$RIG/h10.out" 2>"$RIG/h10.err" || \
@@ -696,7 +718,8 @@ kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified watch retreated ear
 stage_letter "$H10_HOME" legacy 10
 wait "$H10_WATCH_PID" || fail H10 "legacy watch did not wake on a letter"
 grep -q '^1$' "$RIG/h10-legacy.out" || fail H10 "legacy watch output missing letter count"
-pass H10 "watch retreats only when verified and otherwise retains legacy wake behavior"
+pass H10 "watch keeps its own ear for an unverified channel and yields for a verified path"
+stop_pid "$H10_CHANNEL_PID"
 stop_pid "$H10_CONDUIT_PID"
 stop_pid "$H10_PID"
 
