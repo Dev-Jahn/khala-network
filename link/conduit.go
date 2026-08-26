@@ -55,6 +55,7 @@ type conduitState struct {
 	lastAttempt  time.Time
 	nextAttempt  time.Time
 	failures     int
+	echoLogged   bool
 }
 
 type pendingLetter struct {
@@ -743,6 +744,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	if state.generation != generation {
 		state.generation = generation
 		state.attemptIndex = 0
+		state.echoLogged = false
 		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 			state.nextAttempt = now
 		} else {
@@ -787,6 +789,23 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 			}
 			if deliveryErr == nil {
 				journal.Via = "channel"
+				if !reg.ChannelVerified {
+					info, socketErr := os.Lstat(reg.SocketPath)
+					if socketErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode()&os.ModeSocket != 0 {
+						deliveryErr = writeDoorbell(reg.SocketPath, frame)
+						if deliveryErr == nil {
+							journal.Via = "channel+socket"
+							c.statesMu.Lock()
+							if !state.echoLogged {
+								c.logger.Printf("channel written; socket ring echoed (opt-in unverified)")
+								state.echoLogged = true
+							}
+							c.statesMu.Unlock()
+						} else {
+							c.logger.Printf("channel written but socket echo %s failed: %v", reg.InstanceID, deliveryErr)
+						}
+					}
+				}
 			} else {
 				journal.ChannelError = deliveryErr.Error()
 				c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
@@ -870,6 +889,9 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		}
 		if item.journal.Generation == generation {
 			latest = item
+			if item.journal.Via == "channel+socket" {
+				state.echoLogged = true
+			}
 		}
 	}
 	if latest.at.IsZero() {

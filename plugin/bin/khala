@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.7.2
+KHALA_VERSION=0.7.3
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -3637,12 +3637,20 @@ cmd_watch() {
     watch_interval=$(normalize_integer "$watch_interval")
     watch_max_wait=$(normalize_integer "$watch_max_wait")
     watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
-    if find_link_binary && "$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
-        --instance "${KHALA_SESSION_INSTANCE-}" \
-        --session-id "${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}" \
-        --caller-pid "$$" >/dev/null 2>&1; then
-        printf '%s\n' 'conduit has the ear'
-        return 0
+    if find_link_binary; then
+        watch_ready_error=$("$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
+            --instance "${KHALA_SESSION_INSTANCE-}" \
+            --session-id "${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}" \
+            --caller-pid "$$" 2>&1)
+        if [ "$?" -eq 0 ]; then
+            printf '%s\n' 'conduit has the ear'
+            return 0
+        fi
+        case "$watch_ready_error" in
+            *'conduit path unverified'*)
+                printf '%s\n' 'watch: conduit path unverified; watching directly' >&2
+                ;;
+        esac
     fi
     watch_self=$(self_node) || {
         error "설정을 확인하거나 khala init 먼저 실행하세요."
