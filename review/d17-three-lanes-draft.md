@@ -53,6 +53,14 @@ non-세션(워처) 메시징의 확실한 구분. steno@b200 실측 회신(09-02
     "…sent a message **while you were working**:", idle 도착은 새 user 턴 "Another Claude session sent a message:".
     **남은 미측**: 채널 경로(khala_drain), permission 프롬프트 대기 중, compact·종료 중(SessionStart 드레인으로만 관측).
     B 착수 전 별도 실측은 불필요하고, permission 프롬프트 상태 1건만 선택 항목이다(유저 pane 필요).
+12. **"턴이 열림 ≠ 처리됨"** (steno@b200 실측 09-02 12:30Z, 전사 근거). 세션이 계정 5h 한도에 걸린 동안 urgent 편지 1통에
+    conduit이 10분 간격으로 초인종 5회(같은 generation, attempt만 다름)를 울렸고, 매번 새 턴이 열렸지만 앞 4회는 한도
+    메시지로 즉시 종료·모델 호출 불가, 한도 해제 뒤 5회째에서 drain 성공. **미드레인 시 10분 재울림이 경보를 살렸다.**
+    함의: (a) 소켓 쓰기 성공은 처리 보장이 아니다 — 재울림은 ring set(편지·urgent)에 유지하고 info는 재울림 없음(A4와 정합);
+    (b) 프레임에 `retry: N`(직전 drain 없이 반복된 횟수)을 실어 세션이 "앞 N회는 내가 못 받았다"를 알게 한다(0.8.0 소품,
+    conduit 저널의 attemptIndex를 그대로 노출); (c) B: 게이트웨이는 "귀는 열렸는데 drain이 N분째 없음"(=.ear 살아있음 ∧ 미처리
+    pending 지속)을 사용자 토픽에 1줄로 알려야 한다 — 세션이 못 보내는 상태이므로 게이트웨이가 대신 말한다; (d) 계정 회전(ccbroker)
+    이 1차 처방이며 이번엔 회전이 없었다(steno 운영 건).
 
 ## 2. 제안 A — `notice`: 기계 알림을 편지와 분리한다 (0.8.0)
 
@@ -114,6 +122,8 @@ notices: 3        # notice 수 (urgent 1 / info 2 는 subjects 줄 앞에 U/I �
   잡히지만 **단독으로는 절대 울리지 않고** 다음 초인종·다음 drain·SessionStart에 편승한다(steno §4-4). 이것이
   `--later`보다 강한 약속이다(`later`는 CC가 idle에 표면화하므로 결국 깨울 수 있다).
 - `Priority: later`(message)는 현행 유지. `khala_reply`/채널 메타는 `notices`·`urgency`를 같이 싣는다.
+- **재울림과 `retry:`**: 미드레인 generation은 지금처럼 10분마다 재울림(ring set에만). 프레임에 `retry: N` 줄(같은
+  generation의 N번째 재시도, 첫 울림은 0)을 넣고 채널 메타에도 `retry`를 싣는다 — 사실 12.
 - 채널 경로 content 줄: `gpu-guard@b200 · U · <subject>`.
 
 ### A5. 워처 신원 클래스와 dead-man
@@ -209,6 +219,9 @@ Subject: (첫 줄 80자)
   `/notices steno@b200 urgent|off`. 봇의 자연어 처리는 없다 — 명령은 접두 `/`뿐, 나머지 텍스트는 General에선 무시.
 - **토픽 1개 = 세션 주소 1개**(토픽 이름 = 주소). 매핑은 `~/.khala/gateway.state`(thread_id↔address, 0600)에 저장하고
   토픽 생성 이벤트(`forum_topic_created`)로 복구. 토픽에 쓴 글 → `user` 편지. 세션 회신 → 그 토픽.
+- **세션 상태 1줄**: 게이트웨이는 세션 토픽에 상태 변화만 게시한다 — "듣는 중"(.ear 신규), "귀는 열렸으나 N분째 미처리"
+  (.ear 살아있음 ∧ 해당 identity의 pending 지속; 계정 한도·권한 대기의 징후, 사실 12), "잠듦"(.ear 소멸). 세션이 스스로 말할 수
+  없는 상태를 대신 말하는 것이 목적이므로 이 3종 외 자동 게시는 없다.
 - 세션이 먼저 말 걸기(`send user@mini`) → 토픽 없으면 만들어 게시. **워처 notice는 기본 전달 안 함**(폰 소음). 토픽별
   `/notices … urgent`로 켜면 urgent만 요약 1줄로 전달. 사용자에게 보고할 내용은 세션이 정리해서 보내는 게 정석이다.
 - 제약 반영: 그룹당 봇 20 msg/min(Bots FAQ) → 토픽별 큐·합치기; 4096자 청킹(플러그인과 동일 규칙); 봇은 히스토리를 못
