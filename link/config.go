@@ -113,7 +113,13 @@ func validMessageID(s string) bool { return messageIDPattern.MatchString(s) }
 func validGeneration(s string) bool { return generationPattern.MatchString(s) }
 
 func presenceNode(name string) (string, bool) {
-	base := strings.TrimSuffix(name, ".watching")
+	base := name
+	for _, suffix := range []string{".watching", ".watcher", ".ear"} {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			break
+		}
+	}
 	i := strings.LastIndexByte(base, '@')
 	if i <= 0 || i == len(base)-1 {
 		return "", false

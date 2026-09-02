@@ -62,10 +62,16 @@ type pendingLetter struct {
 	id      string
 	from    string
 	subject string
+	notice  bool
+	urgent  bool
 	// later is set when the envelope carries "Priority: later" — the sender
 	// asked for the doorbell to wait until the session is idle.
 	later bool
 }
+
+// conduitBeforeDoorbellWrite is nil in production. Tests use it to change the
+// inbox deterministically after a frame is built and before its final re-check.
+var conduitBeforeDoorbellWrite func(identity string)
 
 type conduit struct {
 	home                string
@@ -387,7 +393,7 @@ func (c *conduit) scan() {
 			continue
 		}
 		letters := c.pending(identity)
-		if len(letters) == 0 {
+		if len(ringLetters(letters)) == 0 {
 			c.statesMu.Lock()
 			delete(c.states, identity)
 			c.statesMu.Unlock()
@@ -678,6 +684,8 @@ func (c *conduit) pending(identity string) []pendingLetter {
 			continue
 		}
 		letter := pendingLetter{id: entry.Name()}
+		typeValue := ""
+		urgencyValue := ""
 		f, err := os.Open(filepath.Join(dir, entry.Name()))
 		if err == nil {
 			scanner := bufio.NewScanner(io.LimitReader(f, 64<<10))
@@ -695,8 +703,18 @@ func (c *conduit) pending(identity string) []pendingLetter {
 				if strings.HasPrefix(line, "Priority: ") && strings.TrimSpace(strings.TrimPrefix(line, "Priority: ")) == "later" {
 					letter.later = true
 				}
+				if strings.HasPrefix(line, "Type: ") {
+					typeValue = strings.TrimSpace(strings.TrimPrefix(line, "Type: "))
+				}
+				if strings.HasPrefix(line, "Urgency: ") {
+					urgencyValue = strings.TrimSpace(strings.TrimPrefix(line, "Urgency: "))
+				}
 			}
 			_ = f.Close()
+		}
+		if typeValue == "notice" {
+			letter.notice = true
+			letter.urgent = urgencyValue != "info"
 		}
 		letters = append(letters, letter)
 	}
@@ -724,15 +742,52 @@ func sanitizePreview(value string, limit int) string {
 }
 
 func letterGeneration(letters []pendingLetter) string {
-	hash := sha256.New()
+	ids := make([]string, 0, len(letters))
 	for _, letter := range letters {
-		_, _ = io.WriteString(hash, letter.id)
+		if !letter.notice || letter.urgent {
+			ids = append(ids, letter.id)
+		}
+	}
+	sort.Strings(ids)
+	hash := sha256.New()
+	for _, id := range ids {
+		_, _ = io.WriteString(hash, id)
 		_, _ = hash.Write([]byte{0})
 	}
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
+func ringLetters(letters []pendingLetter) []pendingLetter {
+	ring := make([]pendingLetter, 0, len(letters))
+	for _, letter := range letters {
+		if !letter.notice || letter.urgent {
+			ring = append(ring, letter)
+		}
+	}
+	return ring
+}
+
+func letterCounts(letters []pendingLetter) (mail, notices, urgent int) {
+	for _, letter := range letters {
+		if !letter.notice {
+			mail++
+			continue
+		}
+		notices++
+		if letter.urgent {
+			urgent++
+		}
+	}
+	return mail, notices, urgent
+}
+
 func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionRegistration, letters []pendingLetter) {
+	if len(ringLetters(letters)) == 0 {
+		c.statesMu.Lock()
+		delete(c.states, identity)
+		c.statesMu.Unlock()
+		return
+	}
 	now := time.Now()
 	generation := letterGeneration(letters)
 	c.statesMu.Lock()
@@ -769,7 +824,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		Generation: generation, AttemptID: attemptID, AttemptIndex: attemptIndex,
 		AttemptedAt: now.UTC().Format(time.RFC3339Nano), PeerStatus: "unknown", CCVersion: reg.CCVersion,
 	}
-	for _, letter := range letters {
+	for _, letter := range ringLetters(letters) {
 		journal.LetterIDs = append(journal.LetterIDs, letter.id)
 	}
 	verified := reg.ConduitVerified && reg.Phase == "ready" && lease.InstanceID == reg.InstanceID &&
@@ -781,11 +836,24 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		journal.Error = "registration is not ready and conduit-verified"
 		deliveryErr = errors.New(journal.Error)
 	} else {
-		frame := c.frame(identity, generation, attemptID, letters)
+		frame := c.frame(identity, generation, attemptID, attemptIndex-1, letters)
+		if conduitBeforeDoorbellWrite != nil {
+			conduitBeforeDoorbellWrite(identity)
+		}
+		freshLetters := c.pending(identity)
+		if letterGeneration(freshLetters) != generation {
+			c.logger.Printf("doorbell skipped: generation changed before write (%s)", identity)
+			if len(ringLetters(freshLetters)) == 0 {
+				c.statesMu.Lock()
+				delete(c.states, identity)
+				c.statesMu.Unlock()
+			}
+			return
+		}
 		if reg.ChannelSocket != "" {
 			deliveryErr = c.verifyChannelSocket(reg)
 			if deliveryErr == nil {
-				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, letters))
+				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, attemptIndex-1, letters))
 			}
 			if deliveryErr == nil {
 				journal.Via = "channel"
@@ -934,11 +1002,16 @@ func (c *conduit) updateNativeStatus(reg sessionRegistration, failures int) {
 	}
 }
 
-func (c *conduit) frame(identity, generation, attempt string, letters []pendingLetter) map[string]any {
+// retry is the number of earlier attempts already written for this same
+// generation (0 on the first ring). A session that sees retry > 0 learns that
+// earlier doorbells were opened but never drained (measured 2026-09-02: an
+// account limit opened four turns that could not run a model call).
+func (c *conduit) frame(identity, generation, attempt string, retry int, letters []pendingLetter) map[string]any {
 	from, subjects := doorbellDisplay(letters)
+	mail, notices, urgent := letterCounts(letters)
 	streamPending := c.pendingStreams(identity)
-	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nstreams: %d\nfrom: %s\nsubjects: %s\ngeneration: %s\nattempt: %s\nread: khala inbox --drain",
-		identity, c.self, len(letters), streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), generation, attempt)
+	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nnotices: %d\nurgent: %d\nstreams: %d\nfrom: %s\nsubjects: %s\ngeneration: %s\nattempt: %s\nretry: %d\nread: khala inbox --drain",
+		identity, c.self, mail, notices, urgent, streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), generation, attempt, retry)
 	if len(content) > 8192 {
 		content = content[:8192]
 		for !utf8.ValidString(content) {
@@ -957,6 +1030,9 @@ func doorbellDisplay(letters []pendingLetter) ([]string, []string) {
 	var from []string
 	var subjects []string
 	for _, letter := range letters {
+		if letter.notice && !letter.urgent {
+			continue
+		}
 		if letter.from != "" {
 			if _, seen := fromSet[letter.from]; !seen && len(from) < 8 {
 				fromSet[letter.from] = struct{}{}
@@ -964,20 +1040,28 @@ func doorbellDisplay(letters []pendingLetter) ([]string, []string) {
 			}
 		}
 		if letter.subject != "" && len(subjects) < 8 {
-			subjects = append(subjects, letter.subject)
+			subject := letter.subject
+			if letter.notice {
+				subject = "U · " + subject
+			}
+			subjects = append(subjects, subject)
 		}
 	}
 	return from, subjects
 }
 
-func (c *conduit) channelRequest(generation, attempt string, letters []pendingLetter) map[string]any {
+func (c *conduit) channelRequest(generation, attempt string, retry int, letters []pendingLetter) map[string]any {
 	from, subjects := doorbellDisplay(letters)
+	mail, notices, urgent := letterCounts(letters)
 	meta := map[string]string{
 		"from":       strings.Join(from, ", "),
 		"subject":    strings.Join(subjects, "; "),
-		"pending":    strconv.Itoa(len(letters)),
+		"pending":    strconv.Itoa(mail),
+		"notices":    strconv.Itoa(notices),
+		"urgent":     strconv.Itoa(urgent),
 		"generation": generation,
 		"attempt":    attempt,
+		"retry":      strconv.Itoa(retry),
 	}
 	if len(from) == 1 {
 		meta["user"] = from[0]
@@ -987,15 +1071,16 @@ func (c *conduit) channelRequest(generation, attempt string, letters []pendingLe
 	if doorbellPriority(letters) == "later" {
 		meta["later"] = "1"
 	}
-	lines := make([]string, 0, len(letters)+1)
-	for _, letter := range letters {
-		lines = append(lines, fmt.Sprintf("%s · %s", letter.from, letter.subject))
+	ring := ringLetters(letters)
+	lines := make([]string, 0, len(ring)+1)
+	for _, letter := range ring {
+		if letter.notice {
+			lines = append(lines, fmt.Sprintf("%s · U · %s", letter.from, letter.subject))
+		} else {
+			lines = append(lines, fmt.Sprintf("%s · %s", letter.from, letter.subject))
+		}
 	}
-	noun := "letters"
-	if len(letters) == 1 {
-		noun = "letter"
-	}
-	lines = append(lines, fmt.Sprintf("%d %s — run khala_drain", len(letters), noun))
+	lines = append(lines, fmt.Sprintf("%d letters, %d notices — run khala_drain", mail, notices))
 	return map[string]any{"v": 1, "content": strings.Join(lines, "\n"), "meta": meta}
 }
 
@@ -1036,14 +1121,15 @@ func (c *conduit) verifyChannelSocket(reg sessionRegistration) error {
 // turn, exactly as its own SendMessage does, while "later" waits for idle —
 // and an autonomous turn can run for tens of minutes (user decision
 // 2026-08-17, superseding the 0.5.0 default). A doorbell drops to "later" only
-// when every pending letter carries "Priority: later" (khala send --later);
-// one ordinary letter in the batch keeps the batch prompt. "now" is never
-// minted here.
+// when every letter in the ring set carries "Priority: later" (khala send
+// --later); info notices are outside that set, while one ordinary letter keeps
+// the batch prompt. "now" is never minted here.
 func doorbellPriority(letters []pendingLetter) string {
-	if len(letters) == 0 {
+	ring := ringLetters(letters)
+	if len(ring) == 0 {
 		return "next"
 	}
-	for _, letter := range letters {
+	for _, letter := range ring {
 		if !letter.later {
 			return "next"
 		}

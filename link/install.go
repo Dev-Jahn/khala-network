@@ -226,6 +226,21 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	// Id=>bytes invariant applies to spool Id objects; presence has no Id.
 	// Replace only presence atomically, without interpreting its contents.
 	if o.Class == "presence" {
+		// A .watcher declaration is owned by the watcher's node and carries its
+		// declared epoch on line 1 ("retired <epoch>" for a tombstone). Never let
+		// a delayed older copy overwrite a newer one: replication order is not
+		// guaranteed across the link and the rsync fallback.
+		if strings.HasSuffix(o.Basename, ".watcher") {
+			if incoming, ok := watcherEpoch(data); ok {
+				if existing, err := os.ReadFile(dest); err == nil {
+					if current, ok := watcherEpoch(existing); ok && incoming < current {
+						_ = os.Remove(tmp)
+						i.logger.Printf("stale watcher declaration ignored: %s (%d < %d)", o.Basename, incoming, current)
+						return installed, dest, nil
+					}
+				}
+			}
+		}
 		if err := os.Rename(tmp, dest); err != nil {
 			return quarantined, tmp, err
 		}
@@ -496,4 +511,24 @@ func removeTransit(path string, offered [sha256.Size]byte) error {
 		return fmt.Errorf("transit changed after OFFER; refusing unlink")
 	}
 	return os.Remove(path)
+}
+
+// watcherEpoch reads the declared epoch on the first line of a .watcher
+// marker; "retired <epoch>" tombstones count as that epoch.
+func watcherEpoch(data []byte) (int64, bool) {
+	line := data
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		line = data[:i]
+	}
+	text := strings.TrimSpace(string(line))
+	text = strings.TrimPrefix(text, "retired ")
+	text = strings.TrimSpace(text)
+	if text == "" || len(text) > 18 {
+		return 0, false
+	}
+	epoch, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || epoch < 0 {
+		return 0, false
+	}
+	return epoch, true
 }

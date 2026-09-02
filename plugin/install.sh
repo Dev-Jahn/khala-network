@@ -282,7 +282,7 @@ fi
 khala_install_say "using $KHALA_DOWNLOADER for release downloads"
 
 if [ "$KHALA_BOOTSTRAP" -eq 0 ]; then
-    if ssh -o BatchMode=yes -o ConnectTimeout=8 "$KHALA_MAILBOX_COORD" true >/dev/null 2>&1; then
+    if ssh -o BatchMode=yes -o ConnectTimeout=8 "$KHALA_MAILBOX_COORD" true </dev/null >/dev/null 2>&1; then
         khala_install_say "mailbox $KHALA_MAILBOX_COORD is reachable over batch SSH"
     else
         printf 'khala install: WARNING: mailbox %s is unreachable right now; installation continues and sync will retry\n' \

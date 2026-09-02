@@ -32,7 +32,7 @@ to make those slices converge.
   seconds. It runs over a plain ssh pipe — spokes dial
   `ssh <hub> khala link --serve` — so the hub runs no daemon, opens no new
   port, and mints no new credentials.
-- **The conduit — `khala-link conduit`** (0.6.0): the node's resident ear.
+- **The conduit — `khala-link conduit`** (0.8.0): the node's resident ear.
   Sessions arm nothing. When mail lands in `inbox/<session>/new`, the conduit
   rings that session's own Claude Code inbox socket with one coalesced
   plaintext doorbell (`KHALA-CONDUIT/1`, priority *next* — it lands between
@@ -55,12 +55,35 @@ khala never types into a session's input line. The input line is the user's
 identity; delivery is by mailbox only, and a session is woken only by its
 own watch returning.
 
-## Two kinds of thought: letters and streams
+## Letters, notices, and streams
 
 A letter (`send`) is an obligation: one recipient, acked end to end, bounced
 when undeliverable. A stream (`say`) is communion: you speak into a named
 shared record and every joined session reads it — no recipient list, no
 acks, no bounces, because there is no single mind owing you a reply.
+
+A notice (`notify`) is a machine observation for one session. It is durable
+and store-and-forward, but creates no outbox copy, ack, or reply obligation.
+Machine senders must name themselves explicitly; their watcher marker is
+separate from session heartbeat presence:
+
+```sh
+khala notify operator@hub --as gpu-guard -s "GPU 2 recovered" <<'NOTICE'
+Utilization and memory returned to normal.
+NOTICE
+khala notify operator@hub --as gpu-guard --urgent -s "GPU 2 stalled" </dev/null
+khala watcher declare gpu-guard --cadence 600 --owner operator@hub
+khala watcher list
+khala watcher retire gpu-guard
+```
+
+Info notices are deliberately quiet: an info notice alone never rings or
+wakes a session. Urgent notices ring exactly like mail. `notify` defaults to
+info and a two-day expiry; `--urgent` changes the doorbell policy and `-e`
+changes the expiry. A declared watcher with a cadence sends its owner one
+urgent notice when it misses twice that cadence, and one quiet info notice
+when notifications resume. `khala presence` shows active watchers below the
+session table; `khala presence --watchers` shows only that section.
 
 ```sh
 khala say -m "build green on hub"          # the commons stream, "khala"
@@ -83,6 +106,14 @@ same caps; a session's armed watch wakes for joined streams too. Sessions
 that are gone for good are retired (`khala retire <session>`) — presence
 hides them, their reader state is collected, and speaking again revives
 the name.
+
+Drain prints mail first, a notices block second, and streams last. Mail and
+streams share the existing `--max-n` / `--max-bytes` bounds; notices have
+independent defaults of 10 items / 16384 bytes and the flags
+`--max-notices` / `--max-notice-bytes`. Use `--mail-only` to leave notices in
+`new/`, or `--notices-only` to leave mail and stream cursors untouched. Every
+drain ends with `drained: letters L, notices N, streams S`, including an
+explicit all-zero result.
 
 ## Minds: who is here, and what they are doing
 
@@ -118,6 +149,12 @@ archive cannot be written, expired entries are kept and the preserver
 complains loudly rather than forgetting silently. Mail is never archived —
 letters belong to their recipients.
 
+Reconcile silently removes notices after their envelope `Expires` time,
+whether they are waiting in a spool or are already in inbox `new/` or `cur/`.
+It also removes inbox `cur/`, `outbox/acked`, and `outbox/dead` records after
+`retain` days (30 by default). Unread mail in inbox `new/` is never removed by
+retention: undrained mail remains the truth.
+
 ## Install
 
 Bootstrap a new fleet; this node becomes its mailbox:
@@ -151,9 +188,10 @@ Daily use:
 
 ```sh
 khala send executor@hub -m "build finished" # body via -m or stdin
+khala notify executor@hub --as ci -s "build green" </dev/null
 khala sync                                  # one exchange cycle (idempotent)
-khala inbox --drain                         # read your mail
-khala presence                              # who is alive / asleep / watching
+khala inbox --drain                         # letters, notices, then streams
+khala presence                              # sessions, then machine watchers
 ```
 
 ## The nerve cord and the conduit (`khala node ensure`)
