@@ -575,8 +575,11 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   reconcile은 link가 fresh한 동안 1초마다 불리는데, 0.8.0은 매 pass마다 편지 트리 전체를
   파일당 서너 번 fork하며 검사해(수백 통에 6-8 s) brain.lock.d를 사실상 독점했고 그 노드의
   drain/notify가 60회 대기 뒤 실패했다(2026-09-02 실측). 배달·ack·dead-man·outbox 만료·
-  preserve 캡처는 매 pass 그대로이며, 기준 시각은 `run/retention.stamp`의 mtime이다(없거나
-  미래면 due — 잠금이 아니라 즉시 정리).
+  preserve 캡처·stream/mind 파일 검증과 격리·낮은 mind generation 수거(프로토콜 1.2 GC)는
+  매 pass 그대로이며, 기준 시각은 `run/retention.stamp`의 mtime이다(없거나 미래면 due —
+  잠금이 아니라 즉시 정리). 같은 이유로 reconcile 루프가 값 하나마다 sed/grep을 fork하던
+  헬퍼(header_value·normalize_integer·valid_*·validate_mind_file)는 순수 셸로 바꿨다 —
+  pass 비용은 fork 수가 지배한다(트리 사본 실측, 0.7.3 → 0.8.1 게이트 pass: b200 3.3 s → 0.2-0.3 s, mini 허브 3.0 s → 0.6-0.8 s; 5분마다의 정리 pass는 2.2 s / 5.1 s).
   `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
   last-notify가 모두 오래됐을 때만 삭제한다.
 

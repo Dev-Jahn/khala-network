@@ -445,6 +445,23 @@ KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-1.err" || die "i
 write_letter "$home" reader "$now.3.2.second@alpha" second@alpha notice info second "$((now - 1))" waits
 KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-2.err" || die "interval reconcile 2 failed"
 [ -f "$home/inbox/reader/new/$now.3.2.second@alpha" ] || die "a pass inside the interval swept anyway"
+# Inside the interval the per-pass semantics still run: a garbage stream entry and a
+# future-epoch one are quarantined (loudly), and a lower mind generation is collected.
+mkdir -p "$home/streams/khala/alpha"
+printf 'garbage\n' > "$home/streams/khala/alpha/$now.9.9.reader@alpha"
+printf 'Khala: 0.1\nId: %s.9.8.reader@alpha\nFrom: reader@alpha\nStream: khala\nDate: 2000-01-01T00:00:00Z\nType: entry\n\nfuture\n' "$((now + 100000))" \
+    > "$home/streams/khala/alpha/$((now + 100000)).9.8.reader@alpha"
+low=$(KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" mind -m low 2>/dev/null) || die "low mind failed"
+cp "$home/minds/alpha/reader/$low" "$home/tmp/low.fixture" || die "low fixture failed"
+high=$(KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" mind -m high 2>/dev/null) || die "high mind failed"
+cp "$home/tmp/low.fixture" "$home/minds/alpha/reader/$low" || die "low re-injection failed"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-2b.err" || die "interval reconcile 2b failed"
+[ ! -e "$home/streams/khala/alpha/$now.9.9.reader@alpha" ] || die "garbage stream entry survived a pass inside the interval"
+[ ! -e "$home/streams/khala/alpha/$((now + 100000)).9.8.reader@alpha" ] || die "future stream entry survived a pass inside the interval"
+[ "$(grep -c '격리' "$RIG/interval-2b.err")" -eq 2 ] || die "quarantine inside the interval was not loud twice: $(tr '\n' ' ' < "$RIG/interval-2b.err")"
+[ ! -e "$home/minds/alpha/reader/$low" ] || die "lower mind generation survived a pass inside the interval"
+[ -f "$home/minds/alpha/reader/$high" ] || die "current mind generation was collected"
+[ -f "$home/inbox/reader/new/$now.3.2.second@alpha" ] || die "the semantic pass swept the age-out anyway"
 aged "$home/run/retention.stamp" "$((now - 301))"
 KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-3.err" || die "interval reconcile 3 failed"
 [ ! -e "$home/inbox/reader/new/$now.3.2.second@alpha" ] || die "a pass after the interval did not sweep"

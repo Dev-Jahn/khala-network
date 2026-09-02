@@ -157,8 +157,9 @@ retention: undrained mail remains the truth. These age-out sweeps (and the
 stream, mind, presence and delivered-log ones) run at most once per
 `retention-interval` seconds (300 by default; `0` runs them on every pass),
 so a link reconciling once a second does not hold the brain lock for the
-whole sweep; delivery, acks, dead-man notices and outbox expiry still run on
-every pass.
+whole sweep. Delivery, acks, dead-man notices, outbox expiry, preserve
+capture, validation and quarantine of stream and mind files, and the
+collection of superseded mind generations still run on every pass.
 
 ## Install
 
