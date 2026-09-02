@@ -496,7 +496,7 @@ watcher marker `presence/<name>@<node>.watcher` (5행, 전체를 원자 교체):
 ```
 <declared-epoch> | retired <epoch>
 <cadence-seconds>                 # 0 = unknown, dead-man 없음
-<owner-session> | -
+<owner-session@node> | -              # 전체 주소; 원격 owner 허용
 <last-notify-epoch>               # 0 = never
 active | silent <since-epoch>
 ```
@@ -522,8 +522,11 @@ active | silent <since-epoch>
 spool 사본의 수명 (타입별):
 
 - **message 사본 = 재전송 원천** — ack가 원본을 소비할 때 함께 삭제된다 (위).
-- **ack/bounce/notice 사본 = fire-and-forget** — (b) push 성공 시 삭제. 유실은 원문
+- **ack/bounce 사본 = fire-and-forget** — (b) push 성공 시 삭제. 유실은 원문
   재전송 → dedup → ack 재생성이 치유한다 (§5.2).
+- **notice 사본 = 발신 노드가 `Expires`까지 보관** (0.8.0, GPT-Pro P0-1) — 우체통이
+  바이트를 받은 것은 배달이 아니다(R4). 수신 노드는 Id로 중복을 흡수하고, 만료된
+  사본은 `prune_expired_notices`가 지운다.
 
 sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 패스; ack 정산이 다음
 사이클로 넘어갈 수 있으나 멱등이므로 무해):
@@ -563,8 +566,11 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   잔해다. 이송이지 삭제가 아님(silent 소멸 금지) — 부검 가능하게 남긴다.
 - retention (0.8.0): `Expires`가 지난 notice는 `spool/for/*`와
   `inbox/*/new|cur`에서 조용히 삭제하며 배달 직전 만료도 drop한다.
-  `inbox/*/cur`, `outbox/acked`, `outbox/dead`는 Id epoch가 `retain`일(기본 30)보다
-  오래되면 삭제한다. `inbox/*/new`의 mail은 retention으로 절대 삭제하지 않는다.
+  `inbox/*/cur`, `outbox/acked`, `outbox/dead`는 **그 상태에 들어간 시각**(drain/ack/만료
+  이동 시 mtime을 갱신)이 `retain`일(기본 30)보다 오래되면 삭제한다 — Id epoch가 아니다:
+  31일 묵은 편지를 drain한 직후 지워지면 안 된다(mtime이 Id보다 앞서면 Id epoch로 폴백).
+  `send -e`는 5097600초(59일) 이하로 제한한다 — dedup 기록 보존(60일) 안에 들어야
+  재전송이 두 번 설치되지 않는다. `inbox/*/new`의 mail은 retention으로 절대 삭제하지 않는다.
   `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
   last-notify가 모두 오래됐을 때만 삭제한다.
 
@@ -578,7 +584,7 @@ CLI 인터페이스 (한 머신 마일스톤 범위):
   발신 세션명: `--as` > `$KHALA_SESSION` > `$PWD` basename (D5). 안착 = 성공(§5.2).
 - `khala notify <session@node> --as <watcher> [-s 제목] [--urgent] [-e 만료초]` —
   본문은 stdin, outbox/ack 없음. 기본 info/2일.
-- `khala watcher declare <name> --cadence <초> --owner <session> | list | retire <name>` —
+- `khala watcher declare <name> --cadence <초> --owner <session@node> | list | retire <name>` —
   machine identity와 dead-man 상태 관리.
 - `khala sync` — 위 한 사이클. 실패는 파일 단위로 소리 내고 계속(R10) — 전체 abort 금지.
 - `khala reconcile` — (a)+(c)만 한 패스 실행하며 네트워크 I/O는 하지 않는다.

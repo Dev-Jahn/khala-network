@@ -72,7 +72,7 @@ usage() {
             ;;
         minds) printf '%s\n' 'usage: khala minds'; return 0 ;;
         watcher)
-            printf '%s\n' 'usage: khala watcher declare <name> --cadence <seconds> --owner <session>'
+            printf '%s\n' 'usage: khala watcher declare <name> --cadence <seconds> --owner <session@node>'
             printf '%s\n' '       khala watcher list'
             printf '%s\n' '       khala watcher retire <name>'
             return 0
@@ -110,7 +110,7 @@ usage:
   khala mind (-m focus [--stance stance] | --clear)
   khala profile [--model model] [--effort effort] [--role role] [--charge charge]
   khala minds
-  khala watcher declare <name> --cadence <seconds> --owner <session>
+  khala watcher declare <name> --cadence <seconds> --owner <session@node>
   khala watcher list
   khala watcher retire <name>
   khala retire <session>
@@ -309,7 +309,7 @@ read_watcher_marker() {
     bounded_integer "$WATCHER_L2" || return 1
     case "$WATCHER_L3" in
         -) ;;
-        *) valid_name "$WATCHER_L3" || return 1 ;;
+        *) valid_address "$WATCHER_L3" || valid_name "$WATCHER_L3" || return 1 ;;
     esac
     bounded_integer "$WATCHER_L4" || return 1
     case "$WATCHER_L5" in
@@ -1767,8 +1767,11 @@ remove_pushed_infrastructure() {
     for pushed_file in "$pushed_dir"/*; do
         [ -f "$pushed_file" ] || continue
         pushed_type=$(header_value Type "$pushed_file")
+        # A notice keeps its source copy until Expires: the mailbox accepting
+        # bytes is not delivery (R4). The destination deduplicates repeats by
+        # Id, and prune_expired_notices removes the copy once it expires.
         case "$pushed_type" in
-            ack|bounce|notice)
+            ack|bounce)
                 if ! rm -f "$pushed_file"; then
                     sync_error "$pushed_file: push한 인프라 사본을 지우지 못했습니다"
                 fi
@@ -1826,7 +1829,8 @@ exchange_with_endpoint() {
     # Watching-marker deletion is intentionally not propagated: remote copies
     # become stale under the display-side freshness rule.
     for exchange_presence in "$KHALA_ROOT"/presence/*@"$exchange_self" \
-        "$KHALA_ROOT"/presence/*@"$exchange_self".watching; do
+        "$KHALA_ROOT"/presence/*@"$exchange_self".watching \
+        "$KHALA_ROOT"/presence/*@"$exchange_self".watcher; do
         [ -f "$exchange_presence" ] || continue
         if ! mailbox_rsync "$exchange_endpoint" push "$exchange_presence" \
             presence/ 0; then
@@ -2105,6 +2109,7 @@ expire_outbox() {
             sync_error "$expired_file: dead-letter 이동에 실패했습니다"
             continue
         fi
+        touch "$KHALA_ROOT/outbox/dead/$expired_id" 2>/dev/null || :
         expired_node=${expired_to#*@}
         if ! rm -f "$KHALA_ROOT/spool/for/$expired_node/$expired_id"; then
             sync_error "$expired_file: spool 사본 삭제에 실패했습니다"
@@ -2150,6 +2155,7 @@ settle_acks() {
                 sync_error "$ack_file: 원문을 acked로 옮기지 못했습니다"
                 continue
             fi
+            touch "$archived_file" 2>/dev/null || :
             reference_file=$archived_file
         elif [ -f "$archived_file" ]; then
             reference_file=$archived_file
@@ -2256,8 +2262,17 @@ prune_letter_archives() {
         retention_path_inside_root "$prune_archive_file" || continue
         prune_archive_id=$(header_value Id "$prune_archive_file")
         valid_message_id "$prune_archive_id" || continue
+        # Age = time the file entered this state (drain/ack/expiry touch its
+        # mtime), never the Id epoch: a letter that waited 31 days in new/ must
+        # not vanish the moment it is drained. A file whose mtime predates its
+        # own Id (clock skew, restored backup) falls back to the Id epoch.
+        prune_archive_epoch=$(file_mtime "$prune_archive_file") || prune_archive_epoch=
         bounded_integer "${prune_archive_id%%.*}" || continue
-        prune_archive_epoch=$(normalize_integer "${prune_archive_id%%.*}")
+        prune_archive_id_epoch=$(normalize_integer "${prune_archive_id%%.*}")
+        if ! bounded_integer "${prune_archive_epoch-}" || \
+            [ "$prune_archive_epoch" -lt "$prune_archive_id_epoch" ]; then
+            prune_archive_epoch=$prune_archive_id_epoch
+        fi
         if [ "$prune_archive_epoch" -le "$prune_archive_now" ] && \
             [ "$((prune_archive_now - prune_archive_epoch))" -gt "$prune_archive_seconds" ]; then
             if ! rm -f "$prune_archive_file"; then
@@ -2329,7 +2344,11 @@ watcher_deadman() {
             continue
         fi
         deadman_expires=$((deadman_now + 172800))
-        if ! queue_notice "$deadman_address" "$WATCHER_L3@$deadman_node" \
+        case "$WATCHER_L3" in
+            *@*) deadman_owner=$WATCHER_L3 ;;
+            *) deadman_owner=$WATCHER_L3@$deadman_node ;;
+        esac
+        if ! queue_notice "$deadman_address" "$deadman_owner" \
             "$deadman_urgency" "$deadman_subject" "$deadman_expires" "$deadman_body"; then
             rm -f "$deadman_body"
             sync_error "$deadman_marker: dead-man notice를 만들지 못했습니다"
@@ -2925,11 +2944,17 @@ cmd_send() {
                 ;;
         esac
     done
-    if ! positive_or_zero_integer "$send_ttl"; then
-        error "만료 초는 0 이상의 정수여야 합니다"
+    if ! bounded_integer "$send_ttl"; then
+        error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
         return 1
     fi
     send_ttl=$(normalize_integer "$send_ttl")
+    # The delivered-Id dedup log is kept 60 days; a letter that could still be
+    # retransmitted after its dedup entry expired would be installed twice.
+    if [ "$send_ttl" -gt 5097600 ]; then
+        error "만료 초는 5097600(59일) 이하여야 합니다 — dedup 기록 보존(60일) 안에 들어야 합니다"
+        return 1
+    fi
     case "$send_subject" in
         *'
 '*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
@@ -3592,9 +3617,13 @@ cmd_watcher() {
                 error "watcher cadence는 0 이상 18자리 이하의 정수여야 합니다"
                 return 1
             fi
-            if ! valid_name "$watcher_owner"; then
-                error "잘못된 watcher owner: $watcher_owner"
-                return 1
+            if ! valid_address "$watcher_owner"; then
+                if valid_name "$watcher_owner"; then
+                    watcher_owner=$watcher_owner@$(self_node) || return 1
+                else
+                    error "잘못된 watcher owner: $watcher_owner (session@node)"
+                    return 1
+                fi
             fi
             watcher_cadence=$(normalize_integer "$watcher_cadence")
             watcher_node=$(self_node) || return 1
@@ -4601,6 +4630,7 @@ cmd_inbox() {
                     inbox_drain_status=1
                     break
                 fi
+                touch "$inbox_cur_file" 2>/dev/null || :
                 drained_n=$((drained_n + 1))
                 drained_letters=$((drained_letters + 1))
                 drained_bytes=$((drained_bytes + file_bytes))
@@ -4649,6 +4679,7 @@ cmd_inbox() {
                     inbox_drain_status=1
                     break
                 fi
+                touch "$inbox_cur_file" 2>/dev/null || :
                 notice_from=$(header_value From "$inbox_cur_file")
                 notice_subject=$(header_value Subject "$inbox_cur_file")
                 notice_urgency=$(header_value Urgency "$inbox_cur_file")

@@ -25,6 +25,15 @@ count_files() {
     printf '%s\n' "$count_files_n"
 }
 
+first_file() {
+    for first_file_path in "$1"/*; do
+        [ -f "$first_file_path" ] || continue
+        printf '%s\n' "$first_file_path"
+        return 0
+    done
+    return 1
+}
+
 init_home() {
     init_home_path=$1
     KHALA_HOME=$init_home_path "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" ||
@@ -68,13 +77,13 @@ marker=$home/presence/guard@alpha.watcher
 declared=$(sed -n '1p' "$marker")
 [ "$declared" -gt 0 ] || die "declared epoch invalid"
 [ "$(sed -n '2p' "$marker")" = 10 ] || die "cadence differs"
-[ "$(sed -n '3p' "$marker")" = owner ] || die "owner differs"
+[ "$(sed -n '3p' "$marker")" = owner@alpha ] || die "owner differs"
 [ "$(sed -n '4p' "$marker")" = 0 ] || die "new declaration did not start at never"
 [ "$(sed -n '5p' "$marker")" = active ] || die "new declaration state differs"
 write_marker "$marker" "$declared" 10 owner 123 'silent 124'
 KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 30 --owner new-owner >/dev/null ||
     die "watcher re-declare failed"
-[ "$(sed -n '2p' "$marker")" = 30 ] && [ "$(sed -n '3p' "$marker")" = new-owner ] ||
+[ "$(sed -n '2p' "$marker")" = 30 ] && [ "$(sed -n '3p' "$marker")" = new-owner@alpha ] ||
     die "re-declare did not update cadence/owner"
 [ "$(sed -n '4p' "$marker")" = 123 ] && [ "$(sed -n '5p' "$marker")" = 'silent 124' ] ||
     die "re-declare did not preserve L4/L5"
@@ -82,14 +91,14 @@ write_marker "$home/presence/remote@beta.watcher" "$declared" 60 remote-owner 0 
 KHALA_HOME=$home "$KHALA" watcher list >"$RIG/list.out" || die "watcher list failed"
 head -n 1 "$RIG/list.out" | grep -qx $'NAME\tNODE\tOWNER\tCADENCE\tLAST\tSTATE' ||
     die "watcher list header differs"
-grep -q $'^guard\talpha\tnew-owner\t30\t.*\tsilent$' "$RIG/list.out" ||
+grep -q $'^guard\talpha\tnew-owner@alpha\t30\t.*\tsilent$' "$RIG/list.out" ||
     die "local watcher list row differs"
 grep -q $'^remote\tbeta\tremote-owner\t60\t-\tactive$' "$RIG/list.out" ||
     die "remote watcher list row differs"
 KHALA_HOME=$home "$KHALA" watcher retire guard >"$RIG/retire.out" || die "watcher retire failed"
 grep -Eq '^retired [0-9]+$' "$marker" || die "retire did not rewrite L1"
 KHALA_HOME=$home "$KHALA" watcher list >"$RIG/retired-list.out" || die "retired list failed"
-grep -q $'^guard\talpha\tnew-owner\t30\t.*\tretired$' "$RIG/retired-list.out" ||
+grep -q $'^guard\talpha\tnew-owner@alpha\t30\t.*\tretired$' "$RIG/retired-list.out" ||
     die "retired watcher row differs"
 printf 'ok P5 — watcher declare/list/retire and five-line marker\n'
 
@@ -107,7 +116,7 @@ KHALA_HOME=$home "$KHALA" presence >"$RIG/presence.out" || die "presence failed"
 grep -q '^guard@alpha' "$RIG/presence.out" && die "watcher leaked into main presence table"
 grep -q '^human@alpha' "$RIG/presence.out" || die "human missing from presence"
 grep -qx 'watchers:' "$RIG/presence.out" || die "presence watcher section missing"
-grep -q $'^guard\talpha\towner\t0\t-\tactive$' "$RIG/presence.out" ||
+grep -q $'^guard\talpha\towner@alpha\t0\t-\tactive$' "$RIG/presence.out" ||
     die "presence watcher row differs"
 KHALA_HOME=$home "$KHALA" presence --watchers >"$RIG/only-watchers.out" ||
     die "presence --watchers failed"
@@ -198,5 +207,21 @@ KHALA_HOME=$home KHALA_SESSION=guard "$KHALA" bind --register starting \
     >"$RIG/bind-retired.out" 2>"$RIG/bind-retired.err" || die "retired watcher registration failed"
 [ -s "$log" ] || die "retired watcher registration did not reach runtime"
 printf 'ok P8 — live watcher identity cannot acquire a session lease\n'
+
+
+# P5b — the owner is a full address; a remote owner receives the dead-man notice in its node's spool
+# (GPT-Pro P0-2, 2026-09-02).
+home=$RIG/remote-owner
+KHALA_HOME=$home "$KHALA" init alpha >/dev/null 2>&1 || die "remote-owner init failed"
+KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 60 --owner steno@beta >/dev/null || die "remote owner declare failed"
+marker=$home/presence/guard@alpha.watcher
+now=$(date +%s)
+printf '%s\n60\nsteno@beta\n%s\nactive\n' "$((now - 1000))" "$((now - 1000))" > "$marker"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>&1 || die "remote-owner reconcile failed"
+deadman=$(first_file "$home/spool/for/beta") || die "dead-man notice for a remote owner was not spooled to its node"
+grep -q '^To: steno@beta$' "$deadman" || die "dead-man notice is not addressed to the remote owner"
+KHALA_HOME=$home "$KHALA" watcher declare local --cadence 60 --owner steno >/dev/null || die "bare owner declare failed"
+grep -q '^steno@alpha$' "$home/presence/local@alpha.watcher" || die "bare owner was not qualified with the local node"
+printf 'ok P5b — owner is a full address; remote owners get the dead-man notice via their node spool\n'
 
 printf 'RESULT: PASS\n'

@@ -483,7 +483,7 @@ property_13() {
 property_14() {
     home=$RIG/p14-home
     init_home "$home" alpha
-    future=$(( $(date +%s) + 86401 ))
+    future=$(( $(date +%s) + 90000 ))  # > now+86400 with slack: the check runs seconds later under load
     future_id=$(write_entry "$home" khala alpha timewarp "$future" 'future reconcile') || die "future fixture failed"
     if KHALA_HOME=$home "$KHALA" reconcile >"$RIG/p14-rec.out" 2>"$RIG/p14-rec.err"; then
         :

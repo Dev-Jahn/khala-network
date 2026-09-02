@@ -161,6 +161,26 @@ khala watcher list | retire <name>
 - 옵션(작음): `KHALA_SESSION`이 **빈 문자열로 set**이면 "unset"으로 보고 stderr 경고 — 조용한 폴백이 아니라 경고 있는
   정정. 결정 §6-5에 묶음.
 
+### A8. GPT-Pro 검토 반영 (2026-09-02, review/gpt-pro-d17-review.md)
+
+릴리스 관문 3건(P0)을 코드에 반영했다(2ca2ac7):
+- **notice 보관**: rsync 폴백의 `remove_pushed_infrastructure`가 notice를 우체통 push 직후 지우던 것을 중단. 발신 노드가
+  `Expires`까지 스풀 사본을 보관하고 수신 노드가 Id로 중복을 흡수한다(R4). Go 링크 경로는 원래 원본을 보존했다.
+- **보존 시계**: `inbox/cur`·`outbox/acked`·`dead`의 나이를 Id epoch가 아니라 **상태 진입 시각**(drain/ack/만료 이동 시
+  mtime touch)으로 잰다. `send -e`는 59일 상한(dedup 기록 60일 안).
+- **워처 마커**: owner는 전체 주소(`session@node`, 원격 허용 — dead-man notice가 owner 노드 스풀로 감). 마커는 워처 노드
+  단독 쓰기, rsync 폴백도 `.watcher`를 push, 링크 installer는 L1 epoch 역행을 거부(퇴역 tombstone을 옛 사본이 되살리지 못함).
+  검토가 권한 "L5를 복제에서 제거"는 미적용 — 현 구현에서 L5를 쓰는 것도 워처 노드 자신뿐이라 다중 writer가 없다.
+
+받아들였지만 0.8.0에 넣지 않은 것(0.8.1 후보, 태스크로 등록): A1 "info 억제는 선언된 워처 발신자에게만"(발신자 검증), A2 "info만
+남은 편지함은 6시간 뒤 later 초인종 1회"(conduit의 first-seen 추적), A7 재울림 빈도 완화(10분→30분→…), A8 `retry:`를
+`ring-index`/`pending-for`로 교체(attemptIndex는 성공 쓰기 횟수가 아니다 — 지적이 맞다). 사실 5 정정: runtime 경로는
+`KHALA_RUNTIME_DIR` > `/run/user/<uid>/khala`(소유 검사 통과 시) > `/tmp/khala-<uid>`, macOS는 `$TMPDIR/khala-<uid>`.
+
+B·C에 대한 권고는 §3·§4 착수 전에 반영한다: `Type: user`→`Type: operator`+Ed25519 서명(게이트웨이 키), 슈퍼그룹 대신
+**개인 채팅 토픽**(Bot API 9.3, 2025-12-31), 세션별 `.ear` 대신 노드당 `ears` 스냅샷(세대·지역 first-seen·drain 텔레메트리),
+B5의 필수 실측 10항목.
+
 ### A7. steno·clawd 이행
 
 - steno: `khala_notify.sh`의 `send … --as "$AS"` → `notify … --as "$AS" [--urgent]`(즉시=`--urgent`, `--later`=기본

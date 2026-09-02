@@ -407,3 +407,39 @@ func TestRecoverStaleTmpMovesWithoutUnlink(t *testing.T) {
 		t.Fatalf("recovered matches=%v err=%v", matches, err)
 	}
 }
+
+func TestWatcherDeclarationNeverRegresses(t *testing.T) {
+	home := testKhalaHome(t)
+	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	newer := []byte("1700000100\n600\nsteno@b200\n1700000100\nactive\n")
+	older := []byte("1700000000\n600\nsteno@b200\n1700000000\nactive\n")
+	tomb := []byte("retired 1700000200\n600\nsteno@b200\n1700000100\nactive\n")
+	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha.watcher", newer), newer); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha.watcher", older), older); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(filepath.Join(home, "presence", "guard@alpha.watcher"))
+	if string(got) != string(newer) {
+		t.Fatalf("older declaration overwrote newer: %q", got)
+	}
+	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha.watcher", tomb), tomb); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(filepath.Join(home, "presence", "guard@alpha.watcher"))
+	if string(got) != string(tomb) {
+		t.Fatalf("retired tombstone with a higher epoch was not installed: %q", got)
+	}
+	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha.watcher", newer), newer); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = os.ReadFile(filepath.Join(home, "presence", "guard@alpha.watcher"))
+	if string(got) != string(tomb) {
+		t.Fatalf("an older active copy revived a retired watcher: %q", got)
+	}
+	plain := []byte("1700000050\n")
+	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha", plain), plain); err != nil {
+		t.Fatal(err)
+	}
+}

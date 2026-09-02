@@ -247,8 +247,14 @@ write_letter "$home" reader "$now.2.4.live@alpha" live@alpha notice info live "$
 mv "$home/inbox/reader/new/$now.2.4.live@alpha" "$home/inbox/reader/cur/$now.2.4.live@alpha"
 write_letter "$home" reader "$old.2.5.archive@alpha" archive@alpha message '' old-cur "$future" old
 mv "$home/inbox/reader/new/$old.2.5.archive@alpha" "$home/inbox/reader/cur/$old.2.5.archive@alpha"
+# retention counts from the time the file entered cur/ (its mtime), so age it explicitly
+touch -d "@$old" "$home/inbox/reader/cur/$old.2.5.archive@alpha" 2>/dev/null ||
+    touch -t "$(date -r "$old" +%Y%m%d%H%M.%S 2>/dev/null)" "$home/inbox/reader/cur/$old.2.5.archive@alpha"
 for archive_dir in outbox/acked outbox/dead; do
     cp "$home/inbox/reader/new/$old.2.1.oldmail@alpha" "$home/$archive_dir/$old.2.1.oldmail@alpha"
+    # retention ages from the time the file entered acked/dead (its mtime)
+    touch -d "@$old" "$home/$archive_dir/$old.2.1.oldmail@alpha" 2>/dev/null ||
+        touch -t "$(date -r "$old" +%Y%m%d%H%M.%S 2>/dev/null)" "$home/$archive_dir/$old.2.1.oldmail@alpha"
 done
 mkdir -p "$home/spool/for/beta"
 cp "$home/inbox/reader/cur/$old.2.3.oldnotice@alpha" "$home/spool/for/beta/$old.2.3.oldnotice@alpha"
@@ -387,5 +393,39 @@ rm -f "$home/run/reconcile.trigger"
 printf '' | KHALA_HOME=$home "$KHALA" notify reader@beta --as guard -s remote >/dev/null 2>&1 || die "remote notify failed"
 [ ! -f "$home/run/reconcile.trigger" ] || die "remote notify wrote a trigger it does not need"
 printf 'ok P1b — same-node notify triggers reconcile; remote notify does not\n'
+
+
+# P1c — a notice keeps its source spool copy: no outbox, and reconcile (which runs the
+# same infrastructure pruning the rsync fallback uses) leaves an unexpired copy in place
+# (GPT-Pro P0-1, 2026-09-02). The mailbox accepting bytes is not delivery.
+home=$RIG/custody
+init_home "$home"
+printf '' | KHALA_HOME=$home "$KHALA" notify reader@beta --as guard -s custody >/dev/null 2>&1 || die "custody notify failed"
+notice_copy=$(first_file "$home/spool/for/beta") || die "custody notice missing from spool"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>&1 || die "custody reconcile failed"
+[ -f "$notice_copy" ] || die "reconcile removed an unexpired notice source copy"
+[ "$(count_files "$home/outbox/new")" -eq 0 ] || die "notice entered outbox/new"
+grep -q 'ack|bounce)' "$KHALA" || die "remove_pushed_infrastructure still deletes notices after a push"
+! grep -q 'ack|bounce|notice)' "$KHALA" || die "remove_pushed_infrastructure still lists notice"
+printf 'ok P1c — notice source copy survives reconcile and is excluded from post-push removal\n'
+
+# P4d — retention counts from the time a letter entered cur/, not from its Id epoch (GPT-Pro P0-3).
+home=$RIG/state-clock
+init_home "$home"
+now=$(date +%s)
+old_id="$((now - 40 * 86400)).1.1.sender@alpha"
+write_letter "$home" reader "$old_id" sender@alpha message '' waited "$((now + 99999))" body
+KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >/dev/null 2>&1 || die "state-clock drain failed"
+[ -f "$home/inbox/reader/cur/$old_id" ] || die "drained letter not in cur"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>&1 || die "state-clock reconcile failed"
+[ -f "$home/inbox/reader/cur/$old_id" ] || die "a letter drained today was pruned because its Id is old"
+touch -d '@'"$((now - 40 * 86400))" "$home/inbox/reader/cur/$old_id" 2>/dev/null || touch -t "$(date -r $((now - 40 * 86400)) +%Y%m%d%H%M.%S 2>/dev/null || date -d @$((now - 40 * 86400)) +%Y%m%d%H%M.%S)" "$home/inbox/reader/cur/$old_id"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>&1 || die "state-clock reconcile 2 failed"
+[ ! -f "$home/inbox/reader/cur/$old_id" ] || die "a letter in cur for 40 days was not pruned"
+if KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" send other@alpha -s ttl -m x -e 6000000 >/dev/null 2>"$RIG/ttl.err"; then
+    die "send accepted a TTL beyond the dedup horizon"
+fi
+grep -q 5097600 "$RIG/ttl.err" || die "TTL refusal does not name the cap"
+printf 'ok P4d — retention uses state-entry time; send TTL is capped below the dedup horizon\n'
 
 printf 'RESULT: PASS\n'

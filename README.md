@@ -72,7 +72,7 @@ khala notify operator@hub --as gpu-guard -s "GPU 2 recovered" <<'NOTICE'
 Utilization and memory returned to normal.
 NOTICE
 khala notify operator@hub --as gpu-guard --urgent -s "GPU 2 stalled" </dev/null
-khala watcher declare gpu-guard --cadence 600 --owner operator
+khala watcher declare gpu-guard --cadence 600 --owner operator@hub
 khala watcher list
 khala watcher retire gpu-guard
 ```
