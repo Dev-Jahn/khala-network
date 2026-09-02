@@ -174,7 +174,8 @@ property_4() {
         die "SIGPIPE did not move all eight letters to cur"
     KHALA_HOME=$p4_home KHALA_SESSION=reader "$KHALA" inbox --drain \
         > "$RIG/p4-second.out" || die "second drain failed"
-    [ ! -s "$RIG/p4-second.out" ] || die "second drain redelivered letters"
+    [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p4-second.out")" -eq 0 ] ||
+        die "second drain redelivered letters"
 }
 
 property_5() {

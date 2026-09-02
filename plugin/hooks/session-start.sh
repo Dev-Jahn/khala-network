@@ -166,7 +166,15 @@ fi
 
 khala_new_dir=$KHALA_ROOT/inbox/$KHALA_RESOLVED_SESSION/new
 khala_before=$(khala_count_files "$khala_new_dir")
-khala_drained=0
+khala_before_snapshot=$KHALA_ROOT/tmp/session-before.$$
+: > "$khala_before_snapshot"
+for khala_before_path in "$khala_new_dir"/*; do
+    [ -f "$khala_before_path" ] || continue
+    khala_before_type=$(sed -n '/^$/q; s/^Type: //p' "$khala_before_path")
+    printf '%s\t%s\n' "$khala_before_type" "$khala_before_path" >> "$khala_before_snapshot"
+done
+khala_drained_letters=0
+khala_drained_notices=0
 if [ "$khala_hook_owner" = yes ]; then
     khala_drain_out=$KHALA_ROOT/tmp/session-drain.$$
     khala_drain_err=$KHALA_ROOT/tmp/session-drain.$$.err
@@ -185,13 +193,20 @@ if [ "$khala_hook_owner" = yes ]; then
     [ ! -f "$khala_drain_out" ] || cat "$khala_drain_out"
     [ ! -s "$khala_drain_err" ] || cat "$khala_drain_err" >&2
     rm -f "$khala_drain_out" "$khala_drain_err"
-    khala_after=$(khala_count_files "$khala_new_dir")
-    khala_drained=$((khala_before - khala_after))
-    [ "$khala_drained" -ge 0 ] || khala_drained=0
+    while IFS="$(printf '\t')" read -r khala_before_type khala_before_path; do
+        [ -n "${khala_before_path-}" ] || continue
+        [ ! -e "$khala_before_path" ] || continue
+        if [ "$khala_before_type" = notice ]; then
+            khala_drained_notices=$((khala_drained_notices + 1))
+        else
+            khala_drained_letters=$((khala_drained_letters + 1))
+        fi
+    done < "$khala_before_snapshot"
 else
     printf 'khala: you are not the receiver of %s — set KHALA_SESSION=<other> or `khala bind --takeover` (pending %s)\n' \
         "$KHALA_RESOLVED_SESSION" "$khala_before"
 fi
+rm -f "$khala_before_snapshot"
 
 khala_aux_out=$KHALA_ROOT/tmp/session-aux.$$
 khala_aux_err=$KHALA_ROOT/tmp/session-aux.$$.err
@@ -205,6 +220,7 @@ rm -f "$khala_aux_out" "$khala_aux_err"
 [ -z "$khala_join_job" ] || wait "$khala_join_job" 2>/dev/null || :
 rm -f "$khala_join_out" "$khala_join_err"
 
-printf 'khala: %s@%s — registration ready, lease %s, 편지 %s건 드레인\n' \
-    "$KHALA_RESOLVED_SESSION" "$KHALA_NODE" "$khala_hook_owner" "$khala_drained"
+printf 'khala: %s@%s — registration ready, lease %s, 편지 %s건·알림 %s건 드레인\n' \
+    "$KHALA_RESOLVED_SESSION" "$KHALA_NODE" "$khala_hook_owner" \
+    "$khala_drained_letters" "$khala_drained_notices"
 exit 0

@@ -200,6 +200,19 @@ func (f *conduitFixture) stageLetter(identity string) {
 	}
 }
 
+func (f *conduitFixture) stageEnvelope(identity, id, content string) string {
+	f.t.Helper()
+	dir := filepath.Join(f.home, "inbox", identity, "new")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	path := filepath.Join(dir, id)
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		f.t.Fatal(err)
+	}
+	return path
+}
+
 func readLeaseForTest(t *testing.T, path string) identityLease {
 	t.Helper()
 	var lease identityLease
@@ -218,6 +231,188 @@ func waitForTest(timeout time.Duration, condition func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return condition()
+}
+
+func TestNoticeClassificationShapesSocketAndChannelDoorbells(t *testing.T) {
+	f := newConduitFixture(t)
+	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nType: message\nSubject: hello\nPriority: later\n\nbody\n")
+	f.stageEnvelope("ink", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	f.stageEnvelope("ink", "3.urgent", "From: gpu@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
+	f.stageEnvelope("ink", "4.malformed", "From: disk@alpha\nType: notice\nUrgency: banana\nSubject: full\n\nbody\n")
+	f.stageEnvelope("ink", "5.missing-urgency", "From: clock@alpha\nType: notice\nSubject: late\n\nbody\n")
+	f.stageEnvelope("ink", "6.unknown", "From: legacy@alpha\nType: future\nSubject: old\n\nbody\n")
+	f.stageEnvelope("ink", "7.body-control", "From: body@alpha\nSubject: envelope wins\n\nType: notice\nUrgency: info\n")
+
+	letters := f.conduit.pending("ink")
+	ringIDs := []pendingLetter{{id: "1.mail"}, {id: "3.urgent"}, {id: "4.malformed"}, {id: "5.missing-urgency"}, {id: "6.unknown"}, {id: "7.body-control"}}
+	wantGeneration := letterGeneration(ringIDs)
+	if got := letterGeneration(letters); got != wantGeneration {
+		t.Fatalf("generation=%s want ring-set generation %s", got, wantGeneration)
+	}
+
+	frame := f.conduit.frame("ink", wantGeneration, "attempt-1", 2, letters)
+	message := frame["message"].(map[string]string)["content"]
+	wantFrame := "KHALA-CONDUIT/1\n" +
+		"recipient: ink@alpha\n" +
+		"pending: 3\n" +
+		"notices: 4\n" +
+		"urgent: 3\n" +
+		"streams: 0\n" +
+		"from: alice@alpha, gpu@alpha, disk@alpha, clock@alpha, legacy@alpha, body@alpha\n" +
+		"subjects: hello; U · hot; U · full; U · late; old; envelope wins\n" +
+		"generation: " + wantGeneration + "\n" +
+		"attempt: attempt-1\n" +
+		"retry: 2\n" +
+		"read: khala inbox --drain"
+	if message != wantFrame {
+		t.Fatalf("socket frame mismatch:\n%s\nwant:\n%s", message, wantFrame)
+	}
+	if got := frame["priority"]; got != "next" {
+		t.Fatalf("socket priority=%v want next", got)
+	}
+
+	request := f.conduit.channelRequest(wantGeneration, "attempt-1", 2, letters)
+	meta := request["meta"].(map[string]string)
+	for key, want := range map[string]string{
+		"pending": "3", "notices": "4", "urgent": "3", "generation": wantGeneration, "retry": "2",
+	} {
+		if got := meta[key]; got != want {
+			t.Errorf("channel meta[%q]=%q want %q", key, got, want)
+		}
+	}
+	wantChannel := "alice@alpha · hello\n" +
+		"gpu@alpha · U · hot\n" +
+		"disk@alpha · U · full\n" +
+		"clock@alpha · U · late\n" +
+		"legacy@alpha · old\n" +
+		"body@alpha · envelope wins\n" +
+		"3 letters, 4 notices — run khala_drain"
+	if got := request["content"]; got != wantChannel {
+		t.Fatalf("channel content=%q want %q", got, wantChannel)
+	}
+}
+
+func TestInfoNoticeDoesNotAffectGenerationOrPriorityAndNeverRingsAlone(t *testing.T) {
+	f := newConduitFixture(t)
+	f.stageEnvelope("mixed", "1.mail", "From: alice@alpha\nType: message\nPriority: later\nSubject: wait\n\nbody\n")
+	f.stageEnvelope("mixed", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	letters := f.conduit.pending("mixed")
+	if got, want := letterGeneration(letters), letterGeneration([]pendingLetter{{id: "1.mail"}}); got != want {
+		t.Fatalf("info notice changed generation: got %s want %s", got, want)
+	}
+	if got := doorbellPriority(letters); got != "later" {
+		t.Fatalf("info notice changed priority to %q, want later", got)
+	}
+
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageEnvelope("ink", "1.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"] = &conduitState{generation: "stale"}
+	f.conduit.statesMu.Unlock()
+	f.conduit.scan()
+	time.Sleep(100 * time.Millisecond)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
+		t.Fatalf("info-only inbox rang %d times, want 0", got)
+	}
+	f.conduit.statesMu.Lock()
+	_, stateExists := f.conduit.states["ink"]
+	f.conduit.statesMu.Unlock()
+	if stateExists {
+		t.Fatal("info-only inbox retained ring state")
+	}
+	if entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID)); !os.IsNotExist(err) || len(entries) != 0 {
+		t.Fatalf("info-only inbox journaled delivery: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
+	f := newConduitFixture(t)
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	oldPath := f.stageEnvelope("ink", "1.old", "From: alice@alpha\nType: message\nSubject: old\n\nbody\n")
+	oldLetters := f.conduit.pending("ink")
+
+	originalHook := conduitBeforeDoorbellWrite
+	t.Cleanup(func() { conduitBeforeDoorbellWrite = originalHook })
+	conduitBeforeDoorbellWrite = func(identity string) {
+		if identity != "ink" {
+			t.Fatalf("pre-write hook identity=%q want ink", identity)
+		}
+		cur := filepath.Join(f.home, "inbox", identity, "cur")
+		if err := os.MkdirAll(cur, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(oldPath, filepath.Join(cur, filepath.Base(oldPath))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.conduit.scan()
+	time.Sleep(100 * time.Millisecond)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
+		t.Fatalf("stale generation wrote %d socket frames, want 0", got)
+	}
+	if !strings.Contains(f.logs.String(), "doorbell skipped: generation changed before write (ink)") {
+		t.Fatalf("missing generation-change log: %s", f.logs.String())
+	}
+	f.conduit.statesMu.Lock()
+	_, stateExists := f.conduit.states["ink"]
+	f.conduit.statesMu.Unlock()
+	if stateExists {
+		t.Fatal("empty ring set retained state after pre-write re-check")
+	}
+	journalDir := filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID)
+	if entries, err := os.ReadDir(journalDir); !os.IsNotExist(err) || len(entries) != 0 {
+		t.Fatalf("abandoned write was journaled: entries=%v err=%v", entries, err)
+	}
+
+	conduitBeforeDoorbellWrite = nil
+	f.stageEnvelope("ink", "2.fresh", "From: bob@alpha\nType: message\nSubject: fresh\n\nbody\n")
+	freshLetters := f.conduit.pending("ink")
+	freshGeneration := letterGeneration(freshLetters)
+	if freshGeneration == letterGeneration(oldLetters) {
+		t.Fatal("fresh fixture did not change generation")
+	}
+	f.conduit.scan()
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("fresh generation did not ring")
+	}
+	entries, err := os.ReadDir(journalDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("fresh delivery journal entries=%d err=%v", len(entries), err)
+	}
+	var journal deliveryJournal
+	if err := readJSON(filepath.Join(journalDir, entries[0].Name()), &journal); err != nil {
+		t.Fatal(err)
+	}
+	if journal.Generation != freshGeneration || strings.Join(journal.LetterIDs, ",") != "2.fresh" {
+		t.Fatalf("fresh journal generation=%q ids=%v, want %q [2.fresh]", journal.Generation, journal.LetterIDs, freshGeneration)
+	}
+}
+
+func TestConduitPreWriteRecheckAllowsUnchangedGenerationOnce(t *testing.T) {
+	f := newConduitFixture(t)
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageLetter("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+
+	originalHook := conduitBeforeDoorbellWrite
+	t.Cleanup(func() { conduitBeforeDoorbellWrite = originalHook })
+	hookCalls := 0
+	conduitBeforeDoorbellWrite = func(string) { hookCalls++ }
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("unchanged generation did not ring")
+	}
+	if hookCalls != 1 {
+		t.Fatalf("pre-write hook calls=%d want 1", hookCalls)
+	}
+	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("unchanged delivery journal entries=%d err=%v", len(entries), err)
+	}
 }
 
 func TestCurrentBootIDPrefersDarwinBootSessionUUID(t *testing.T) {

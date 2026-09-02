@@ -437,6 +437,7 @@ outbox/dead/              # dead-letter (§5.2 bounce 1회성의 종착지)
 spool/for/<node>/         # 라우팅 큐; 우체통 노드에선 교환 지점
 inbox/<session>/new|cur/  # 세션별 우편함 (드레인이 new→cur 이동)
 presence/<session>        # heartbeat 파일 (내용 = epoch 한 줄)
+presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (5행)
 log/delivered             # dedup 로그: "<epoch> <msg_id>" 줄
 tmp/
 ```
@@ -461,14 +462,48 @@ Id: <epoch>.<pid>.<rand>.<session>@<node>
 From: <session@node>
 To: <session@node>
 Date: <ISO8601 UTC>
-Type: message | ack | bounce | notice
-Refs: <id>                # ack/bounce/notice만
+Type: message | ack | bounce
+Refs: <id>                # ack/bounce만
 Subject: <한 줄>          # 선택 (send -s; 줄바꿈 금지) — r7에서 비준
 Priority: later           # 선택 (send --later) — conduit 초인종을 세션 idle까지 미룸; 기본(헤더 없음)은 next (0.5.5)
 Expires: <epoch>          # 미지정 시 발신 +30일 (문서화된 기본값 — 영원한 재전송 없음)
 <빈 줄>
 본문 (UTF-8 텍스트. 이진 첨부 필요 = Go 전환 트리거, §9.2)
 ```
+
+notice 파일 (헤더 순서 고정, `Subject`만 선택):
+
+```
+Khala: 0.1
+Id: <epoch>.<pid>.<rand>.<watcher>@<node>
+From: <watcher>@<node>
+To: <session>@<node>
+Date: <ISO8601 UTC>
+Type: notice
+Urgency: urgent | info
+Subject: <한 줄>          # 선택
+Expires: <epoch>          # 기본 발신 +2일
+<빈 줄>
+본문
+```
+
+notice의 제어 필드는 봉투에서만 읽는다. `Urgency: info`만 quiet이며, urgency가
+`urgent`이거나 없거나 다른 값이면 보수적으로 urgent로 분류한다. notice에는
+`Refs`, `In-Reply-To`, `Priority`가 없다.
+
+watcher marker `presence/<name>@<node>.watcher` (5행, 전체를 원자 교체):
+
+```
+<declared-epoch> | retired <epoch>
+<cadence-seconds>                 # 0 = unknown, dead-man 없음
+<owner-session> | -
+<last-notify-epoch>               # 0 = never
+active | silent <since-epoch>
+```
+
+`notify --as`는 plain heartbeat를 쓰지 않고 marker의 4행만 갱신한다. marker가
+없으면 cadence 0, owner `-`, active로 한 번 안내하고 자동 선언한다. 삭제는
+복제되지 않으므로 retire는 1행을 다시 쓴다.
 
 타입별 취급:
 
@@ -481,7 +516,8 @@ Expires: <epoch>          # 미지정 시 발신 +30일 (문서화된 기본값 
   해당 message 사본 삭제** (재전송 중단). **dead의 원문은 ack가 와도 dead에 남는다** —
   만료 판정은 발신자의 최종 판정이고, bounce 이후 도착한 ack는 상태를 되돌리지 않는다
   (r10, soul-jar 리뷰 비준).
-- **bounce / notice** → 해당 세션 inbox로 배달 (bounce는 1회성, 재반송 없음 — §5.2).
+- **bounce / notice** → 해당 세션 inbox로 fire-and-forget 배달 (bounce는 1회성,
+  재반송 없음 — §5.2). notice는 ack를 만들지 않는다.
 
 spool 사본의 수명 (타입별):
 
@@ -525,6 +561,12 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   로그**. 30일 = Expires 기본값과 같은 상수 계열(§9.6 메시지 포맷) — 정상 메시지가
   spool에 그보다 오래 머물 수 없으므로, 그 나이의 파싱 불능 파일은 배달물이 아니라
   잔해다. 이송이지 삭제가 아님(silent 소멸 금지) — 부검 가능하게 남긴다.
+- retention (0.8.0): `Expires`가 지난 notice는 `spool/for/*`와
+  `inbox/*/new|cur`에서 조용히 삭제하며 배달 직전 만료도 drop한다.
+  `inbox/*/cur`, `outbox/acked`, `outbox/dead`는 Id epoch가 `retain`일(기본 30)보다
+  오래되면 삭제한다. `inbox/*/new`의 mail은 retention으로 절대 삭제하지 않는다.
+  `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
+  last-notify가 모두 오래됐을 때만 삭제한다.
 
 **한 머신 마일스톤 = (a)+(c) 경로의 실증** (self=우체통이라 (b)=no-op). cross-machine은
 (b)의 rsync만 추가 — 코드 경로가 같아서 에뮬레이션이 아니라 부분집합이다.
@@ -534,9 +576,14 @@ CLI 인터페이스 (한 머신 마일스톤 범위):
 - `khala init <자기별칭>` — 디렉터리 생성(0700), config 골격, identity 기록.
 - `khala send <session@node> [-s 제목] [-e 만료초]` — 본문은 stdin 또는 `-m`.
   발신 세션명: `--as` > `$KHALA_SESSION` > `$PWD` basename (D5). 안착 = 성공(§5.2).
+- `khala notify <session@node> --as <watcher> [-s 제목] [--urgent] [-e 만료초]` —
+  본문은 stdin, outbox/ack 없음. 기본 info/2일.
+- `khala watcher declare <name> --cadence <초> --owner <session> | list | retire <name>` —
+  machine identity와 dead-man 상태 관리.
 - `khala sync` — 위 한 사이클. 실패는 파일 단위로 소리 내고 계속(R10) — 전체 abort 금지.
 - `khala reconcile` — (a)+(c)만 한 패스 실행하며 네트워크 I/O는 하지 않는다.
-- `khala inbox [--drain [--max-n N] [--max-bytes B]]` — 목록/드레인(new→cur).
+- `khala inbox [--drain [--max-n N] [--max-bytes B] [--max-notices N]
+  [--max-notice-bytes B] [--mail-only|--notices-only]]` — 목록/드레인(new→cur).
   상한 초과분은 "N건 더 (발신자 목록)" 요약만 (§5.5). 기본 상한 = 20건 / 65536바이트
   (r7에서 비준).
 - `khala presence` — 4상태 표. send/inbox는 자기 heartbeat를 갱신하고 presence는 순수

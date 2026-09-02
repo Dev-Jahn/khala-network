@@ -172,7 +172,8 @@ property_2() {
     grep -Fq "$entry_id" "$RIG/p2-first.out" || die "first drain missed the entry"
     KHALA_HOME=$home_b KHALA_SESSION=reader "$KHALA" inbox --drain \
         >"$RIG/p2-second.out" 2>"$RIG/p2-second.err" || die "second drain failed"
-    [ ! -s "$RIG/p2-second.out" ] || die "second drain redelivered an entry"
+    [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p2-second.out")" -eq 0 ] ||
+        die "second drain redelivered an entry"
     [ "$(sed -n '1p' "$home_b/cursor/reader/khala")" = "$entry_id" ] ||
         die "cursor did not record the drained Id"
 }
@@ -320,7 +321,8 @@ property_6() {
     rm -f "$flight_control"
     wait "$flight_inject_pid" || die "in-flight injector failed"
     [ ! -s "$RIG/p6-flight-watch.out" ] || die "expired watch produced output"
-    [ ! -s "$RIG/p6-flight-drain.out" ] || die "expired entry appeared in drain"
+    [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p6-flight-drain.out")" -eq 0 ] ||
+        die "expired entry appeared in drain"
     [ ! -e "$home_a/cursor/flight-reader/flight" ] || die "expired entry advanced the cursor"
 }
 

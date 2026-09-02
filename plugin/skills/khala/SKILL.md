@@ -50,6 +50,15 @@ SendMessage) or `later` when every pending letter was sent with `--later`; the
 conduit never mints `now`. Sessions arm and re-arm nothing: the node conduit owns the
 ear, while `inbox/<identity>/new` remains the durable truth.
 
+## Notices
+
+Machine senders use `khala notify <session@node> --as <watcher> -s "subject"`
+and a quoted heredoc for any nontrivial body. A notice needs no ack or reply.
+Info notices never ring; `--urgent` notices ring like mail. Drain prints mail,
+then notices, then streams, and always ends with
+`drained: letters L, notices N, streams S`. Use `khala watcher declare/list/retire`
+to publish machine identities and configure cadence/dead-man notification.
+
 ## When the khala channel is on
 
 Start an interactive session with

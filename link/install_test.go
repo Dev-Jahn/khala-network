@@ -122,6 +122,27 @@ func TestMutablePresenceLeaseReplacesAtomically(t *testing.T) {
 	}
 }
 
+func TestPresenceMarkerSuffixesInstallOnDialAndServe(t *testing.T) {
+	home := testKhalaHome(t)
+	for _, name := range []string{"ear@alpha.watching", "gpu-guard@alpha.watcher", "steno@alpha.ear"} {
+		o := testOffer("presence", "alpha", name, []byte("marker"))
+		for _, endpoint := range []struct{ role, peer string }{
+			{role: "dial", peer: "beta"},
+			{role: "serve", peer: "alpha"},
+		} {
+			installer := &installer{home: home, role: endpoint.role, peer: endpoint.peer, logger: testLogger{t}}
+			dest, err := installer.destination(o)
+			if err != nil {
+				t.Errorf("%s rejected %q: %v", installer.role, name, err)
+				continue
+			}
+			if want := filepath.Join(home, "presence", name); dest != want {
+				t.Errorf("%s destination=%q want %q", installer.role, dest, want)
+			}
+		}
+	}
+}
+
 func TestRoleOwnershipRejectsReflectionAndTraversal(t *testing.T) {
 	home := testKhalaHome(t)
 	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}

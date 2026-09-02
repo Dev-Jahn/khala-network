@@ -55,3 +55,14 @@ func TestGenerationValidationMatchesBrainGrammar(t *testing.T) {
 		}
 	}
 }
+
+func TestPresenceNodeAcceptsMarkerSuffixes(t *testing.T) {
+	for _, name := range []string{
+		"ear@alpha", "ear@alpha.watching", "gpu-guard@alpha.watcher", "steno@alpha.ear",
+	} {
+		node, ok := presenceNode(name)
+		if !ok || node != "alpha" {
+			t.Errorf("presenceNode(%q)=(%q, %t), want (alpha, true)", name, node, ok)
+		}
+	}
+}

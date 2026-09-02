@@ -158,7 +158,8 @@ if ! KHALA_SESSION=alice "$KHALA" inbox --drain \
     >"$TEST_DIR/drain-2.out" 2>"$TEST_DIR/drain-2.err"; then
     fail 7 "second drain failed: $(tr '\n' ' ' < "$TEST_DIR/drain-2.err")"
 fi
-[ ! -s "$TEST_DIR/drain-2.out" ] || fail 7 "second drain printed an old message"
+[ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$TEST_DIR/drain-2.out")" -eq 0 ] ||
+    fail 7 "second drain printed an old message"
 pass 7 "inbox drain moves new to cur exactly once"
 
 # 8. Expire an unread message and receive one bounce only.

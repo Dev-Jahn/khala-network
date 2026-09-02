@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.7.3
+KHALA_VERSION=0.8.0
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -53,6 +53,10 @@ usage() {
             printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]'
             return 0
             ;;
+        notify)
+            printf '%s\n' 'usage: khala notify <session@node> --as <watcher> [-s|--subject subject] [--urgent] [-e seconds]'
+            return 0
+            ;;
         say)
             printf '%s\n' 'usage: khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]'
             return 0
@@ -67,6 +71,12 @@ usage() {
             return 0
             ;;
         minds) printf '%s\n' 'usage: khala minds'; return 0 ;;
+        watcher)
+            printf '%s\n' 'usage: khala watcher declare <name> --cadence <seconds> --owner <session>'
+            printf '%s\n' '       khala watcher list'
+            printf '%s\n' '       khala watcher retire <name>'
+            return 0
+            ;;
         retire) printf '%s\n' 'usage: khala retire <session>'; return 0 ;;
         reconcile) printf '%s\n' 'usage: khala reconcile'; return 0 ;;
         sync) printf '%s\n' 'usage: khala sync'; return 0 ;;
@@ -80,10 +90,10 @@ usage() {
             return 0
             ;;
         inbox)
-            printf '%s\n' 'usage: khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B]]'
+            printf '%s\n' 'usage: khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]'
             return 0
             ;;
-        presence) printf '%s\n' 'usage: khala presence'; return 0 ;;
+        presence) printf '%s\n' 'usage: khala presence [--watchers]'; return 0 ;;
     esac
     cat >&2 <<'EOF'
 usage:
@@ -91,6 +101,7 @@ usage:
   khala init <node>
   khala invite <ssh-target> --name <alias> [--mailbox-coord <user@host>]
   khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]
+  khala notify <session@node> --as <watcher> [-s|--subject subject] [--urgent] [-e seconds]
   khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]
   khala join <stream> [--from-start] [--quiet]
   khala leave <stream>
@@ -99,14 +110,17 @@ usage:
   khala mind (-m focus [--stance stance] | --clear)
   khala profile [--model model] [--effort effort] [--role role] [--charge charge]
   khala minds
+  khala watcher declare <name> --cadence <seconds> --owner <session>
+  khala watcher list
+  khala watcher retire <name>
   khala retire <session>
   khala reconcile
   khala sync
   khala link [restart] [--max-object-bytes bytes]
   khala link --serve [--max-object-bytes bytes]
   khala watch [--session session] [--interval seconds] [--max-wait seconds]
-  khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B]]
-  khala presence
+  khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
+  khala presence [--watchers]
 EOF
 }
 
@@ -151,6 +165,15 @@ normalize_integer() {
     printf '%s\n' "$normalized"
 }
 
+# A digits-only check is not enough for shell arithmetic: a 40-digit value
+# passes positive_or_zero_integer and then wraps or errors inside $((...)).
+# Bound every epoch, cadence, and lifetime the 0.8.0 code adds to 18 digits.
+bounded_integer() {
+    positive_or_zero_integer "$1" || return 1
+    bounded_value=$(normalize_integer "$1")
+    [ "${#bounded_value}" -le 18 ]
+}
+
 retain_days() {
     retained=$(sed -n 's/^retain //p' "$CONFIG")
     if [ -z "$retained" ]; then
@@ -192,19 +215,24 @@ session_name() {
     explicit_set=${2-0}
     if [ "$explicit_set" -eq 1 ]; then
         session=$explicit
-    elif [ "${KHALA_SESSION+x}" = x ]; then
+    elif [ "${KHALA_SESSION+x}" = x ] && [ -n "$KHALA_SESSION" ]; then
         session=$KHALA_SESSION
-    elif [ -n "${PWD-}" ] && [ -f "$PWD/.khala-session" ] && \
+    else
+        if [ "${KHALA_SESSION+x}" = x ]; then
+            printf '%s\n' 'khala: KHALA_SESSION이 비어 있어 설정되지 않은 것으로 취급합니다' >&2
+        fi
+        if [ -n "${PWD-}" ] && [ -f "$PWD/.khala-session" ] && \
         session_file=$(sed -n '1p' "$PWD/.khala-session") && \
         [ "$(wc -l < "$PWD/.khala-session" | tr -d ' ')" -le 1 ] && \
         valid_name "$session_file"; then
         # The checkout's declared identity: the same one-line .khala-session
         # the hooks read. Without this step a bare CLI send in a hook-managed
         # checkout silently completes under the directory basename instead.
-        session=$session_file
-    else
-        error "세션 이름을 정할 수 없습니다; KHALA_SESSION을 설정하거나 .khala-session을 만들거나 --as를 지정하세요"
-        return 1
+            session=$session_file
+        else
+            error "세션 이름을 정할 수 없습니다; KHALA_SESSION을 설정하거나 .khala-session을 만들거나 --as를 지정하세요"
+            return 1
+        fi
     fi
     if ! valid_name "$session"; then
         error "잘못된 세션 이름: $session"
@@ -216,7 +244,7 @@ session_name() {
 header_value() {
     key=$1
     file=$2
-    sed -n "s/^$key: //p" "$file"
+    sed -n "/^$/q; s/^$key: //p" "$file"
 }
 
 atomic_copy() {
@@ -258,6 +286,75 @@ atomic_line() {
         return 1
     fi
     return 0
+}
+
+read_watcher_marker() {
+    watcher_read_file=$1
+    [ -f "$watcher_read_file" ] || return 1
+    [ "$(wc -l < "$watcher_read_file" | tr -d ' ')" -eq 5 ] || return 1
+    WATCHER_L1=$(sed -n '1p' "$watcher_read_file")
+    WATCHER_L2=$(sed -n '2p' "$watcher_read_file")
+    WATCHER_L3=$(sed -n '3p' "$watcher_read_file")
+    WATCHER_L4=$(sed -n '4p' "$watcher_read_file")
+    WATCHER_L5=$(sed -n '5p' "$watcher_read_file")
+    WATCHER_RETIRED=0
+    case "$WATCHER_L1" in
+        retired\ *)
+            WATCHER_DECLARED=${WATCHER_L1#retired }
+            WATCHER_RETIRED=1
+            ;;
+        *) WATCHER_DECLARED=$WATCHER_L1 ;;
+    esac
+    bounded_integer "$WATCHER_DECLARED" || return 1
+    bounded_integer "$WATCHER_L2" || return 1
+    case "$WATCHER_L3" in
+        -) ;;
+        *) valid_name "$WATCHER_L3" || return 1 ;;
+    esac
+    bounded_integer "$WATCHER_L4" || return 1
+    case "$WATCHER_L5" in
+        active) ;;
+        silent\ *)
+            watcher_silent_since=${WATCHER_L5#silent }
+            bounded_integer "$watcher_silent_since" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    WATCHER_DECLARED=$(normalize_integer "$WATCHER_DECLARED")
+    WATCHER_CADENCE=$(normalize_integer "$WATCHER_L2")
+    WATCHER_LAST_NOTIFY=$(normalize_integer "$WATCHER_L4")
+    return 0
+}
+
+write_watcher_marker() {
+    watcher_write_file=$1
+    watcher_write_l1=$2
+    watcher_write_l2=$3
+    watcher_write_l3=$4
+    watcher_write_l4=$5
+    watcher_write_l5=$6
+    watcher_write_tmp=$(mktemp "$TMP_DIR/watcher.XXXXXX") || return 1
+    if ! printf '%s\n%s\n%s\n%s\n%s\n' "$watcher_write_l1" "$watcher_write_l2" \
+        "$watcher_write_l3" "$watcher_write_l4" "$watcher_write_l5" \
+        > "$watcher_write_tmp"; then
+        rm -f "$watcher_write_tmp"
+        return 1
+    fi
+    if ! mv "$watcher_write_tmp" "$watcher_write_file"; then
+        rm -f "$watcher_write_tmp"
+        return 1
+    fi
+    return 0
+}
+
+watcher_marker_non_retired() {
+    watcher_live_file=$1
+    [ -f "$watcher_live_file" ] || return 1
+    watcher_live_l1=$(sed -n '1p' "$watcher_live_file")
+    case "$watcher_live_l1" in
+        retired*) return 1 ;;
+        *) return 0 ;;
+    esac
 }
 
 detect_epoch_date_style() {
@@ -1415,6 +1512,52 @@ queue_infrastructure_message() {
         "$infra_ref" "$infra_body" "$infra_dir/$infra_id" "$infra_id"
 }
 
+queue_notice() {
+    notice_from=$1
+    notice_to=$2
+    notice_urgency=$3
+    notice_subject=$4
+    notice_expires=$5
+    notice_body_file=$6
+    NOTICE_ID=$(new_message_id "$notice_from") || return 1
+    notice_node=${notice_to#*@}
+    notice_dir=$KHALA_ROOT/spool/for/$notice_node
+    if ! mkdir -p "$notice_dir"; then
+        return 1
+    fi
+    notice_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
+    notice_tmp=$(mktemp "$TMP_DIR/notice.XXXXXX") || return 1
+    if ! {
+        printf 'Khala: 0.1\n'
+        printf 'Id: %s\n' "$NOTICE_ID"
+        printf 'From: %s\n' "$notice_from"
+        printf 'To: %s\n' "$notice_to"
+        printf 'Date: %s\n' "$notice_date"
+        printf 'Type: notice\n'
+        printf 'Urgency: %s\n' "$notice_urgency"
+        if [ -n "$notice_subject" ]; then
+            printf 'Subject: %s\n' "$notice_subject"
+        fi
+        printf 'Expires: %s\n' "$notice_expires"
+        printf '\n'
+        cat "$notice_body_file"
+    } > "$notice_tmp"; then
+        rm -f "$notice_tmp"
+        return 1
+    fi
+    if ln "$notice_tmp" "$notice_dir/$NOTICE_ID" 2>/dev/null; then
+        rm -f "$notice_tmp"
+        return 0
+    fi
+    rm -f "$notice_tmp"
+    if [ -e "$notice_dir/$NOTICE_ID" ]; then
+        error "$NOTICE_ID: 이미 존재하는 Id라 notice를 덮어쓰지 않습니다"
+    else
+        error "$NOTICE_ID: notice를 spool에 원자적으로 안착시키지 못했습니다"
+    fi
+    return 1
+}
+
 delivered_before() {
     wanted_id=$1
     while IFS=' ' read -r dedup_read_epoch dedup_read_id dedup_read_extra; do
@@ -1863,9 +2006,28 @@ deliver_fire_and_forget() {
     incoming_file=$1
     incoming_id=$(header_value Id "$incoming_file")
     incoming_to=$(header_value To "$incoming_file")
+    incoming_type=$(header_value Type "$incoming_file")
     if ! valid_address "$incoming_to"; then
         sync_error "$incoming_file: 잘못된 To 헤더"
         return
+    fi
+    if [ "$incoming_type" = notice ]; then
+        incoming_expires=$(header_value Expires "$incoming_file")
+        if ! bounded_integer "$incoming_expires"; then
+            sync_error "$incoming_file: 잘못된 notice Expires 헤더"
+            return
+        fi
+        incoming_expires=$(normalize_integer "$incoming_expires")
+        incoming_now=$(date +%s) || {
+            sync_error "$incoming_file: 현재 시각을 읽지 못했습니다"
+            return
+        }
+        if [ "$incoming_expires" -le "$incoming_now" ]; then
+            if ! rm -f "$incoming_file"; then
+                sync_error "$incoming_file: 만료된 notice를 지우지 못했습니다"
+            fi
+            return
+        fi
     fi
     incoming_session=${incoming_to%@*}
     incoming_dir=$KHALA_ROOT/inbox/$incoming_session
@@ -2039,6 +2201,149 @@ prune_delivered_log() {
     fi
 }
 
+# A directory symlink under inbox/, outbox/ or spool/ would let a retention
+# glob follow it out of KHALA_ROOT. Every directory between the root and the
+# file must be a real directory; the file itself is checked with -L by callers.
+retention_path_inside_root() {
+    retention_rel=${1#"$KHALA_ROOT"/}
+    [ "$retention_rel" != "$1" ] || return 1
+    retention_walk=$KHALA_ROOT
+    retention_rest=$retention_rel
+    while [ "$retention_rest" != "${retention_rest#*/}" ]; do
+        retention_walk=$retention_walk/${retention_rest%%/*}
+        retention_rest=${retention_rest#*/}
+        [ ! -L "$retention_walk" ] && [ -d "$retention_walk" ] || return 1
+    done
+    return 0
+}
+
+prune_expired_notices() {
+    prune_notice_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    for prune_notice_file in "$KHALA_ROOT"/spool/for/*/* \
+        "$KHALA_ROOT"/inbox/*/new/* "$KHALA_ROOT"/inbox/*/cur/*; do
+        [ -f "$prune_notice_file" ] || continue
+        [ -L "$prune_notice_file" ] && continue
+        retention_path_inside_root "$prune_notice_file" || continue
+        [ "$(header_value Type "$prune_notice_file")" = notice ] || continue
+        prune_notice_expires=$(header_value Expires "$prune_notice_file")
+        bounded_integer "$prune_notice_expires" || continue
+        prune_notice_expires=$(normalize_integer "$prune_notice_expires")
+        if [ "$prune_notice_expires" -le "$prune_notice_now" ]; then
+            if ! rm -f "$prune_notice_file"; then
+                sync_error "$prune_notice_file: 만료된 notice를 지우지 못했습니다"
+            fi
+        fi
+    done
+}
+
+prune_letter_archives() {
+    prune_archive_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    prune_archive_days=$(retain_days) || {
+        sync_error "letter retention 설정을 읽지 못했습니다"
+        return
+    }
+    prune_archive_seconds=$((prune_archive_days * 86400))
+    for prune_archive_file in "$KHALA_ROOT"/inbox/*/cur/* \
+        "$KHALA_ROOT"/outbox/acked/* "$KHALA_ROOT"/outbox/dead/*; do
+        [ -f "$prune_archive_file" ] || continue
+        [ -L "$prune_archive_file" ] && continue
+        retention_path_inside_root "$prune_archive_file" || continue
+        prune_archive_id=$(header_value Id "$prune_archive_file")
+        valid_message_id "$prune_archive_id" || continue
+        bounded_integer "${prune_archive_id%%.*}" || continue
+        prune_archive_epoch=$(normalize_integer "${prune_archive_id%%.*}")
+        if [ "$prune_archive_epoch" -le "$prune_archive_now" ] && \
+            [ "$((prune_archive_now - prune_archive_epoch))" -gt "$prune_archive_seconds" ]; then
+            if ! rm -f "$prune_archive_file"; then
+                sync_error "$prune_archive_file: retention 지난 letter를 지우지 못했습니다"
+            fi
+        fi
+    done
+}
+
+watcher_deadman() {
+    deadman_node=$1
+    deadman_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    for deadman_marker in "$KHALA_ROOT"/presence/*@"$deadman_node".watcher; do
+        [ -f "$deadman_marker" ] || continue
+        [ -L "$deadman_marker" ] && continue
+        deadman_address=$(basename "$deadman_marker" .watcher)
+        if ! valid_address "$deadman_address"; then
+            sync_error "$deadman_marker: 잘못된 watcher marker 파일명"
+            continue
+        fi
+        if ! read_watcher_marker "$deadman_marker"; then
+            sync_error "$deadman_marker: 잘못된 watcher marker"
+            continue
+        fi
+        [ "$WATCHER_RETIRED" -eq 0 ] || continue
+        [ "$WATCHER_CADENCE" -gt 0 ] || continue
+        [ "$WATCHER_L3" != - ] || continue
+        deadman_transition=
+        deadman_urgency=
+        deadman_subject=
+        deadman_next_state=
+        if [ "$WATCHER_LAST_NOTIFY" -gt 0 ]; then
+            deadman_anchor=$WATCHER_LAST_NOTIFY
+        else
+            deadman_anchor=$WATCHER_DECLARED
+        fi
+        if [ "$deadman_now" -ge "$deadman_anchor" ]; then
+            deadman_age_seconds=$((deadman_now - deadman_anchor))
+        else
+            deadman_age_seconds=0
+        fi
+        deadman_state=${WATCHER_L5%% *}
+        deadman_name=${deadman_address%@*}
+        if [ "$deadman_state" = active ] && \
+            [ "$deadman_age_seconds" -gt "$((2 * WATCHER_CADENCE))" ]; then
+            deadman_transition=silent
+            deadman_urgency=urgent
+            deadman_age=$(relative_age "$deadman_anchor" "$deadman_now")
+            deadman_subject="[watcher] $deadman_name silent $deadman_age (cadence ${WATCHER_CADENCE}s)"
+            deadman_next_state="silent $deadman_now"
+        elif [ "$deadman_state" = silent ] && \
+            [ "$deadman_age_seconds" -le "$((2 * WATCHER_CADENCE))" ]; then
+            deadman_transition=active
+            deadman_urgency=info
+            deadman_subject="[watcher] $deadman_name active again"
+            deadman_next_state=active
+        fi
+        [ -n "$deadman_transition" ] || continue
+        deadman_body=$(mktemp "$TMP_DIR/deadman-body.XXXXXX") || {
+            sync_error "$deadman_marker: dead-man 본문 임시 파일을 만들지 못했습니다"
+            continue
+        }
+        if ! printf 'watcher marker: %s\n' "$deadman_marker" > "$deadman_body"; then
+            rm -f "$deadman_body"
+            sync_error "$deadman_marker: dead-man 본문을 쓰지 못했습니다"
+            continue
+        fi
+        deadman_expires=$((deadman_now + 172800))
+        if ! queue_notice "$deadman_address" "$WATCHER_L3@$deadman_node" \
+            "$deadman_urgency" "$deadman_subject" "$deadman_expires" "$deadman_body"; then
+            rm -f "$deadman_body"
+            sync_error "$deadman_marker: dead-man notice를 만들지 못했습니다"
+            continue
+        fi
+        rm -f "$deadman_body"
+        if ! write_watcher_marker "$deadman_marker" "$WATCHER_L1" "$WATCHER_L2" \
+            "$WATCHER_L3" "$WATCHER_L4" "$deadman_next_state"; then
+            rm -f "$KHALA_ROOT/spool/for/$deadman_node/$NOTICE_ID"
+            sync_error "$deadman_marker: dead-man 상태를 기록하지 못했습니다"
+        fi
+    done
+}
+
 prune_stream_entries() {
     prune_stream_now=$(date +%s) || {
         sync_error "현재 시각을 읽지 못했습니다"
@@ -2188,6 +2493,32 @@ prune_presence() {
         [ -f "$prune_presence_file" ] || continue
         case "$prune_presence_file" in
             *.watching) continue ;;
+            *.watcher)
+                [ -L "$prune_presence_file" ] && continue
+                if ! read_watcher_marker "$prune_presence_file"; then
+                    sync_error "$prune_presence_file: 잘못된 watcher marker"
+                    continue
+                fi
+                prune_presence_declared_old=0
+                prune_presence_notify_old=0
+                if [ "$((WATCHER_DECLARED + prune_presence_seconds))" -lt \
+                    "$prune_presence_now" ]; then
+                    prune_presence_declared_old=1
+                fi
+                if [ "$((WATCHER_LAST_NOTIFY + prune_presence_seconds))" -lt \
+                    "$prune_presence_now" ]; then
+                    prune_presence_notify_old=1
+                fi
+                if { [ "$WATCHER_RETIRED" -eq 1 ] && \
+                    [ "$prune_presence_declared_old" -eq 1 ]; } || \
+                    { [ "$prune_presence_declared_old" -eq 1 ] && \
+                    [ "$prune_presence_notify_old" -eq 1 ]; }; then
+                    if ! rm -f "$prune_presence_file"; then
+                        sync_error "$prune_presence_file: retention 지난 watcher marker를 지우지 못했습니다"
+                    fi
+                fi
+                continue
+                ;;
         esac
         if ! prune_presence_epoch=$(presence_record_epoch "$prune_presence_file"); then
             sync_error "$prune_presence_file: 잘못된 heartbeat"
@@ -2240,15 +2571,18 @@ reconcile_cycle() {
         sync_error "self node를 읽지 못했습니다"
     else
         copy_outbox_to_spool
+        prune_expired_notices
         reconcile_spool=$KHALA_ROOT/spool/for/$reconcile_self
         if ! mkdir -p "$reconcile_spool"; then
             sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
         else
+            watcher_deadman "$reconcile_self"
             deliver_messages "$reconcile_spool"
             deliver_infrastructure "$reconcile_spool"
             settle_acks "$reconcile_spool"
         fi
         expire_outbox "$reconcile_self"
+        prune_letter_archives
         prune_delivered_log
         if ! load_preserve_config; then
             sync_error "preserver degraded: preserve config를 읽지 못했습니다"
@@ -2606,6 +2940,9 @@ cmd_send() {
     fi
     send_node=$(self_node) || return 1
     send_session=$(session_name "$send_as" "$send_as_set") || return 1
+    if [ "$send_as_set" -eq 1 ]; then
+        printf '%s\n' 'khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요' >&2
+    fi
     send_from=$send_session@$send_node
     send_now=$(date +%s) || { error "현재 시각을 읽지 못했습니다"; return 1; }
     send_expires=$((send_now + send_ttl))
@@ -2663,6 +3000,129 @@ cmd_send() {
         error "$send_id: 즉시 spool 물질화에 실패했습니다; 다음 reconcile에서 재시도합니다"
     fi
     printf '%s\n' "$send_id"
+    return 0
+}
+
+cmd_notify() {
+    require_config || return 1
+    [ "$#" -ge 1 ] || { usage notify; return 1; }
+    notify_to=$1
+    shift
+    if ! valid_address "$notify_to"; then
+        error "잘못된 주소: $notify_to"
+        return 1
+    fi
+    notify_as=
+    notify_as_set=0
+    notify_subject=
+    notify_urgency=info
+    notify_ttl=172800
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --as)
+                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
+                notify_as=$2
+                notify_as_set=1
+                shift 2
+                ;;
+            -s|--subject)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
+                notify_subject=$2
+                shift 2
+                ;;
+            --urgent)
+                notify_urgency=urgent
+                shift
+                ;;
+            -e)
+                [ "$#" -ge 2 ] || { error "-e 값이 없습니다"; return 1; }
+                notify_ttl=$2
+                shift 2
+                ;;
+            *) error "알 수 없는 notify 옵션: $1"; return 1 ;;
+        esac
+    done
+    if [ "$notify_as_set" -ne 1 ]; then
+        error "notify에는 --as <watcher>가 필요합니다"
+        return 1
+    fi
+    if ! valid_name "$notify_as"; then
+        error "잘못된 watcher 이름: $notify_as"
+        return 1
+    fi
+    if ! bounded_integer "$notify_ttl"; then
+        error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
+        return 1
+    fi
+    notify_ttl=$(normalize_integer "$notify_ttl")
+    case "$notify_subject" in
+        *'
+'*|*'
+'*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
+    esac
+    notify_body=$(mktemp "$TMP_DIR/notice-body.XXXXXX") || return 1
+    if ! cat > "$notify_body"; then
+        rm -f "$notify_body"
+        error "notice 본문을 읽지 못했습니다"
+        return 1
+    fi
+    notify_node=$(self_node) || { rm -f "$notify_body"; return 1; }
+    notify_from=$notify_as@$notify_node
+    notify_now=$(date +%s) || { rm -f "$notify_body"; return 1; }
+    notify_expires=$((notify_now + notify_ttl))
+    notify_marker=$KHALA_ROOT/presence/$notify_from.watcher
+    notify_lock=$KHALA_ROOT/run/brain.lock.d
+    if ! acquire_lock "$notify_lock" 300 notify; then
+        rm -f "$notify_body"
+        error "notify용 brain lock을 얻지 못했습니다"
+        return 1
+    fi
+    notify_auto_declared=0
+    notify_status=0
+    if [ -f "$notify_marker" ]; then
+        if ! read_watcher_marker "$notify_marker"; then
+            error "$notify_marker: 잘못된 watcher marker"
+            notify_status=1
+        fi
+    else
+        WATCHER_L1=$notify_now
+        WATCHER_L2=0
+        WATCHER_L3=-
+        WATCHER_L4=0
+        WATCHER_L5=active
+        notify_auto_declared=1
+    fi
+    if [ "$notify_status" -eq 0 ] && ! queue_notice "$notify_from" "$notify_to" \
+        "$notify_urgency" "$notify_subject" "$notify_expires" "$notify_body"; then
+        error "notice를 infrastructure spool에 넣지 못했습니다"
+        notify_status=1
+    fi
+    if [ "$notify_status" -eq 0 ] && ! write_watcher_marker "$notify_marker" \
+        "$WATCHER_L1" "$WATCHER_L2" "$WATCHER_L3" "$notify_now" "$WATCHER_L5"; then
+        rm -f "$KHALA_ROOT/spool/for/${notify_to#*@}/$NOTICE_ID"
+        error "$notify_marker: last-notify를 갱신하지 못했습니다"
+        notify_status=1
+    fi
+    rm -f "$notify_body"
+    if ! release_lock "$notify_lock"; then
+        error "notify용 brain lock을 해제하지 못했습니다"
+        return 1
+    fi
+    [ "$notify_status" -eq 0 ] || return 1
+    if [ "$notify_auto_declared" -eq 1 ]; then
+        printf 'khala notify: %s watcher를 cadence 0으로 자동 선언했습니다\n' "$notify_from" >&2
+    fi
+    # A notice for this node sits in spool/for/<self> where the link watcher
+    # never looks (it only offers other nodes' spools), so nothing would run
+    # reconcile until an unrelated event. Leave the brain's trigger file so its
+    # 200 ms poll delivers the notice into the inbox now instead of later.
+    if [ "${notify_to#*@}" = "$notify_node" ]; then
+        notify_trigger_tmp=$(mktemp "$TMP_DIR/notify-trigger.XXXXXX") 2>/dev/null &&
+            date +%s > "$notify_trigger_tmp" 2>/dev/null &&
+            mv "$notify_trigger_tmp" "$KHALA_ROOT/run/reconcile.trigger" 2>/dev/null ||
+            rm -f "${notify_trigger_tmp-}"
+    fi
+    printf '%s\n' "$NOTICE_ID"
     return 0
 }
 
@@ -3044,6 +3504,170 @@ relative_age() {
     fi
 }
 
+print_watcher_table() {
+    watcher_table_mode=$1
+    watcher_table_now=$(date +%s) || return 1
+    printf 'NAME\tNODE\tOWNER\tCADENCE\tLAST\tSTATE\n'
+    for watcher_table_file in "$KHALA_ROOT"/presence/*.watcher; do
+        [ -f "$watcher_table_file" ] || continue
+        watcher_table_address=$(basename "$watcher_table_file" .watcher)
+        if ! valid_address "$watcher_table_address"; then
+            error "$watcher_table_file: 잘못된 watcher marker 파일명"
+            return 1
+        fi
+        if ! read_watcher_marker "$watcher_table_file"; then
+            error "$watcher_table_file: 잘못된 watcher marker"
+            return 1
+        fi
+        if [ "$watcher_table_mode" = active ] && [ "$WATCHER_RETIRED" -eq 1 ]; then
+            continue
+        fi
+        watcher_table_name=${watcher_table_address%@*}
+        watcher_table_node=${watcher_table_address#*@}
+        watcher_table_last=$(relative_age "$WATCHER_LAST_NOTIFY" "$watcher_table_now")
+        if [ "$WATCHER_RETIRED" -eq 1 ]; then
+            watcher_table_state=retired
+        else
+            watcher_table_state=${WATCHER_L5%% *}
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$watcher_table_name" "$watcher_table_node" \
+            "$WATCHER_L3" "$WATCHER_CADENCE" "$watcher_table_last" "$watcher_table_state"
+    done
+    return 0
+}
+
+have_active_watchers() {
+    for watcher_active_file in "$KHALA_ROOT"/presence/*.watcher; do
+        [ -f "$watcher_active_file" ] || continue
+        if watcher_marker_non_retired "$watcher_active_file"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+print_watcher_section() {
+    have_active_watchers || return 0
+    printf '%s\n' 'watchers:'
+    print_watcher_table active
+}
+
+cmd_watcher() {
+    require_config || return 1
+    [ "$#" -ge 1 ] || { usage watcher; return 1; }
+    watcher_command=$1
+    shift
+    case "$watcher_command" in
+        list)
+            [ "$#" -eq 0 ] || { usage watcher; return 1; }
+            print_watcher_table all
+            return $?
+            ;;
+        declare)
+            [ "$#" -ge 1 ] || { usage watcher; return 1; }
+            watcher_name=$1
+            shift
+            if ! valid_name "$watcher_name"; then
+                error "잘못된 watcher 이름: $watcher_name"
+                return 1
+            fi
+            watcher_cadence=
+            watcher_owner=
+            while [ "$#" -gt 0 ]; do
+                case "$1" in
+                    --cadence)
+                        [ "$#" -ge 2 ] || { error "--cadence 값이 없습니다"; return 1; }
+                        watcher_cadence=$2
+                        shift 2
+                        ;;
+                    --owner)
+                        [ "$#" -ge 2 ] || { error "--owner 값이 없습니다"; return 1; }
+                        watcher_owner=$2
+                        shift 2
+                        ;;
+                    *) error "알 수 없는 watcher declare 옵션: $1"; return 1 ;;
+                esac
+            done
+            if ! bounded_integer "$watcher_cadence"; then
+                error "watcher cadence는 0 이상 18자리 이하의 정수여야 합니다"
+                return 1
+            fi
+            if ! valid_name "$watcher_owner"; then
+                error "잘못된 watcher owner: $watcher_owner"
+                return 1
+            fi
+            watcher_cadence=$(normalize_integer "$watcher_cadence")
+            watcher_node=$(self_node) || return 1
+            watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
+            watcher_now=$(date +%s) || return 1
+            watcher_lock=$KHALA_ROOT/run/brain.lock.d
+            if ! acquire_lock "$watcher_lock" 300 watcher-declare; then
+                error "watcher declare용 brain lock을 얻지 못했습니다"
+                return 1
+            fi
+            watcher_status=0
+            if [ -f "$watcher_marker" ]; then
+                if ! read_watcher_marker "$watcher_marker"; then
+                    error "$watcher_marker: 잘못된 watcher marker"
+                    watcher_status=1
+                fi
+            else
+                WATCHER_L4=0
+                WATCHER_L5=active
+            fi
+            if [ "$watcher_status" -eq 0 ] && ! write_watcher_marker "$watcher_marker" \
+                "$watcher_now" "$watcher_cadence" "$watcher_owner" \
+                "$WATCHER_L4" "$WATCHER_L5"; then
+                error "$watcher_marker: watcher 선언을 기록하지 못했습니다"
+                watcher_status=1
+            fi
+            if ! release_lock "$watcher_lock"; then
+                error "watcher declare용 brain lock을 해제하지 못했습니다"
+                return 1
+            fi
+            [ "$watcher_status" -eq 0 ] || return 1
+            printf 'declared %s@%s\n' "$watcher_name" "$watcher_node"
+            return 0
+            ;;
+        retire)
+            [ "$#" -eq 1 ] || { usage watcher; return 1; }
+            watcher_name=$1
+            if ! valid_name "$watcher_name"; then
+                error "잘못된 watcher 이름: $watcher_name"
+                return 1
+            fi
+            watcher_node=$(self_node) || return 1
+            watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
+            watcher_now=$(date +%s) || return 1
+            watcher_lock=$KHALA_ROOT/run/brain.lock.d
+            if ! acquire_lock "$watcher_lock" 300 watcher-retire; then
+                error "watcher retire용 brain lock을 얻지 못했습니다"
+                return 1
+            fi
+            watcher_status=0
+            if [ ! -f "$watcher_marker" ]; then
+                error "$watcher_name@$watcher_node: watcher marker가 없습니다"
+                watcher_status=1
+            elif ! read_watcher_marker "$watcher_marker"; then
+                error "$watcher_marker: 잘못된 watcher marker"
+                watcher_status=1
+            elif ! write_watcher_marker "$watcher_marker" "retired $watcher_now" \
+                "$WATCHER_L2" "$WATCHER_L3" "$WATCHER_L4" "$WATCHER_L5"; then
+                error "$watcher_marker: watcher retire를 기록하지 못했습니다"
+                watcher_status=1
+            fi
+            if ! release_lock "$watcher_lock"; then
+                error "watcher retire용 brain lock을 해제하지 못했습니다"
+                return 1
+            fi
+            [ "$watcher_status" -eq 0 ] || return 1
+            printf 'retired %s@%s\n' "$watcher_name" "$watcher_node"
+            return 0
+            ;;
+        *) error "알 수 없는 watcher 하위 명령: $watcher_command"; return 1 ;;
+    esac
+}
+
 cmd_minds() {
     require_config || return 1
     [ "$#" -eq 0 ] || { usage; return 1; }
@@ -3079,6 +3703,9 @@ cmd_minds() {
     printf 'ADDRESS\tSTATE\tWATCHING\tMODEL\tMODEL_AGE\tEFFORT\tEFFORT_AGE\tROLE\tROLE_AGE\tCHARGE\tCHARGE_AGE\tFOCUS\tFOCUS_AGE\tSTANCE\tSTANCE_AGE\tFRESHNESS\n'
     while IFS= read -r minds_address; do
         [ -n "$minds_address" ] || continue
+        if watcher_marker_non_retired "$KHALA_ROOT/presence/$minds_address.watcher"; then
+            continue
+        fi
         minds_session=${minds_address%@*}
         minds_node=${minds_address#*@}
         minds_presence=$KHALA_ROOT/presence/$minds_address
@@ -3368,6 +3995,12 @@ cmd_bind() {
         bind_phase=$2
         shift 2
         bind_identity=$(session_name "" 0) || return 1
+        bind_node=$(self_node) || return 1
+        if watcher_marker_non_retired \
+            "$KHALA_ROOT/presence/$bind_identity@$bind_node.watcher"; then
+            error "$bind_identity@$bind_node: watcher 신원은 session runtime에 등록할 수 없습니다"
+            return 1
+        fi
         "$LINK_BINARY" runtime register --identity "$bind_identity" --phase "$bind_phase" \
             --caller-pid "$$" "$@"
         return $?
@@ -3800,6 +4433,9 @@ cmd_inbox() {
     # AMBIGUOUS: §9.6 requires drain bounds but does not specify their defaults.
     max_n=20
     max_bytes=65536
+    max_notices=10
+    max_notice_bytes=16384
+    inbox_drain_selection=all
     if [ "$#" -gt 0 ]; then
         case "$1" in
             --drain)
@@ -3816,6 +4452,32 @@ cmd_inbox() {
                             [ "$#" -ge 2 ] || { error "--max-bytes 값이 없습니다"; return 1; }
                             max_bytes=$2
                             shift 2
+                            ;;
+                        --max-notices)
+                            [ "$#" -ge 2 ] || { error "--max-notices 값이 없습니다"; return 1; }
+                            max_notices=$2
+                            shift 2
+                            ;;
+                        --max-notice-bytes)
+                            [ "$#" -ge 2 ] || { error "--max-notice-bytes 값이 없습니다"; return 1; }
+                            max_notice_bytes=$2
+                            shift 2
+                            ;;
+                        --mail-only)
+                            [ "$inbox_drain_selection" != notices ] || {
+                                error "--mail-only와 --notices-only는 함께 쓸 수 없습니다"
+                                return 1
+                            }
+                            inbox_drain_selection=mail
+                            shift
+                            ;;
+                        --notices-only)
+                            [ "$inbox_drain_selection" != mail ] || {
+                                error "--mail-only와 --notices-only는 함께 쓸 수 없습니다"
+                                return 1
+                            }
+                            inbox_drain_selection=notices
+                            shift
                             ;;
                         *) error "알 수 없는 inbox 옵션: $1"; return 1 ;;
                     esac
@@ -3838,13 +4500,16 @@ cmd_inbox() {
         esac
     fi
     if [ "$inbox_mode" = drain ] && \
-        { ! positive_integer "$max_n" || ! positive_integer "$max_bytes"; }; then
+        { ! positive_integer "$max_n" || ! positive_integer "$max_bytes" || \
+        ! positive_integer "$max_notices" || ! positive_integer "$max_notice_bytes"; }; then
         error "drain 상한은 양의 정수여야 합니다"
         return 1
     fi
     if [ "$inbox_mode" = drain ]; then
         max_n=$(normalize_integer "$max_n")
         max_bytes=$(normalize_integer "$max_bytes")
+        max_notices=$(normalize_integer "$max_notices")
+        max_notice_bytes=$(normalize_integer "$max_notice_bytes")
     fi
     inbox_session=$(session_name "" 0) || return 1
     if ! heartbeat "$inbox_session"; then
@@ -3911,49 +4576,115 @@ cmd_inbox() {
     fi
     inbox_drain_status=0
     trap '' PIPE
-    prune_stream_entries
+    if [ "$inbox_drain_selection" != notices ]; then
+        prune_stream_entries
+    fi
     drained_n=0
     drained_bytes=0
+    drained_letters=0
+    drained_notices=0
+    drained_notice_bytes=0
+    drained_streams=0
     remaining_n=0
     remaining_senders=
-    for inbox_file in "$inbox_dir"/new/*; do
-        [ -f "$inbox_file" ] || continue
-        file_bytes=$(wc -c < "$inbox_file" | tr -d ' ')
-        if [ "$drained_n" -lt "$max_n" ] && \
-            [ "$((drained_bytes + file_bytes))" -le "$max_bytes" ]; then
-            inbox_basename=$(basename "$inbox_file")
-            inbox_cur_file=$inbox_dir/cur/$inbox_basename
-            if ! mv "$inbox_file" "$inbox_cur_file"; then
-                error "$inbox_file: cur 이동에 실패했습니다"
-                inbox_drain_status=1
-                break
+    if [ "$inbox_drain_selection" != notices ]; then
+        for inbox_file in "$inbox_dir"/new/*; do
+            [ -f "$inbox_file" ] || continue
+            [ "$(header_value Type "$inbox_file")" != notice ] || continue
+            file_bytes=$(wc -c < "$inbox_file" | tr -d ' ')
+            if [ "$drained_n" -lt "$max_n" ] && \
+                [ "$((drained_bytes + file_bytes))" -le "$max_bytes" ]; then
+                inbox_basename=$(basename "$inbox_file")
+                inbox_cur_file=$inbox_dir/cur/$inbox_basename
+                if ! mv "$inbox_file" "$inbox_cur_file"; then
+                    error "$inbox_file: cur 이동에 실패했습니다"
+                    inbox_drain_status=1
+                    break
+                fi
+                drained_n=$((drained_n + 1))
+                drained_letters=$((drained_letters + 1))
+                drained_bytes=$((drained_bytes + file_bytes))
+                printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
+                cat "$inbox_cur_file" 2>/dev/null || :
+                printf '\n' 2>/dev/null || :
+            else
+                remaining_n=$((remaining_n + 1))
+                remaining_from=$(header_value From "$inbox_file")
+                case " $remaining_senders " in
+                    *" $remaining_from "*) ;;
+                    *)
+                        if [ -n "$remaining_senders" ]; then
+                            remaining_senders="$remaining_senders, $remaining_from"
+                        else
+                            remaining_senders=$remaining_from
+                        fi
+                        ;;
+                esac
             fi
-            drained_n=$((drained_n + 1))
-            drained_bytes=$((drained_bytes + file_bytes))
-            printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
-            cat "$inbox_cur_file" 2>/dev/null || :
-            printf '\n' 2>/dev/null || :
-        else
-            remaining_n=$((remaining_n + 1))
-            remaining_from=$(header_value From "$inbox_file")
-            case " $remaining_senders " in
-                *" $remaining_from "*) ;;
-                *)
-                    if [ -n "$remaining_senders" ]; then
-                        remaining_senders="$remaining_senders, $remaining_from"
-                    else
-                        remaining_senders=$remaining_from
-                    fi
-                    ;;
-            esac
-        fi
-    done
+        done
+    fi
     if [ "$remaining_n" -gt 0 ]; then
         printf '%s건 더 (%s)\n' "$remaining_n" "$remaining_senders"
     fi
+    notice_output=$(mktemp "$TMP_DIR/inbox-notices.XXXXXX") || inbox_drain_status=1
+    notice_remaining_senders=$(mktemp "$TMP_DIR/inbox-notice-senders.XXXXXX") || \
+        inbox_drain_status=1
+    if [ "$inbox_drain_status" -eq 0 ]; then
+        : > "$notice_output"
+        : > "$notice_remaining_senders"
+    fi
+    notice_remaining_n=0
+    if [ "$inbox_drain_status" -eq 0 ] && \
+        [ "$inbox_drain_selection" != mail ]; then
+        for inbox_file in "$inbox_dir"/new/*; do
+            [ -f "$inbox_file" ] || continue
+            [ "$(header_value Type "$inbox_file")" = notice ] || continue
+            file_bytes=$(wc -c < "$inbox_file" | tr -d ' ')
+            if [ "$drained_notices" -lt "$max_notices" ] && \
+                [ "$((drained_notice_bytes + file_bytes))" -le "$max_notice_bytes" ]; then
+                inbox_basename=$(basename "$inbox_file")
+                inbox_cur_file=$inbox_dir/cur/$inbox_basename
+                if ! mv "$inbox_file" "$inbox_cur_file"; then
+                    error "$inbox_file: cur 이동에 실패했습니다"
+                    inbox_drain_status=1
+                    break
+                fi
+                notice_from=$(header_value From "$inbox_cur_file")
+                notice_subject=$(header_value Subject "$inbox_cur_file")
+                notice_urgency=$(header_value Urgency "$inbox_cur_file")
+                [ "$notice_urgency" = info ] || notice_urgency=urgent
+                if ! {
+                    printf '%s\n' "--- notice $inbox_basename --- $notice_from · $notice_urgency · $notice_subject"
+                    cat "$inbox_cur_file"
+                    printf '\n'
+                } >> "$notice_output"; then
+                    error "$inbox_cur_file: notice 출력 준비에 실패했습니다"
+                    inbox_drain_status=1
+                    break
+                fi
+                drained_notices=$((drained_notices + 1))
+                drained_notice_bytes=$((drained_notice_bytes + file_bytes))
+            else
+                notice_remaining_n=$((notice_remaining_n + 1))
+                notice_remaining_from=$(header_value From "$inbox_file")
+                printf '%s\n' "$notice_remaining_from" >> "$notice_remaining_senders"
+            fi
+        done
+    fi
+    if [ "$drained_notices" -gt 0 ]; then
+        printf '=== notices (%s) ===\n' "$drained_notices"
+        cat "$notice_output"
+    fi
+    if [ "$notice_remaining_n" -gt 0 ]; then
+        notice_remaining_groups=$(sort "$notice_remaining_senders" | uniq -c | \
+            sort -k1,1nr -k2,2 | awk '{ if (shown++) printf ", "; printf "%s %s", $2, $1 }')
+        printf '알림 %s건 더 (%s)\n' "$notice_remaining_n" "$notice_remaining_groups"
+    fi
+    rm -f "${notice_output-}" "${notice_remaining_senders-}"
     inbox_retain_days=$(retain_days) || inbox_drain_status=1
     inbox_now=$(date +%s) || inbox_drain_status=1
-    if [ "$inbox_drain_status" -eq 0 ]; then
+    if [ "$inbox_drain_status" -eq 0 ] && \
+        [ "$inbox_drain_selection" != notices ]; then
         inbox_retain_seconds=$((inbox_retain_days * 86400))
         for inbox_join_file in "$KHALA_ROOT/join/$inbox_session"/*; do
             [ -f "$inbox_join_file" ] || continue
@@ -4012,6 +4743,7 @@ cmd_inbox() {
                         break
                     fi
                     drained_n=$((drained_n + 1))
+                    drained_streams=$((drained_streams + 1))
                     drained_bytes=$((drained_bytes + file_bytes))
                 else
                     inbox_stream_remaining=$((inbox_stream_remaining + 1))
@@ -4030,14 +4762,23 @@ cmd_inbox() {
         return 1
     fi
     trap - PIPE
+    printf 'drained: letters %s, notices %s, streams %s\n' \
+        "$drained_letters" "$drained_notices" "$drained_streams"
     return "$inbox_drain_status"
 }
 
 cmd_presence() {
     require_config || return 1
-    if [ "$#" -ne 0 ]; then
+    presence_watchers_only=0
+    if [ "$#" -eq 1 ] && [ "$1" = --watchers ]; then
+        presence_watchers_only=1
+    elif [ "$#" -ne 0 ]; then
         usage
         return 1
+    fi
+    if [ "$presence_watchers_only" -eq 1 ]; then
+        print_watcher_section
+        return $?
     fi
     presence_self=$(self_node) || return 1
     presence_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
@@ -4055,11 +4796,14 @@ cmd_presence() {
         [ -f "$presence_file" ] || continue
         presence_address=$(basename "$presence_file")
         case "$presence_address" in
-            *.watching) continue ;;
+            *.watching|*.watcher) continue ;;
         esac
         if ! valid_address "$presence_address"; then
             error "$presence_file: 잘못된 heartbeat 파일명"
             return 1
+        fi
+        if watcher_marker_non_retired "$presence_file.watcher"; then
+            continue
         fi
         presence_session=${presence_address%@*}
         presence_node=${presence_address#*@}
@@ -4099,12 +4843,17 @@ cmd_presence() {
             error "$presence_marker: 잘못된 watching marker 파일명"
             continue
         fi
+        if watcher_marker_non_retired \
+            "$KHALA_ROOT/presence/$presence_address.watcher"; then
+            continue
+        fi
         [ ! -f "$KHALA_ROOT/presence/$presence_address" ] || continue
         presence_watching=$(watching_status "$presence_marker" \
             "$presence_now" "$presence_ttl")
         printf '%s\tunknown\t-\t%s\n' "$presence_address" "$presence_watching"
     done
     printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch)'
+    print_watcher_section
     return 0
 }
 
@@ -4116,7 +4865,7 @@ fi
 command_name=$1
 shift
 case "$command_name" in
-    version|init|invite|send|say|join|leave|streams|stream|mind|profile|minds|retire|reconcile|sync|link|watch|inbox|presence)
+    version|init|invite|send|notify|say|join|leave|streams|stream|mind|profile|minds|watcher|retire|reconcile|sync|link|watch|inbox|presence)
         if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
             usage "$command_name"
             exit 0
@@ -4136,6 +4885,7 @@ case "$command_name" in
     init) cmd_init "$@" ;;
     invite) cmd_invite "$@" ;;
     send) cmd_send "$@" ;;
+    notify) cmd_notify "$@" ;;
     say) cmd_say "$@" ;;
     join) cmd_join "$@" ;;
     leave) cmd_leave "$@" ;;
@@ -4144,6 +4894,7 @@ case "$command_name" in
     mind) cmd_mind "$@" ;;
     profile) cmd_profile "$@" ;;
     minds) cmd_minds "$@" ;;
+    watcher) cmd_watcher "$@" ;;
     retire) cmd_retire "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     sync) cmd_sync "$@" ;;

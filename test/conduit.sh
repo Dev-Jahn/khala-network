@@ -209,7 +209,7 @@ uv run --no-project python - "$H20_CHANNEL_FRAMES" <<'PY' || fail H20 "channel r
 import json, sys
 request = json.loads(open(sys.argv[1], encoding="utf-8").readline())
 assert request["v"] == 1
-assert request["content"] == "reel@bw2 · conduit-20\n1 letter — run khala_drain"
+assert request["content"] == "reel@bw2 · conduit-20\n1 letters, 0 notices — run khala_drain"  # C3 (0.8.0)
 assert "KHALA-CONDUIT/1" not in request["content"]
 assert "generation" not in request["content"]
 assert "attempt" not in request["content"]
@@ -220,6 +220,7 @@ assert request["meta"]["user"] == "reel@bw2"
 assert len(request["meta"]["generation"]) == 64
 assert request["meta"]["attempt"]
 assert request["meta"]["later"] == "1"
+assert request["meta"]["notices"] == "0" and request["meta"]["urgent"] == "0" and request["meta"]["retry"] == "0"  # C3 (0.8.0)
 PY
 grep -R -q '"via":"channel"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" || \
     fail H20 "channel delivery journal omitted via=channel"

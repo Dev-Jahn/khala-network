@@ -61,6 +61,11 @@ non-세션(워처) 메시징의 확실한 구분. steno@b200 실측 회신(09-02
     conduit 저널의 attemptIndex를 그대로 노출); (c) B: 게이트웨이는 "귀는 열렸는데 drain이 N분째 없음"(=.ear 살아있음 ∧ 미처리
     pending 지속)을 사용자 토픽에 1줄로 알려야 한다 — 세션이 못 보내는 상태이므로 게이트웨이가 대신 말한다; (d) 계정 회전(ccbroker)
     이 1차 처방이며 이번엔 회전이 없었다(steno 운영 건).
+13. **같은 노드 notice의 지연**(코드 실측). `notify`는 `spool/for/<self>/`에 직접 쓰지만, dial 역할의 link 감시자는 자기 노드
+    스풀을 후보로 올리지 않고(link/watch.go:335) brain 트리거는 outbox·presence·STORED 이벤트에서만 난다. 그래서 같은 노드
+    알림은 다음 reconcile 계기(presence 갱신·다른 편지·30 s 주기 스캔의 age-gate reconcile)까지 inbox에 들어가지 않는다 —
+    최악 수십 초. 원격 노드행 알림은 STORED→trigger로 즉시. **0.8.0 소품**: `notify`가 자기 노드행이면 쓰고 나서
+    `run/reconcile.trigger`를 찍어(brain의 200 ms 폴링이 소비) 다음 초인종까지 1 s 내로 만든다. 별도 락 불요(brain이 직렬화).
 
 ## 2. 제안 A — `notice`: 기계 알림을 편지와 분리한다 (0.8.0)
 

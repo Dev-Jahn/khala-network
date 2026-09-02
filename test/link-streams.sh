@@ -347,7 +347,8 @@ KHALA_HOME="$B" KHALA_SESSION=race-reader "$KHALA" inbox --drain \
     fail 10 "first drain count was not one"
 KHALA_HOME="$B" KHALA_SESSION=race-reader "$KHALA" inbox --drain \
     >"$B/race-second.out" 2>"$B/race-second.err" || fail 10 "second race drain failed"
-[ ! -s "$B/race-second.out" ] || fail 10 "race entry redelivered after cursor advance"
+[ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$B/race-second.out")" -eq 0 ] ||
+    fail 10 "race entry redelivered after cursor advance"
 pass 10 "link+rsync race left one byte-identical file and one cursor drain"
 
 start_link "$OLD_A" oldalpha "$OLD_HUB" KHALA_LINK_TEST_SERVE_MINOR=0
