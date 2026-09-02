@@ -78,7 +78,7 @@ run_install() {
         KHALA_TEST_CURL_LOG=$install_home/curl.argv \
         KHALA_TEST_LINK_LOG=$install_home/link.argv \
         KHALA_LINK_RELEASE_BASE=file://$RELEASE \
-        sh "$INSTALL" "$@"
+        sh "$INSTALL" "$@" < /dev/null
     )
 }
 
@@ -141,6 +141,7 @@ case "$*" in
         ;;
     *'khala status | head -1'*) printf '%s\n' 'runtime: remote-ready' ;;
     *'khala sync'*) printf '%s\n' 'sync complete' ;;
+    *' true') cat > /dev/null ;;
 esac
 exit 0
 EOF
@@ -230,6 +231,27 @@ cmp -s "$RIG/join.expected" "$JOIN_HOME/.khala/config" || fail 2 'join config by
 grep -F $'ssh\t-o\tBatchMode=yes\t-o\tConnectTimeout=8\tuser@hub\ttrue' \
     "$JOIN_HOME/ssh.argv" >/dev/null || fail 2 'join reachability probe argv differ'
 pass 2 'join writes exact peer/mailbox config and probes the mailbox without blocking install'
+
+# 2b. Streamed join (sh -s < install.sh), the invite path: the mailbox probe must not
+# hand the script's stdin to ssh, or the rest of the installer is swallowed.
+STREAM_HOME=$RIG/stream-home
+make_home "$STREAM_HOME" || fail 2b 'could not create streamed-join HOME'
+(
+    unset KHALA_HOME KHALA_SESSION CLAUDE_PROJECT_DIR
+    HOME=$STREAM_HOME PATH=$SHIM:/usr/bin:/bin SHELL=/bin/sh KHALA_TEST_ROOT=$ROOT \
+        KHALA_TEST_CLAUDE_LOG=$STREAM_HOME/claude.argv KHALA_TEST_SSH_LOG=$STREAM_HOME/ssh.argv \
+        KHALA_TEST_SSH_STDIN=$STREAM_HOME/ssh.stdin KHALA_TEST_CURL_LOG=$STREAM_HOME/curl.argv \
+        KHALA_TEST_LINK_LOG=$STREAM_HOME/link.argv KHALA_LINK_RELEASE_BASE=file://$RELEASE \
+        sh -s -- --name laptop2 --mailbox hub user@hub < "$INSTALL"
+) > "$RIG/stream.out" 2> "$RIG/stream.err" || \
+    fail 2b "streamed join failed: $(tr '\n' ' ' < "$RIG/stream.err")"
+grep -q '^Khala installation complete:$' "$RIG/stream.out" || \
+    fail 2b 'streamed join ended before the summary (installer stdin swallowed by ssh?)'
+printf '%s\n' 'self laptop2' 'peer hub user@hub' 'mailbox hub' 'ttl 120' > "$RIG/stream.expected"
+cmp -s "$RIG/stream.expected" "$STREAM_HOME/.khala/config" || fail 2b 'streamed join config bytes differ'
+grep -F $'ssh\t-o\tBatchMode=yes\t-o\tConnectTimeout=8\tuser@hub\ttrue' \
+    "$STREAM_HOME/ssh.argv" >/dev/null || fail 2b 'streamed join skipped the reachability probe'
+pass 2b 'streamed join (sh -s) survives an stdin-draining mailbox probe and completes'
 
 # 3. Idempotent rerun.
 BOOT_CONFIG_SUM=$(cksum "$BOOT_HOME/.khala/config")
