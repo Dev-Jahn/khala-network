@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.8.0
+KHALA_VERSION=0.8.1
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -133,16 +133,37 @@ require_config() {
 }
 
 valid_name() {
-    printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*$'
+    case "$1" in
+        ''|-*|*[!a-z0-9-]*) return 1 ;;
+    esac
+    return 0
 }
 
 valid_address() {
-    printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$'
+    case "$1" in
+        *@*@*) return 1 ;;
+        *@*) ;;
+        *) return 1 ;;
+    esac
+    valid_name "${1%%@*}" && valid_name "${1#*@}"
 }
 
 valid_message_id() {
-    printf '%s\n' "$1" | grep -q \
-        '^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[a-z0-9][a-z0-9-]*@[a-z0-9][a-z0-9-]*$'
+    case "$1" in
+        *.*.*.*@*) ;;
+        *) return 1 ;;
+    esac
+    message_id_rest=$1
+    message_id_epoch=${message_id_rest%%.*}
+    message_id_rest=${message_id_rest#*.}
+    message_id_counter=${message_id_rest%%.*}
+    message_id_rest=${message_id_rest#*.}
+    message_id_pid=${message_id_rest%%.*}
+    message_id_rest=${message_id_rest#*.}
+    positive_or_zero_integer "$message_id_epoch" && \
+        positive_or_zero_integer "$message_id_counter" && \
+        positive_or_zero_integer "$message_id_pid" && \
+        valid_address "$message_id_rest"
 }
 
 positive_or_zero_integer() {
@@ -157,8 +178,16 @@ positive_integer() {
     [ "$1" -gt 0 ] 2>/dev/null
 }
 
+# The helpers below run inside reconcile loops that visit every file on every
+# pass (0.8.1: a pass is a hot path, once a second under the link). They are
+# pure shell on purpose: one fork per value, times a few values per file, times
+# hundreds of files, is what held the brain lock for whole seconds. LC_ALL=C is
+# pinned above, so the bracket ranges in these case patterns are ASCII.
 normalize_integer() {
-    normalized=$(printf '%s\n' "$1" | sed 's/^0*//')
+    normalized=$1
+    while case "$normalized" in 0?*) true ;; *) false ;; esac; do
+        normalized=${normalized#0}
+    done
     if [ -z "$normalized" ]; then
         normalized=0
     fi
@@ -184,6 +213,47 @@ retain_days() {
         return 1
     fi
     normalize_integer "$retained"
+}
+
+# Age-out sweeps (expired notices, aged cur/acked/dead, delivered log, and the
+# retention deletions of streams, minds and presence) answer "older than N
+# days?" — a question whose answer does not change between two passes a second
+# apart. 0.8.0 ran them on every reconcile, and the link reconciles once a
+# second while fresh; on a node with a few hundred letters that held
+# brain.lock.d for 6-8 s of every 10, and every drain/notify on the node waited
+# out its 60 attempts (2026-09-02). Delivery, acks, dead-man, expiry of
+# outbox/new, preserve capture, validation/quarantine and the mind generation
+# GC stay on every pass; only the age-out sweeps wait for `retention-interval`
+# seconds (300 by default; 0 = every pass) measured from run/retention.stamp.
+retention_interval_seconds() {
+    retention_interval=$(sed -n 's/^retention-interval //p' "$CONFIG")
+    if [ -z "$retention_interval" ]; then
+        retention_interval=300
+    fi
+    if ! bounded_integer "$retention_interval"; then
+        error "config의 retention-interval이 0 이상 18자리 이하의 정수가 아닙니다"
+        return 1
+    fi
+    normalize_integer "$retention_interval"
+}
+
+# True when the age-out sweeps are due; stamps the pass so the next one waits.
+# A missing or unreadable stamp means due (a fresh node prunes on its first
+# pass); a stamp from the future (clock step) also means due, never a lockout.
+retention_due() {
+    retention_due_interval=$1
+    retention_stamp=$KHALA_ROOT/run/retention.stamp
+    if [ "$retention_due_interval" -gt 0 ] && [ -f "$retention_stamp" ]; then
+        retention_now=$(date +%s) || return 0
+        retention_last=$(file_mtime "$retention_stamp") || retention_last=
+        if bounded_integer "${retention_last-}" && \
+            [ "$retention_last" -le "$retention_now" ] && \
+            [ "$((retention_now - retention_last))" -lt "$retention_due_interval" ]; then
+            return 1
+        fi
+    fi
+    touch "$retention_stamp" 2>/dev/null || :
+    return 0
 }
 
 file_mtime() {
@@ -241,10 +311,32 @@ session_name() {
     printf '%s\n' "$session"
 }
 
+# Every "Key: value" line of the header block (up to the first empty line),
+# in file order, values only. A file without a trailing newline still yields
+# its last line.
 header_value() {
     key=$1
     file=$2
-    sed -n "/^$/q; s/^$key: //p" "$file"
+    while IFS= read -r header_line || [ -n "$header_line" ]; do
+        [ -n "$header_line" ] || break
+        case "$header_line" in
+            "$key: "*) printf '%s\n' "${header_line#"$key: "}" ;;
+        esac
+    done < "$file"
+}
+
+# Number of lines anywhere in the file (header and body) starting with the
+# literal prefix — the fork-free twin of `grep -c "^prefix"`.
+line_prefix_count() {
+    prefix=$1
+    file=$2
+    prefix_count=0
+    while IFS= read -r prefix_line || [ -n "$prefix_line" ]; do
+        case "$prefix_line" in
+            "$prefix"*) prefix_count=$((prefix_count + 1)) ;;
+        esac
+    done < "$file"
+    printf '%s\n' "$prefix_count"
 }
 
 atomic_copy() {
@@ -291,12 +383,28 @@ atomic_line() {
 read_watcher_marker() {
     watcher_read_file=$1
     [ -f "$watcher_read_file" ] || return 1
-    [ "$(wc -l < "$watcher_read_file" | tr -d ' ')" -eq 5 ] || return 1
-    WATCHER_L1=$(sed -n '1p' "$watcher_read_file")
-    WATCHER_L2=$(sed -n '2p' "$watcher_read_file")
-    WATCHER_L3=$(sed -n '3p' "$watcher_read_file")
-    WATCHER_L4=$(sed -n '4p' "$watcher_read_file")
-    WATCHER_L5=$(sed -n '5p' "$watcher_read_file")
+    # Exactly five newline-terminated lines (a partial sixth line is ignored,
+    # as `wc -l` would have ignored it); read in one pass, no forks — this runs
+    # for every marker on every reconcile.
+    watcher_read_n=0
+    watcher_read_1= watcher_read_2= watcher_read_3= watcher_read_4= watcher_read_5=
+    while IFS= read -r watcher_read_line; do
+        watcher_read_n=$((watcher_read_n + 1))
+        case "$watcher_read_n" in
+            1) watcher_read_1=$watcher_read_line ;;
+            2) watcher_read_2=$watcher_read_line ;;
+            3) watcher_read_3=$watcher_read_line ;;
+            4) watcher_read_4=$watcher_read_line ;;
+            5) watcher_read_5=$watcher_read_line ;;
+            *) return 1 ;;
+        esac
+    done < "$watcher_read_file"
+    [ "$watcher_read_n" -eq 5 ] || return 1
+    WATCHER_L1=$watcher_read_1
+    WATCHER_L2=$watcher_read_2
+    WATCHER_L3=$watcher_read_3
+    WATCHER_L4=$watcher_read_4
+    WATCHER_L5=$watcher_read_5
     WATCHER_RETIRED=0
     case "$WATCHER_L1" in
         retired\ *)
@@ -643,7 +751,19 @@ new_message_id() {
 }
 
 valid_generation() {
-    printf '%s\n' "$1" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+    case "$1" in
+        *.*.*) return 1 ;;
+        *.*) ;;
+        *) return 1 ;;
+    esac
+    for generation_part in "${1%%.*}" "${1#*.}"; do
+        case "$generation_part" in
+            0) ;;
+            [1-9]*) positive_or_zero_integer "$generation_part" || return 1 ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
 }
 
 valid_mind_value() {
@@ -664,21 +784,82 @@ validate_mind_file() {
         ! valid_generation "$mind_expected_generation"; then
         return 1
     fi
-    for mind_header in Generation Session Node State Model Effort Role Charge Focus Stance \
-        Declared-State Declared-Model Declared-Effort Declared-Role Declared-Charge \
-        Declared-Focus Declared-Stance; do
-        [ "$(grep -c "^$mind_header: " "$mind_file")" -eq 1 ] || return 1
+    # One pass over the whole file (it runs for every mind generation on every
+    # reconcile): a header value comes from the block before the first empty
+    # line, while every line of the file — body included — counts toward the
+    # exactly-once rule, as the grep -c this replaces did.
+    mind_in_header=1
+    mind_generation= mind_session= mind_node= mind_state=
+    mind_declared_state= mind_declared_model= mind_declared_effort= mind_declared_role=
+    mind_declared_charge= mind_declared_focus= mind_declared_stance=
+    mind_n_generation=0 mind_n_session=0 mind_n_node=0 mind_n_state=0 mind_n_model=0
+    mind_n_effort=0 mind_n_role=0 mind_n_charge=0 mind_n_focus=0 mind_n_stance=0
+    mind_n_declared_state=0 mind_n_declared_model=0 mind_n_declared_effort=0
+    mind_n_declared_role=0 mind_n_declared_charge=0 mind_n_declared_focus=0
+    mind_n_declared_stance=0
+    while IFS= read -r mind_line || [ -n "$mind_line" ]; do
+        if [ -z "$mind_line" ]; then
+            mind_in_header=0
+            continue
+        fi
+        case "$mind_line" in
+            "Generation: "*)
+                mind_n_generation=$((mind_n_generation + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_generation=${mind_line#"Generation: "} ;;
+            "Session: "*)
+                mind_n_session=$((mind_n_session + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_session=${mind_line#"Session: "} ;;
+            "Node: "*)
+                mind_n_node=$((mind_n_node + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_node=${mind_line#"Node: "} ;;
+            "State: "*)
+                mind_n_state=$((mind_n_state + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_state=${mind_line#"State: "} ;;
+            "Model: "*) mind_n_model=$((mind_n_model + 1)) ;;
+            "Effort: "*) mind_n_effort=$((mind_n_effort + 1)) ;;
+            "Role: "*) mind_n_role=$((mind_n_role + 1)) ;;
+            "Charge: "*) mind_n_charge=$((mind_n_charge + 1)) ;;
+            "Focus: "*) mind_n_focus=$((mind_n_focus + 1)) ;;
+            "Stance: "*) mind_n_stance=$((mind_n_stance + 1)) ;;
+            "Declared-State: "*)
+                mind_n_declared_state=$((mind_n_declared_state + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_state=${mind_line#"Declared-State: "} ;;
+            "Declared-Model: "*)
+                mind_n_declared_model=$((mind_n_declared_model + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_model=${mind_line#"Declared-Model: "} ;;
+            "Declared-Effort: "*)
+                mind_n_declared_effort=$((mind_n_declared_effort + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_effort=${mind_line#"Declared-Effort: "} ;;
+            "Declared-Role: "*)
+                mind_n_declared_role=$((mind_n_declared_role + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_role=${mind_line#"Declared-Role: "} ;;
+            "Declared-Charge: "*)
+                mind_n_declared_charge=$((mind_n_declared_charge + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_charge=${mind_line#"Declared-Charge: "} ;;
+            "Declared-Focus: "*)
+                mind_n_declared_focus=$((mind_n_declared_focus + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_focus=${mind_line#"Declared-Focus: "} ;;
+            "Declared-Stance: "*)
+                mind_n_declared_stance=$((mind_n_declared_stance + 1))
+                [ "$mind_in_header" -eq 0 ] || mind_declared_stance=${mind_line#"Declared-Stance: "} ;;
+        esac
+    done < "$mind_file"
+    for mind_count in "$mind_n_generation" "$mind_n_session" "$mind_n_node" "$mind_n_state" \
+        "$mind_n_model" "$mind_n_effort" "$mind_n_role" "$mind_n_charge" "$mind_n_focus" \
+        "$mind_n_stance" "$mind_n_declared_state" "$mind_n_declared_model" \
+        "$mind_n_declared_effort" "$mind_n_declared_role" "$mind_n_declared_charge" \
+        "$mind_n_declared_focus" "$mind_n_declared_stance"; do
+        [ "$mind_count" -eq 1 ] || return 1
     done
-    [ "$(header_value Generation "$mind_file")" = "$mind_expected_generation" ] || return 1
-    [ "$(header_value Session "$mind_file")" = "$mind_expected_session" ] || return 1
-    [ "$(header_value Node "$mind_file")" = "$mind_expected_node" ] || return 1
-    mind_state=$(header_value State "$mind_file")
+    [ "$mind_generation" = "$mind_expected_generation" ] || return 1
+    [ "$mind_session" = "$mind_expected_session" ] || return 1
+    [ "$mind_node" = "$mind_expected_node" ] || return 1
     case "$mind_state" in
         active|cleared) ;;
         *) return 1 ;;
     esac
-    for mind_field in State Model Effort Role Charge Focus Stance; do
-        mind_declared=$(header_value "Declared-$mind_field" "$mind_file")
+    for mind_declared in "$mind_declared_state" "$mind_declared_model" "$mind_declared_effort" \
+        "$mind_declared_role" "$mind_declared_charge" "$mind_declared_focus" "$mind_declared_stance"; do
         positive_or_zero_integer "$mind_declared" || return 1
     done
     return 0
@@ -694,7 +875,7 @@ current_mind_generation() {
     current_mind_path=
     for current_candidate in "$current_mind_dir"/*; do
         [ -f "$current_candidate" ] || continue
-        current_generation=$(basename "$current_candidate")
+        current_generation=${current_candidate##*/}
         if ! valid_generation "$current_generation" || \
             ! validate_mind_file "$current_candidate" "$current_mind_node" \
                 "$current_mind_session" "$current_generation"; then
@@ -1127,7 +1308,11 @@ archive_stream_file() {
     archive_stream_id=$4
     archive_destination=$(archive_path_for "$archive_stream_name" "$archive_node_name" \
         "$archive_stream_id") || return 1
-    archive_destination_dir=$(dirname "$archive_destination")
+    # Already settled: the archive entry is this very inode (the hardlink made
+    # on an earlier pass). Nothing to create, compare or sync — and this is the
+    # common case on every pass of a preserving node.
+    [ "$archive_live" -ef "$archive_destination" ] && return 0
+    archive_destination_dir=${archive_destination%/*}
     if ! mkdir -p "$archive_destination_dir"; then
         error "preserver degraded: $archive_destination_dir를 만들지 못했습니다"
         return 1
@@ -1164,9 +1349,11 @@ capture_preserved_streams() {
     capture_now=$(date +%s) || return 1
     for capture_file in "$KHALA_ROOT"/streams/*/*/*; do
         [ -f "$capture_file" ] || continue
-        capture_node=$(basename "$(dirname "$capture_file")")
-        capture_stream=$(basename "$(dirname "$(dirname "$capture_file")")")
-        capture_id=$(basename "$capture_file")
+        capture_node_dir=${capture_file%/*}
+        capture_node=${capture_node_dir##*/}
+        capture_stream_dir=${capture_node_dir%/*}
+        capture_stream=${capture_stream_dir##*/}
+        capture_id=${capture_file##*/}
         preserve_stream_selected "$capture_stream" || continue
         if ! valid_name "$capture_stream" || ! valid_name "$capture_node" || \
             ! validate_stream_file "$capture_file" "$capture_stream" "$capture_node"; then
@@ -1198,7 +1385,7 @@ validate_stream_file() {
     stream_date=$(header_value Date "$stream_file")
     stream_type=$(header_value Type "$stream_file")
     stream_refs=$(header_value Refs "$stream_file")
-    if ! valid_message_id "$stream_id" || [ "$(basename "$stream_file")" != "$stream_id" ]; then
+    if ! valid_message_id "$stream_id" || [ "${stream_file##*/}" != "$stream_id" ]; then
         return 1
     fi
     if ! valid_address "$stream_from" || [ "${stream_from#*@}" != "$stream_node_expected" ]; then
@@ -1213,7 +1400,7 @@ validate_stream_file() {
         return 1
     fi
     if [ "$(header_value Khala "$stream_file")" != 0.1 ] || \
-        grep -q '^Expires:' "$stream_file"; then
+        [ "$(line_prefix_count 'Expires:' "$stream_file")" -ne 0 ]; then
         return 1
     fi
     if [ -n "$stream_refs" ] && ! valid_message_id "$stream_refs"; then
@@ -2363,7 +2550,11 @@ watcher_deadman() {
     done
 }
 
+# Every pass: validate, quarantine garbage and future epochs. The retention
+# deletion (and its preserve capture) waits for the retention interval
+# ($1 = 1 when that sweep is due).
 prune_stream_entries() {
+    prune_stream_retention=$1
     prune_stream_now=$(date +%s) || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
@@ -2375,9 +2566,11 @@ prune_stream_entries() {
     prune_stream_seconds=$((prune_stream_days * 86400))
     for prune_stream_file in "$KHALA_ROOT"/streams/*/*/*; do
         [ -f "$prune_stream_file" ] || continue
-        prune_stream_node=$(basename "$(dirname "$prune_stream_file")")
-        prune_stream_name=$(basename "$(dirname "$(dirname "$prune_stream_file")")")
-        prune_stream_id=$(basename "$prune_stream_file")
+        prune_stream_node_dir=${prune_stream_file%/*}
+        prune_stream_node=${prune_stream_node_dir##*/}
+        prune_stream_name_dir=${prune_stream_node_dir%/*}
+        prune_stream_name=${prune_stream_name_dir##*/}
+        prune_stream_id=${prune_stream_file##*/}
         if ! valid_name "$prune_stream_name" || ! valid_name "$prune_stream_node" || \
             ! validate_stream_file "$prune_stream_file" "$prune_stream_name" "$prune_stream_node"; then
             quarantine_stream_file "$prune_stream_file" "$prune_stream_name" \
@@ -2392,6 +2585,7 @@ prune_stream_entries() {
                 sync_error "$prune_stream_file: 미래 stream 항목 격리에 실패했습니다"
             continue
         fi
+        [ "$prune_stream_retention" -eq 1 ] || continue
         if [ "$((prune_stream_epoch + prune_stream_seconds))" -lt "$prune_stream_now" ]; then
             if [ "$PRESERVE_CONFIG_INVALID" -eq 1 ]; then
                 PRESERVER_DEGRADED=1
@@ -2418,7 +2612,12 @@ prune_stream_entries() {
     done
 }
 
+# Every pass: validate and quarantine, and collect every generation below the
+# current maximum (protocol 1.2 GC — a delayed lower generation must not
+# outlive the next reconcile). Only the retention deletion of the maximum
+# waits for the retention interval ($1 = 1 when that sweep is due).
 prune_mind_generations() {
+    prune_mind_retention=$1
     prune_mind_now=$(date +%s) || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
@@ -2430,11 +2629,12 @@ prune_mind_generations() {
     prune_mind_seconds=$((prune_mind_days * 86400))
     for prune_mind_session_dir in "$KHALA_ROOT"/minds/*/*; do
         [ -d "$prune_mind_session_dir" ] || continue
-        prune_mind_node=$(basename "$(dirname "$prune_mind_session_dir")")
-        prune_mind_session=$(basename "$prune_mind_session_dir")
+        prune_mind_node_dir=${prune_mind_session_dir%/*}
+        prune_mind_node=${prune_mind_node_dir##*/}
+        prune_mind_session=${prune_mind_session_dir##*/}
         for prune_mind_file in "$prune_mind_session_dir"/*; do
             [ -f "$prune_mind_file" ] || continue
-            prune_mind_generation=$(basename "$prune_mind_file")
+            prune_mind_generation=${prune_mind_file##*/}
             if ! validate_mind_file "$prune_mind_file" "$prune_mind_node" \
                 "$prune_mind_session" "$prune_mind_generation"; then
                 quarantine_mind_file "$prune_mind_file" "$prune_mind_node" \
@@ -2468,7 +2668,8 @@ prune_mind_generations() {
                 fi
             fi
         done
-        prune_mind_generation=$(basename "$prune_mind_current")
+        [ "$prune_mind_retention" -eq 1 ] || continue
+        prune_mind_generation=${prune_mind_current##*/}
         prune_mind_epoch=$(normalize_integer "${prune_mind_generation%%.*}")
         if [ "$((prune_mind_epoch + prune_mind_seconds))" -lt "$prune_mind_now" ]; then
             if ! rm -f "$prune_mind_current"; then
@@ -2590,7 +2791,19 @@ reconcile_cycle() {
         sync_error "self node를 읽지 못했습니다"
     else
         copy_outbox_to_spool
-        prune_expired_notices
+        # A broken retention-interval must not silently stop the sweeps: report it
+        # and sweep on this pass as if the interval were 0.
+        if reconcile_interval=$(retention_interval_seconds); then
+            if retention_due "$reconcile_interval"; then
+                reconcile_retention=1
+            else
+                reconcile_retention=0
+            fi
+        else
+            sync_error "retention-interval 설정을 읽지 못했습니다 — 이번 pass는 age-out 정리를 그냥 돌립니다"
+            reconcile_retention=1
+        fi
+        [ "$reconcile_retention" -eq 0 ] || prune_expired_notices
         reconcile_spool=$KHALA_ROOT/spool/for/$reconcile_self
         if ! mkdir -p "$reconcile_spool"; then
             sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
@@ -2601,16 +2814,18 @@ reconcile_cycle() {
             settle_acks "$reconcile_spool"
         fi
         expire_outbox "$reconcile_self"
-        prune_letter_archives
-        prune_delivered_log
+        if [ "$reconcile_retention" -eq 1 ]; then
+            prune_letter_archives
+            prune_delivered_log
+        fi
         if ! load_preserve_config; then
             sync_error "preserver degraded: preserve config를 읽지 못했습니다"
         elif ! capture_preserved_streams; then
             sync_error "preserver degraded: 하나 이상의 live stream을 정착시키지 못했습니다"
         fi
-        prune_stream_entries
-        prune_mind_generations
-        prune_presence
+        prune_stream_entries "$reconcile_retention"
+        prune_mind_generations "$reconcile_retention"
+        [ "$reconcile_retention" -eq 0 ] || prune_presence
         prune_session_stream_state "$reconcile_self"
     fi
     if ! release_lock "$reconcile_lock"; then
@@ -4606,7 +4821,10 @@ cmd_inbox() {
     inbox_drain_status=0
     trap '' PIPE
     if [ "$inbox_drain_selection" != notices ]; then
-        prune_stream_entries
+        # A drain prunes streams unconditionally so that it never prints or
+        # advances the cursor over an entry retention would already have
+        # removed; drains are rare compared with the link's reconcile passes.
+        prune_stream_entries 1
     fi
     drained_n=0
     drained_bytes=0

@@ -153,7 +153,13 @@ Reconcile silently removes notices after their envelope `Expires` time,
 whether they are waiting in a spool or are already in inbox `new/` or `cur/`.
 It also removes inbox `cur/`, `outbox/acked`, and `outbox/dead` records after
 `retain` days (30 by default). Unread mail in inbox `new/` is never removed by
-retention: undrained mail remains the truth.
+retention: undrained mail remains the truth. These age-out sweeps (and the
+stream, mind, presence and delivered-log ones) run at most once per
+`retention-interval` seconds (300 by default; `0` runs them on every pass),
+so a link reconciling once a second does not hold the brain lock for the
+whole sweep. Delivery, acks, dead-man notices, outbox expiry, preserve
+capture, validation and quarantine of stream and mind files, and the
+collection of superseded mind generations still run on every pass.
 
 ## Install
 
