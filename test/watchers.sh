@@ -38,6 +38,7 @@ init_home() {
     init_home_path=$1
     KHALA_HOME=$init_home_path "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" ||
         die "init failed: $(tr '\n' ' ' < "$RIG/init.err")"
+    printf 'retention-interval 0\n' >> "$init_home_path/config" || die "config append failed"
 }
 
 write_marker() {

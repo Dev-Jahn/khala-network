@@ -122,7 +122,7 @@ def initialize(client: Client, capabilities: dict | None = None) -> None:
     )
     initialized = client.response(1)
     assert initialized["result"]["serverInfo"]["name"] == "khala", initialized
-    assert initialized["result"]["serverInfo"]["version"] == "0.8.0", initialized
+    assert initialized["result"]["serverInfo"]["version"] == "0.8.1", initialized
     assert "claude/channel" in initialized["result"]["capabilities"]["experimental"]
     client.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 

@@ -36,6 +36,7 @@ trap cleanup EXIT HUP INT TERM
 if ! "$KHALA" init b200 >"$TEST_DIR/init.out" 2>"$TEST_DIR/init.err"; then
     fail 1 "init failed: $(tr '\n' ' ' < "$TEST_DIR/init.err")"
 fi
+printf 'retention-interval 0\n' >> "$KHALA_HOME/config" || fail 1 "config append failed"
 if ! baseline_id=$(KHALA_SESSION=baseline "$KHALA" send baseline@b200 \
     -m "pruning baseline" 2>"$TEST_DIR/baseline-send.err"); then
     fail 1 "baseline send failed: $(tr '\n' ' ' < "$TEST_DIR/baseline-send.err")"

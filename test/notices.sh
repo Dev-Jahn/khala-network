@@ -39,6 +39,7 @@ init_home() {
     init_home_path=$1
     KHALA_HOME=$init_home_path "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" ||
         die "init failed: $(tr '\n' ' ' < "$RIG/init.err")"
+    printf 'retention-interval 0\n' >> "$init_home_path/config" || die "config append failed"
 }
 
 write_letter() {
@@ -427,5 +428,42 @@ if KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" send other@alpha -s ttl -m x -
 fi
 grep -q 5097600 "$RIG/ttl.err" || die "TTL refusal does not name the cap"
 printf 'ok P4d — retention uses state-entry time; send TTL is capped below the dedup horizon\n'
+
+# P4e — age-out sweeps run at most once per retention-interval (0.8.1): the link reconciles
+# once a second while fresh, and a full-tree sweep on every pass starved the brain lock.
+home=$RIG/interval
+KHALA_HOME=$home "$KHALA" init alpha >/dev/null 2>&1 || die "interval init failed"
+grep -q '^retention-interval' "$home/config" && die "init wrote a retention-interval line (default must be implicit)"
+now=$(date +%s)
+aged() {
+    touch -d "@$2" "$1" 2>/dev/null || touch -t "$(date -r "$2" +%Y%m%d%H%M.%S 2>/dev/null || date -d "@$2" +%Y%m%d%H%M.%S)" "$1"
+}
+write_letter "$home" reader "$now.3.1.first@alpha" first@alpha notice info first "$((now - 1))" gone
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-1.err" || die "interval reconcile 1 failed"
+[ ! -e "$home/inbox/reader/new/$now.3.1.first@alpha" ] || die "first pass on a fresh node did not sweep"
+[ -f "$home/run/retention.stamp" ] || die "sweep left no retention stamp"
+write_letter "$home" reader "$now.3.2.second@alpha" second@alpha notice info second "$((now - 1))" waits
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-2.err" || die "interval reconcile 2 failed"
+[ -f "$home/inbox/reader/new/$now.3.2.second@alpha" ] || die "a pass inside the interval swept anyway"
+aged "$home/run/retention.stamp" "$((now - 301))"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-3.err" || die "interval reconcile 3 failed"
+[ ! -e "$home/inbox/reader/new/$now.3.2.second@alpha" ] || die "a pass after the interval did not sweep"
+aged "$home/run/retention.stamp" "$((now + 100000))"
+write_letter "$home" reader "$now.3.3.third@alpha" third@alpha notice info third "$((now - 1))" clock
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-4.err" || die "interval reconcile 4 failed"
+[ ! -e "$home/inbox/reader/new/$now.3.3.third@alpha" ] || die "a future stamp locked the sweep out"
+printf 'retention-interval 0\n' >> "$home/config"
+write_letter "$home" reader "$now.3.4.fourth@alpha" fourth@alpha notice info fourth "$((now - 1))" every
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-5.err" || die "interval reconcile 5 failed"
+[ ! -e "$home/inbox/reader/new/$now.3.4.fourth@alpha" ] || die "interval 0 did not sweep on every pass"
+sed 's/^retention-interval 0$/retention-interval x/' "$home/config" > "$home/tmp/config.bad" && mv "$home/tmp/config.bad" "$home/config"
+write_letter "$home" reader "$now.3.5.fifth@alpha" fifth@alpha notice info fifth "$((now - 1))" broken
+if KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/interval-6.err"; then
+    die "a non-integer retention-interval was accepted silently"
+fi
+grep -q 'retention-interval' "$RIG/interval-6.err" || die "bad interval error does not name the key"
+[ ! -e "$home/inbox/reader/new/$now.3.5.fifth@alpha" ] || die "a broken interval silently stopped the sweep"
+for f in 1 2 3 4 5; do [ ! -s "$RIG/interval-$f.err" ] || die "interval pass $f was not silent: $(tr '\n' ' ' < "$RIG/interval-$f.err")"; done
+printf 'ok P4e — age-out sweeps wait for retention-interval; a future stamp and interval 0 sweep at once\n'
 
 printf 'RESULT: PASS\n'

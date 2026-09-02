@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.8.0
+KHALA_VERSION=0.8.1
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -184,6 +184,46 @@ retain_days() {
         return 1
     fi
     normalize_integer "$retained"
+}
+
+# Retention passes (expired notices, aged cur/acked/dead, delivered log,
+# stream/mind/presence age-out) answer "older than N days?" — a question whose
+# answer does not change between two passes a second apart. 0.8.0 ran them on
+# every reconcile, and the link reconciles once a second while fresh; on a node
+# with a few hundred letters that held brain.lock.d for 6-8 s of every 10, and
+# every drain/notify on the node waited out its 60 attempts (2026-09-02).
+# Delivery, acks, dead-man, expiry of outbox/new and preserve capture stay on
+# every pass; only the age-out sweeps wait for `retention-interval` seconds
+# (300 by default; 0 = every pass) measured from run/retention.stamp.
+retention_interval_seconds() {
+    retention_interval=$(sed -n 's/^retention-interval //p' "$CONFIG")
+    if [ -z "$retention_interval" ]; then
+        retention_interval=300
+    fi
+    if ! bounded_integer "$retention_interval"; then
+        error "config의 retention-interval이 0 이상 18자리 이하의 정수가 아닙니다"
+        return 1
+    fi
+    normalize_integer "$retention_interval"
+}
+
+# True when the age-out sweeps are due; stamps the pass so the next one waits.
+# A missing or unreadable stamp means due (a fresh node prunes on its first
+# pass); a stamp from the future (clock step) also means due, never a lockout.
+retention_due() {
+    retention_due_interval=$1
+    retention_stamp=$KHALA_ROOT/run/retention.stamp
+    if [ "$retention_due_interval" -gt 0 ] && [ -f "$retention_stamp" ]; then
+        retention_now=$(date +%s) || return 0
+        retention_last=$(file_mtime "$retention_stamp") || retention_last=
+        if bounded_integer "${retention_last-}" && \
+            [ "$retention_last" -le "$retention_now" ] && \
+            [ "$((retention_now - retention_last))" -lt "$retention_due_interval" ]; then
+            return 1
+        fi
+    fi
+    touch "$retention_stamp" 2>/dev/null || :
+    return 0
 }
 
 file_mtime() {
@@ -2590,7 +2630,19 @@ reconcile_cycle() {
         sync_error "self node를 읽지 못했습니다"
     else
         copy_outbox_to_spool
-        prune_expired_notices
+        # A broken retention-interval must not silently stop the sweeps: report it
+        # and sweep on this pass as if the interval were 0.
+        if reconcile_interval=$(retention_interval_seconds); then
+            if retention_due "$reconcile_interval"; then
+                reconcile_retention=1
+            else
+                reconcile_retention=0
+            fi
+        else
+            sync_error "retention-interval 설정을 읽지 못했습니다 — 이번 pass는 age-out 정리를 그냥 돌립니다"
+            reconcile_retention=1
+        fi
+        [ "$reconcile_retention" -eq 0 ] || prune_expired_notices
         reconcile_spool=$KHALA_ROOT/spool/for/$reconcile_self
         if ! mkdir -p "$reconcile_spool"; then
             sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
@@ -2601,16 +2653,20 @@ reconcile_cycle() {
             settle_acks "$reconcile_spool"
         fi
         expire_outbox "$reconcile_self"
-        prune_letter_archives
-        prune_delivered_log
+        if [ "$reconcile_retention" -eq 1 ]; then
+            prune_letter_archives
+            prune_delivered_log
+        fi
         if ! load_preserve_config; then
             sync_error "preserver degraded: preserve config를 읽지 못했습니다"
         elif ! capture_preserved_streams; then
             sync_error "preserver degraded: 하나 이상의 live stream을 정착시키지 못했습니다"
         fi
-        prune_stream_entries
-        prune_mind_generations
-        prune_presence
+        if [ "$reconcile_retention" -eq 1 ]; then
+            prune_stream_entries
+            prune_mind_generations
+            prune_presence
+        fi
         prune_session_stream_state "$reconcile_self"
     fi
     if ! release_lock "$reconcile_lock"; then

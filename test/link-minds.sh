@@ -51,6 +51,7 @@ write_config() {
         printf 'mailbox %s\n' "$config_peer"
         printf 'ttl 120\n'
         printf 'retain 30\n'
+        printf 'retention-interval 0\n'
     } > "$config_home/config"
 }
 

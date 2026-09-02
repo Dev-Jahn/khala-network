@@ -60,6 +60,7 @@ write_spoke_config() {
         printf 'mailbox b200\n'
         printf 'ttl 120\n'
         printf 'retain 30\n'
+        printf 'retention-interval 0\n'
     } > "$config_tmp" || return 1
     mv "$config_tmp" "$config_home/config"
 }

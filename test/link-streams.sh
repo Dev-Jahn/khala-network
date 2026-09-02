@@ -55,6 +55,7 @@ write_config() {
         printf 'mailbox b200\n'
         printf 'ttl 120\n'
         printf 'retain 30\n'
+        printf 'retention-interval 0\n'
     } > "$config_home/config"
 }
 

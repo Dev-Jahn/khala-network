@@ -571,6 +571,12 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   31일 묵은 편지를 drain한 직후 지워지면 안 된다(mtime이 Id보다 앞서면 Id epoch로 폴백).
   `send -e`는 5097600초(59일) 이하로 제한한다 — dedup 기록 보존(60일) 안에 들어야
   재전송이 두 번 설치되지 않는다. `inbox/*/new`의 mail은 retention으로 절대 삭제하지 않는다.
+  **age-out 정리는 `retention-interval`초(기본 300, 0=매 pass)에 한 번만** 돈다(0.8.1):
+  reconcile은 link가 fresh한 동안 1초마다 불리는데, 0.8.0은 매 pass마다 편지 트리 전체를
+  파일당 서너 번 fork하며 검사해(수백 통에 6-8 s) brain.lock.d를 사실상 독점했고 그 노드의
+  drain/notify가 60회 대기 뒤 실패했다(2026-09-02 실측). 배달·ack·dead-man·outbox 만료·
+  preserve 캡처는 매 pass 그대로이며, 기준 시각은 `run/retention.stamp`의 mtime이다(없거나
+  미래면 due — 잠금이 아니라 즉시 정리).
   `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
   last-notify가 모두 오래됐을 때만 삭제한다.
 
