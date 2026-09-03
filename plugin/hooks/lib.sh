@@ -6,6 +6,13 @@ khala_valid_name() {
     printf '%s\n' "$1" | grep -q '^[a-z0-9][a-z0-9-]*$'
 }
 
+khala_reserved_name() {
+    case "$1" in
+        conduit|khala|khala-gateway|gateway|operator) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 khala_nonnegative_integer() {
     case "$1" in
         ''|*[!0-9]*) return 1 ;;
@@ -178,12 +185,14 @@ khala_resolve_session() {
 
     if [ "${KHALA_SESSION+x}" = x ]; then
         KHALA_EXPLICIT_IDENTITY=1
-        if khala_valid_name "$KHALA_SESSION"; then
+        if khala_valid_name "$KHALA_SESSION" && ! khala_reserved_name "$KHALA_SESSION"; then
             KHALA_RESOLVED_SESSION=$KHALA_SESSION
             KHALA_SESSION_SOURCE=environment
             return 0
         fi
-        if [ "$khala_emit_warning" -eq 1 ]; then
+        if [ "$khala_emit_warning" -eq 1 ] && khala_reserved_name "$KHALA_SESSION"; then
+            printf 'khala: 예약된 이름입니다: %s\n' "$KHALA_SESSION"
+        elif [ "$khala_emit_warning" -eq 1 ]; then
             printf 'khala: KHALA_SESSION이 유효한 세션 이름이 아닙니다: %s (허용: [a-z0-9][a-z0-9-]*)\n' \
                 "$KHALA_SESSION"
         fi
@@ -192,13 +201,17 @@ khala_resolve_session() {
 
     khala_session_path=${CLAUDE_PROJECT_DIR-}/.khala-session
     if [ -n "${CLAUDE_PROJECT_DIR-}" ] && [ -f "$khala_session_path" ]; then
-        if khala_read_session_file "$khala_session_path"; then
+        if khala_read_session_file "$khala_session_path" && \
+            ! khala_reserved_name "$KHALA_SESSION_FILE_VALUE"; then
             KHALA_RESOLVED_SESSION=$KHALA_SESSION_FILE_VALUE
             KHALA_SESSION_SOURCE=file
             KHALA_EXPLICIT_IDENTITY=1
             return 0
         fi
-        if [ "$khala_emit_warning" -eq 1 ]; then
+        if [ "$khala_emit_warning" -eq 1 ] && \
+            khala_reserved_name "$KHALA_SESSION_FILE_VALUE"; then
+            printf 'khala: 예약된 이름입니다: %s\n' "$KHALA_SESSION_FILE_VALUE"
+        elif [ "$khala_emit_warning" -eq 1 ]; then
             printf '%s\n' 'khala: .khala-session이 한 줄의 유효한 세션 이름이 아닙니다 — 무시합니다'
         fi
     fi

@@ -9,9 +9,24 @@ import { join } from 'node:path'
 import { createServer, type Server as UnixServer, type Socket } from 'node:net'
 
 const VALID_IDENTITY = /^[a-z0-9][a-z0-9-]*$/
+const RESERVED_IDENTITIES = new Set(['conduit', 'khala', 'khala-gateway', 'gateway', 'operator'])
 const VALID_META_KEY = /^[a-zA-Z_][a-zA-Z0-9_]*$/
 const CHANNEL_FLAG = '--dangerously-load-development-channels'
 const channelFlagCache = new Map<number, boolean>()
+let warnedReservedIdentity = ''
+
+function acceptedIdentity(value: string): string | undefined {
+  if (!VALID_IDENTITY.test(value)) return undefined
+  if (!RESERVED_IDENTITIES.has(value)) {
+    warnedReservedIdentity = ''
+    return value
+  }
+  if (warnedReservedIdentity !== value) {
+    process.stderr.write(`khala channel: 예약된 이름입니다: ${value}\n`)
+    warnedReservedIdentity = value
+  }
+  return undefined
+}
 
 // Claude Code can export a temporary CLAUDE_CODE_SESSION_ID while --resume is
 // still switching sessions. The parent registry is re-read on every poll and
@@ -21,12 +36,12 @@ const channelFlagCache = new Map<number, boolean>()
 // rig's fake Claude parent. Production uses neither override.
 function resolveIdentity(projectDir: string): string | undefined {
   if (process.env.KHALA_SESSION !== undefined) {
-    return VALID_IDENTITY.test(process.env.KHALA_SESSION) ? process.env.KHALA_SESSION : undefined
+    return acceptedIdentity(process.env.KHALA_SESSION)
   }
   try {
     const lines = readFileSync(join(projectDir, '.khala-session'), 'utf8').split(/\r?\n/)
     if (lines.at(-1) === '') lines.pop()
-    return lines.length === 1 && VALID_IDENTITY.test(lines[0]) ? lines[0] : undefined
+    return lines.length === 1 ? acceptedIdentity(lines[0]) : undefined
   } catch {
     return undefined
   }
@@ -254,7 +269,7 @@ async function main(): Promise<void> {
   khalaLink = resolveBinary('khala-link')
   const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.8.2' },
+    { name: 'khala', version: '0.9.0' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
