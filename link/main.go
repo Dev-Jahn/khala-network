@@ -21,6 +21,8 @@ import (
 
 var implVersion = "0.5.0"
 
+const linkVersion = "0.9.1"
+
 type options struct {
 	serve     bool
 	servePeer string
@@ -38,6 +40,14 @@ func run(args []string) int {
 			return runConduit(args[1:])
 		case "runtime":
 			return runRuntime(args[1:])
+		case "dashboard":
+			return runDashboard(args[1:])
+		case "version":
+			if len(args) != 1 {
+				return fatalf("version takes no arguments")
+			}
+			fmt.Fprintln(os.Stdout, linkVersion)
+			return 0
 		}
 	}
 	opts, err := parseOptions(args)
