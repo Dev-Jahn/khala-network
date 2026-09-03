@@ -1,5 +1,8 @@
 # khala 0.8.1 fact sheet — for the 0.9.0 read-only fleet dashboard + per-node "ears" snapshot
 
+> **정정(2026-09-03, GPT-Pro r1 검토 Q12 + eddy)**: 이 시트의 기준은 e429ac9(0.8.1)이며 행 번호는 그 시점의 것이다 — 함수명으로 찾을 것. 틀린 문장: (1) "`$KHALA_HOME` 전체가 복제된다" → 복제되는 것은 spool·presence·stream·mind 네 부류뿐; (2) §4 "신선도는 파일 안 epoch로만 읽어야 한다" → r3 §3.2(`written-at` + bounded skew); (3) §4 `.watcher` 가드 "end to end" → native 설치 경로만, rsync 폴백은 installer를 거치지 않는다; (4) §2 "first-seen = 등록의 startedAt" → 대기 generation의 first-seen은 오늘 코드에 없다; (5) §11 "5 파일" → 6 파일 61 테스트; (6) §12 `sanitizePreview` 권고 → JSON + `textContent`; (7) Open 2 "every pass" → 정리 pass마다(본문에서 정정됨). 정본 설계는 `d17-c-r3-dashboard.md`.
+
+
 Repo `/NHNHOME/WORKSPACE/0526040002_A1/jahn/workspace/khala-network`, git HEAD `e429ac9`, `KHALA_VERSION=0.8.1` (`bin/khala:28`).
 Two programs: the bash brain/CLI `bin/khala` (5158 lines) and the Go binary `khala-link` (`link/`, one `package main` with subcommands).
 Everything under `$KHALA_HOME` (default `$HOME/.khala`, `bin/khala:6-18`, `link/main.go:226-238`) is fleet-replicated; the *runtime dir* is node-local and never replicated.
