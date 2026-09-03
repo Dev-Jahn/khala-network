@@ -78,13 +78,17 @@ function elapsedSinceFetch() {
   return view.fleet ? Math.max(0, currentEpoch() - view.fleet.generatedAt) : 0;
 }
 
+function plural(count, noun) {
+  return count + " " + noun + (count === 1 ? "" : "s");
+}
+
 function humanDuration(value) {
   if (!Number.isFinite(value) || value < 0) return "-";
   const seconds = Math.floor(value);
-  if (seconds < 60) return seconds + "초";
-  if (seconds < 3600) return Math.floor(seconds / 60) + "분";
-  if (seconds < 86400) return Math.floor(seconds / 3600) + "시간";
-  return Math.floor(seconds / 86400) + "일";
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
+  return Math.floor(seconds / 86400) + "d";
 }
 
 function epochAge(epoch) {
@@ -114,7 +118,7 @@ function render(fleet) {
     const initial = fleet.nodes.find((node) => node.hub) || fleet.nodes[0];
     view.selected = {kind: "node", node: initial.node};
   }
-  setText(byId("self-label"), fleet.self.node + " · " + fleet.self.version + " · mailbox " + ((fleet.self.mailbox || []).join(", ") || "-"));
+  setText(byId("self-label"), fleet.self.node + " · " + fleet.self.version + " · upstream " + ((fleet.self.mailbox || []).join(", ") || "-"));
   renderMetrics(fleet);
   renderMap(fleet);
   renderNodeFilters(fleet);
@@ -132,11 +136,11 @@ function renderMetrics(fleet) {
   const rings = fleet.nodes.reduce((total, node) => total + (node.identities || []).reduce((sum, identity) => sum + (identity.pendingRing || 0), 0), 0);
   const silent = fleet.watchers.filter((watcher) => watcher.state === "silent").length;
   const metrics = [
-    {key: "nodes", label: "정상 노드", value: fresh + "/" + fleet.nodes.length, context: fresh === fleet.nodes.length ? "모두 fresh" : (fleet.nodes.length - fresh) + "개 확인 필요", tone: fresh === fleet.nodes.length ? "ok" : "danger"},
-    {key: "listening", label: "듣는 세션", value: listening, context: "검증된 route", tone: "ok"},
-    {key: "rings", label: "대기 ring", value: rings, context: rings ? "응답 필요" : "대기 없음", tone: rings ? "warn" : "ok"},
-    {key: "watchers", label: "silent 워처", value: silent, context: silent ? "주기 초과" : "경보 없음", tone: silent ? "danger" : "ok"},
-    {key: "snapshot", label: "스냅샷 기준", value: "", context: "5초마다 새로 읽음", tone: "ok", liveAge: 0},
+    {key: "nodes", label: "Healthy nodes", value: fresh + "/" + fleet.nodes.length, context: fresh === fleet.nodes.length ? "all fresh" : (fleet.nodes.length - fresh) + " need attention", tone: fresh === fleet.nodes.length ? "ok" : "danger"},
+    {key: "listening", label: "Reachable sessions", value: listening, context: "verified delivery route", tone: "ok"},
+    {key: "rings", label: "Unread notifications", value: rings, context: rings ? "awaiting a read" : "none unread", tone: rings ? "warn" : "ok"},
+    {key: "watchers", label: "Overdue watchdogs", value: silent, context: silent ? "past their interval" : "no alarms", tone: silent ? "danger" : "ok"},
+    {key: "snapshot", label: "Snapshot age", value: "", context: "polled every 5s", tone: "ok", liveAge: 0},
   ];
   reconcile(byId("summary"), metrics, (item) => item.key, createMetric, updateMetric);
 }
@@ -210,7 +214,7 @@ function renderMap(fleet) {
   reconcile(byId("map-edges"), edges, (edge) => edge.key, createEdge, (group, edge) => updateEdge(group, edge, positions));
   reconcile(byId("map-nodes"), fleet.nodes, (node) => node.node, createMapNode, (group, node) => updateMapNode(group, node, positions.get(node.node)));
   const missingTargets = fleet.nodes.flatMap((node) => (node.mailbox || []).filter((mailbox) => !nodesByName.has(mailbox)));
-  byId("map-description").textContent = "허브를 중심으로 " + fleet.nodes.length + "개 노드와 " + edges.length + "개 메일박스 링크, 각 노드의 위성 신원을 표시합니다." + (missingTargets.length ? " 지도에 없는 메일박스 " + missingTargets.join(", ") + "." : "");
+  byId("map-description").textContent = "Hub-centred map of " + fleet.nodes.length + " nodes, " + edges.length + " sync links and each node's session markers." + (missingTargets.length ? " Upstream not on the map: " + missingTargets.join(", ") + "." : "");
 }
 
 function createEdge() {
@@ -275,7 +279,7 @@ function updateMapNode(group, node, position) {
   const selected = view.selected && view.selected.kind === "node" && view.selected.node === node.node;
   group.setAttribute("class", "map-node state-" + state + (selected ? " selected" : "") + (node.hub ? " hub" : ""));
   group.setAttribute("transform", "translate(" + position.x + " " + position.y + ")");
-  group.setAttribute("aria-label", node.node + ", " + state + (node.hub ? ", 허브" : ""));
+  group.setAttribute("aria-label", node.node + ", " + state + (node.hub ? ", hub" : ""));
   group._hub.setAttribute("visibility", node.hub ? "visible" : "hidden");
   setText(group._icon, {fresh: "●", stale: "◐", stopping: "■", invalid: "×", absent: "○"}[state]);
   setText(group._warning, node.complete === false || node.skew > 60 ? "▲" : "");
@@ -324,73 +328,73 @@ function updateSatellite(group, identity, node, identities) {
   const selected = view.selected && view.selected.kind === "identity" && view.selected.node === node.node && view.selected.name === identity.name;
   group.setAttribute("transform", "translate(" + x.toFixed(2) + " " + y.toFixed(2) + ")");
   group.setAttribute("class", "satellite " + (identity.listening ? "listening" : "not-listening") + (identity.pendingRing > 0 ? " pending" : "") + (selected ? " selected" : ""));
-  group.setAttribute("aria-label", identity.name + ", " + (identity.listening ? "듣는 중" : "듣지 않음") + ", ring " + identity.pendingRing);
+  group.setAttribute("aria-label", identity.name + ", " + (identity.listening ? "reachable" : "unreachable") + ", unread notify " + identity.pendingRing);
   group._ring.setAttribute("visibility", identity.pendingRing > 0 ? "visible" : "hidden");
   setText(group._count, identity.pendingRing > 0 ? identity.pendingRing : "");
-  setText(group._title, identity.name + " · " + (identity.listening ? identity.route : identity.reason) + " · ring " + identity.pendingRing);
+  setText(group._title, identity.name + " · " + (identity.listening ? identity.route : identity.reason) + " · unread notify " + identity.pendingRing);
 }
 
 function renderDetail(fleet) {
   const title = byId("detail-title");
   const summary = byId("detail-summary");
   if (!view.selected) {
-    setText(title, "노드를 선택하세요");
-    setText(summary, "지도에서 노드나 위성 신원을 누르면 현재 상태를 펼칩니다.");
+    setText(title, "Select a node");
+    setText(summary, "Click a node or a session marker on the map to see its current state.");
     renderDetailRows([]);
     return;
   }
   const node = fleet.nodes.find((item) => item.node === view.selected.node);
   if (!node) {
     setText(title, view.selected.node);
-    setText(summary, "현재 스냅샷에서 이 항목을 찾을 수 없습니다.");
+    setText(summary, "Not present in the current snapshot.");
     renderDetailRows([]);
     return;
   }
   if (view.selected.kind === "node") {
     setText(title, node.node + (node.hub ? " · HUB" : ""));
-    setText(summary, node.state + " · 신원 " + (node.identities || []).length + "개" + (node.progressing ? " · generation 진행 중" : ""));
+    setText(summary, node.state + " · " + plural((node.identities || []).length, "session") + (node.progressing ? " · queue digest changing" : ""));
     renderDetailRows([
-      {label: "상태", value: node.state},
-      {label: "허브", value: node.hub ? "예" : "아니오"},
-      {label: "스냅샷 나이", value: node.snapshotAge, mode: "age"},
-      {label: "작성 시각", value: node.writtenAt, mode: "epoch"},
-      {label: "시계 차이", value: typeof node.skew === "number" ? node.skew + "초" : "-"},
-      {label: "완전한 스냅샷", value: node.complete === false ? "아니오 · 일부만" : node.complete === true ? "예" : "-"},
-      {label: "링크 나이", value: node.linkAge, mode: "age"},
-      {label: "메일박스", value: (node.mailbox || []).join(", ") || "-"},
-      {label: "컴포넌트", value: (node.components || []).map((item) => item.name + " " + item.release + " · adapter " + item.adapter + " · ears " + item.ears).join(" / ") || "-"},
-      {label: "신원", value: (node.identities || []).map((item) => item.name).join(", ") || "-"},
+      {label: "State", value: node.state},
+      {label: "Hub", value: node.hub ? "yes" : "no"},
+      {label: "Snapshot age", value: node.snapshotAge, mode: "age"},
+      {label: "Written at", value: node.writtenAt, mode: "epoch"},
+      {label: "Clock skew", value: typeof node.skew === "number" ? node.skew + "s" : "-"},
+      {label: "Complete", value: node.complete === false ? "no · truncated" : node.complete === true ? "yes" : "-"},
+      {label: "Last sync", value: node.linkAge, mode: "age"},
+      {label: "Upstream", value: (node.mailbox || []).join(", ") || "-"},
+      {label: "Agent", value: (node.components || []).map((item) => item.name + " " + item.release + " (adapter " + item.adapter + ", snapshot format " + item.ears + ")").join(" / ") || "-"},
+      {label: "Sessions", value: (node.identities || []).map((item) => item.name).join(", ") || "-"},
     ]);
     return;
   }
   const identity = (node.identities || []).find((item) => item.name === view.selected.name);
   if (!identity) {
     setText(title, view.selected.name + "@" + node.node);
-    setText(summary, "현재 스냅샷에서 이 신원을 찾을 수 없습니다.");
+    setText(summary, "This session is not in the current snapshot.");
     renderDetailRows([]);
     return;
   }
   setText(title, identity.name + "@" + node.node);
-  setText(summary, (identity.listening ? "듣는 중 · " + identity.route : "듣지 않음 · " + identity.reason) + " · " + identity.phase);
+  setText(summary, (identity.listening ? "reachable via " + identity.route : "unreachable · " + identity.reason) + " · " + identity.phase);
   renderDetailRows([
-    {label: "주체", value: identity.principal},
-    {label: "듣는 중", value: identity.listening ? "예" : "아니오"},
-    {label: "경로", value: identity.route},
-    {label: "단계", value: identity.phase},
+    {label: "Principal", value: identity.principal},
+    {label: "Reachable", value: identity.listening ? "yes" : "no"},
+    {label: "Route", value: identity.route},
+    {label: "Phase", value: identity.phase},
     {label: "Claude Code", value: identity.cc},
-    {label: "이유", value: identity.reason},
-    {label: "대기 ring", value: identity.pendingRing},
-    {label: "대기 info", value: identity.pendingInfo},
-    {label: "대기 operator", value: identity.pendingOperator},
-    {label: "generation", value: identity.generation},
-    {label: "처음 관측", value: identity.firstSeen, mode: "epoch"},
-    {label: "가장 오래된 대기", value: identity.oldestPending, mode: "epoch"},
-    {label: "쓴 ring", value: identity.writtenRings},
-    {label: "마지막 초인종", value: identity.lastWritten, mode: "epoch"},
-    {label: "마지막 drain", value: identity.lastDrain, mode: "epoch"},
-    {label: "drain 이전", value: identity.lastDrainBefore},
-    {label: "drain 이후", value: identity.lastDrainAfter},
-    {label: "drain 상태", value: identity.lastDrainStatus},
+    {label: "Reason", value: identity.reason},
+    {label: "Unread · notify", value: identity.pendingRing},
+    {label: "Unread · info", value: identity.pendingInfo},
+    {label: "Unread · operator", value: identity.pendingOperator},
+    {label: "Queue digest", value: identity.generation},
+    {label: "First seen", value: identity.firstSeen, mode: "epoch"},
+    {label: "Oldest unread", value: identity.oldestPending, mode: "epoch"},
+    {label: "Notifications sent", value: identity.writtenRings},
+    {label: "Last notification", value: identity.lastWritten, mode: "epoch"},
+    {label: "Last inbox read", value: identity.lastDrain, mode: "epoch"},
+    {label: "Digest before read", value: identity.lastDrainBefore},
+    {label: "Digest after read", value: identity.lastDrainAfter},
+    {label: "Read status", value: identity.lastDrainStatus},
   ]);
 }
 
@@ -433,7 +437,7 @@ function isStaleClutter(session) {
 function renderNodeFilters(fleet) {
   const nodes = fleet.nodes.map((node) => node.node);
   if (view.node && !nodes.includes(view.node)) view.node = "";
-  const filters = [{node: "", label: "모든 노드"}].concat(nodes.map((node) => ({node, label: node})));
+  const filters = [{node: "", label: "All nodes"}].concat(nodes.map((node) => ({node, label: node})));
   reconcile(byId("node-filters"), filters, (filter) => filter.node || "__all", () => {
     const button = element("button", "chip");
     button.type = "button";
@@ -452,12 +456,12 @@ function renderNodeFilters(fleet) {
 
 function renderSessions(fleet) {
   const hiddenCount = fleet.sessions.filter(isStaleClutter).length;
-  setText(byId("toggle-hidden"), "전체 보기 (+" + hiddenCount + ")");
+  setText(byId("toggle-hidden"), "Show all (+" + hiddenCount + ")");
   byId("toggle-hidden").setAttribute("aria-pressed", String(view.showAll));
   byId("filter-listening").setAttribute("aria-pressed", String(view.listeningOnly));
   byId("filter-pending").setAttribute("aria-pressed", String(view.pendingOnly));
   byId("sort-sessions").setAttribute("aria-pressed", String(!view.newestFirst));
-  setText(byId("sort-sessions"), view.newestFirst ? "최근 본 순" : "오래된 순");
+  setText(byId("sort-sessions"), view.newestFirst ? "Newest first" : "Oldest first");
 
   let sessions = fleet.sessions.filter((session) => view.showAll || !isStaleClutter(session));
   if (view.listeningOnly) sessions = sessions.filter((session) => session.listening);
@@ -498,7 +502,7 @@ function createSessionGroup() {
 
 function updateSessionGroup(group, item) {
   setText(group._title, item.node);
-  setText(group._count, item.items.length + "개 세션");
+  setText(group._count, plural(item.items.length, "session"));
   reconcile(group._grid, item.items, (session) => session.address, createSessionTile, updateSessionTile);
 }
 
@@ -532,36 +536,36 @@ function updateSessionTile(tile, session) {
   tile.className = "session-tile state-" + state;
   setText(tile._name, session.address.slice(0, Math.max(0, session.address.lastIndexOf("@"))));
   const presence = {
-    "alive-here": "⌂ 여기서 활동",
-    "alive-elsewhere": "↗ 다른 노드 활동",
-    asleep: "◐ 잠듦",
-    unknown: "? 알 수 없음",
+    "alive-here": "⌂ active · local",
+    "alive-elsewhere": "↗ active · remote",
+    asleep: "◐ idle",
+    unknown: "? unknown",
   };
   setText(tile._presence, presence[state]);
   tile._seenFill.setAttribute("data-seen-epoch", session.lastSeen || 0);
   tile._seenAge.setAttribute("data-age-epoch", session.lastSeen || 0);
   const routeIcon = {socket: "↔", channel: "⌁", "channel+socket": "⇄", none: "⊘", "-": "⊘"}[session.route] || "·";
   tile._route.className = "route-line" + (session.listening ? " listening" : "");
-  setText(tile._route, routeIcon + " " + (session.listening ? "듣는 중 · " + session.route : "듣지 않음 · " + session.reason));
+  setText(tile._route, routeIcon + " " + (session.listening ? "reachable via " + session.route : "unreachable · " + session.reason));
   const pending = session.pendingByClass || {ring: 0, info: 0, operator: 0};
   const classes = [
-    {key: "ring", label: "R", count: pending.ring || 0},
-    {key: "info", label: "I", count: pending.info || 0},
-    {key: "operator", label: "O", count: pending.operator || 0},
+    {key: "ring", label: "notify", count: pending.ring || 0},
+    {key: "info", label: "info", count: pending.info || 0},
+    {key: "operator", label: "operator", count: pending.operator || 0},
   ];
   reconcile(tile._pendingBars, classes, (item) => item.key, createPendingBar, updatePendingBar);
   const pendingLabels = {
-    empty: "비어 있음",
-    "seen-but-left": "보고도 남김",
-    "no-new-since-drain": "drain 뒤 새 대기 없음",
-    "new-since-drain": "drain 뒤 새 대기",
+    empty: "inbox empty",
+    "seen-but-left": "seen, left unread",
+    "no-new-since-drain": "nothing new since last read",
+    "new-since-drain": "new since last read",
   };
   setText(tile._pendingState, pendingLabels[session.pendingState] || session.pendingState);
   tile._pendingState.className = "pending-state" + (session.pendingState === "empty" ? "" : " attention");
-  setText(tile._model, "모델 " + text(session.model) + " · 노력 " + text(session.effort));
-  setText(tile._role, "역할 " + text(session.role));
-  setText(tile._charge, "담당 " + text(session.charge));
-  setText(tile._focus, "초점 " + text(session.focus));
+  setText(tile._model, "model " + text(session.model) + " · effort " + text(session.effort));
+  setText(tile._role, "role " + text(session.role));
+  setText(tile._charge, "assignment " + text(session.charge));
+  setText(tile._focus, "focus " + text(session.focus));
 }
 
 function createPendingBar() {
@@ -592,7 +596,7 @@ function renderWatchers(fleet) {
   }
   const groups = Array.from(grouped, ([node, items]) => ({node, items}));
   if (!groups.length) {
-    reconcile(byId("watcher-board"), [{node: "__empty", items: []}], (group) => group.node, () => element("p", "empty-state"), (node) => setText(node, "워처 없음"));
+    reconcile(byId("watcher-board"), [{node: "__empty", items: []}], (group) => group.node, () => element("p", "empty-state"), (node) => setText(node, "No watchdogs"));
     return;
   }
   reconcile(byId("watcher-board"), groups, (group) => group.node, createWatcherGroup, updateWatcherGroup);
@@ -611,7 +615,7 @@ function createWatcherGroup(item) {
 
 function updateWatcherGroup(group, item) {
   if (item.node === "__empty") {
-    setText(group, "워처 없음");
+    setText(group, "No watchdogs");
     return;
   }
   setText(group._title, item.node);
@@ -634,7 +638,7 @@ function createWatcherGauge() {
 
 function updateWatcherGauge(gauge, watcher) {
   setText(gauge._name, watcher.name);
-  setText(gauge._owner, "owner " + watcher.owner + " · " + humanDuration(watcher.cadence) + " 주기");
+  setText(gauge._owner, "owner " + watcher.owner + " · interval " + humanDuration(watcher.cadence));
   gauge.setAttribute("data-watcher-last", watcher.last);
   gauge.setAttribute("data-watcher-cadence", watcher.cadence);
   gauge.setAttribute("data-watcher-state", watcher.state);
@@ -642,7 +646,7 @@ function updateWatcherGauge(gauge, watcher) {
 
 function renderStreams(fleet) {
   if (!fleet.streams.length) {
-    reconcile(byId("stream-board"), [{name: "__empty"}], (stream) => stream.name, () => element("p", "empty-state"), (node) => setText(node, "스트림 없음"));
+    reconcile(byId("stream-board"), [{name: "__empty"}], (stream) => stream.name, () => element("p", "empty-state"), (node) => setText(node, "No streams"));
     return;
   }
   const maxEntries = Math.max(1, ...fleet.streams.map((stream) => stream.entries));
@@ -669,7 +673,7 @@ function createStreamCard(stream) {
 
 function updateStreamCard(card, stream, maxEntries) {
   if (stream.name === "__empty") {
-    setText(card, "스트림 없음");
+    setText(card, "No streams");
     return;
   }
   setText(card._name, stream.name);
@@ -680,7 +684,7 @@ function updateStreamCard(card, stream, maxEntries) {
   reconcile(card._unread, unread, (item) => item.identity, createUnreadBar, (row, item) => updateUnreadBar(row, item, Math.max(1, stream.entries)));
   const recent = Array.isArray(stream.recent) ? stream.recent : [];
   card._feedTitle.hidden = recent.length === 0;
-  setText(card._feedTitle, recent.length ? "최근 항목" : "");
+  setText(card._feedTitle, recent.length ? "Recent entries" : "");
   reconcile(card._feed, recent, (entry) => entry.id, createFeedEntry, updateFeedEntry);
 }
 
@@ -725,7 +729,7 @@ function renderLetters(fleet) {
   section.hidden = !Array.isArray(fleet.letters);
   if (!Array.isArray(fleet.letters)) return;
   if (!fleet.letters.length) {
-    reconcile(byId("letter-feed"), [{key: "__empty"}], (item) => item.key, () => element("p", "empty-state"), (node) => setText(node, "편지 없음"));
+    reconcile(byId("letter-feed"), [{key: "__empty"}], (item) => item.key, () => element("p", "empty-state"), (node) => setText(node, "No messages"));
     return;
   }
   reconcile(byId("letter-feed"), fleet.letters, (letter) => letter.identity + "/" + letter.id, createLetterItem, updateLetterItem);
@@ -750,7 +754,7 @@ function createLetterItem(letter) {
 
 function updateLetterItem(button, letter) {
   if (letter.key === "__empty") {
-    setText(button, "편지 없음");
+    setText(button, "No messages");
     return;
   }
   button._letter = letter;
@@ -766,13 +770,13 @@ async function loadLetter(letter) {
   view.selectedLetter = key;
   renderLetters(view.fleet);
   setText(byId("letter-reader-title"), letter.subject + " · " + letter.from);
-  setText(byId("letter-body"), "읽는 중…");
+  setText(byId("letter-body"), "Loading…");
   const target = "/api/v1/letter?identity=" + encodeURIComponent(letter.identity) + "&id=" + encodeURIComponent(letter.id);
   try {
     const response = await fetch(target, {headers: authHeaders(), cache: "no-store"});
-    setText(byId("letter-body"), response.ok ? await response.text() : "편지를 읽지 못했습니다 (" + response.status + ")");
+    setText(byId("letter-body"), response.ok ? await response.text() : "Could not load the message (HTTP " + response.status + ")");
   } catch (_) {
-    setText(byId("letter-body"), "편지를 읽지 못했습니다 (네트워크 연결 없음)");
+    setText(byId("letter-body"), "Could not load the message (network unreachable)");
   }
 }
 
@@ -780,12 +784,12 @@ function updateDynamicVisuals() {
   const elapsed = elapsedSinceFetch();
   for (const node of document.querySelectorAll("[data-age-value]")) {
     const base = Number(node.getAttribute("data-age-value"));
-    setText(node, humanDuration(base + elapsed) + " 전");
+    setText(node, humanDuration(base + elapsed) + " ago");
   }
   for (const node of document.querySelectorAll("[data-age-epoch]")) {
     const epoch = Number(node.getAttribute("data-age-epoch"));
     const age = epochAge(epoch);
-    setText(node, age === null ? "본 적 없음" : humanDuration(age) + " 전");
+    setText(node, age === null ? "never" : humanDuration(age) + " ago");
   }
   for (const fill of document.querySelectorAll("[data-seen-epoch]")) {
     const age = epochAge(Number(fill.getAttribute("data-seen-epoch")));
@@ -797,17 +801,17 @@ function updateDynamicVisuals() {
     const cadence = Number(gauge.getAttribute("data-watcher-cadence"));
     const ratio = cadence > 0 ? age / cadence : 1;
     gauge._fill.style.width = Math.min(100, ratio * 100).toFixed(1) + "%";
-    setText(gauge._value, Math.round(ratio * 100) + "% · " + humanDuration(age) + " 전");
+    setText(gauge._value, Math.round(ratio * 100) + "% · " + humanDuration(age) + " ago");
     gauge.classList.toggle("alarm", ratio > 1 || gauge.getAttribute("data-watcher-state") === "silent");
   }
-  if (view.fleet) setText(byId("fleet-clock"), humanDuration(elapsed) + " 전 생성 · " + new Date(view.fleet.generatedAt * 1000).toLocaleTimeString("ko-KR"));
+  if (view.fleet) setText(byId("fleet-clock"), "generated " + humanDuration(elapsed) + " ago · " + new Date(view.fleet.generatedAt * 1000).toLocaleTimeString("en-GB"));
 }
 
 function showError(error) {
   const banner = byId("error-banner");
   const message = error.message === "fleet 401"
-    ? "인증이 만료되었습니다. 새 dashboard URL로 다시 여세요."
-    : "함대 데이터를 새로 읽지 못했습니다. 마지막 정상 화면을 유지합니다. (" + error.message + ")";
+    ? "Session token expired. Open a new dashboard URL."
+    : "Could not refresh cluster data; showing the last successful snapshot. (" + error.message + ")";
   setText(banner, message);
   banner.hidden = false;
 }

@@ -21,7 +21,7 @@ import (
 
 var implVersion = "0.5.0"
 
-const linkVersion = "0.9.2"
+const linkVersion = "0.9.3"
 
 type options struct {
 	serve     bool

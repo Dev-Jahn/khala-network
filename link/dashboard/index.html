@@ -1,61 +1,61 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Khala 함대 지도</title>
+  <title>Khala Cluster</title>
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
   <header class="topbar">
     <div>
-      <p class="eyebrow">KHALA / FLEET</p>
-      <h1>함대 관제 지도</h1>
+      <p class="eyebrow">KHALA / CLUSTER</p>
+      <h1>Cluster Overview</h1>
     </div>
-    <p id="self-label" class="self-label">연결 중</p>
+    <p id="self-label" class="self-label">connecting…</p>
   </header>
 
   <div id="error-banner" class="error-banner" role="alert" hidden></div>
 
   <main>
-    <section id="summary" class="headline" aria-label="함대 요약" aria-live="polite"></section>
+    <section id="summary" class="headline" aria-label="Cluster summary" aria-live="polite"></section>
 
     <section class="fleet-section" aria-labelledby="fleet-title">
       <div class="section-heading">
         <div>
           <p class="section-kicker">LIVE TOPOLOGY</p>
-          <h2 id="fleet-title">함대 지도</h2>
+          <h2 id="fleet-title">Topology</h2>
         </div>
-        <p id="fleet-clock" class="clock">스냅샷을 기다리는 중</p>
+        <p id="fleet-clock" class="clock">waiting for the first snapshot</p>
       </div>
       <div class="fleet-layout">
         <div class="map-frame">
           <svg id="fleet-map" viewBox="0 0 1000 520" role="img" aria-labelledby="map-title map-description" preserveAspectRatio="xMidYMid meet">
-            <title id="map-title">Khala 노드와 메일박스 연결 지도</title>
-            <desc id="map-description">허브를 중심으로 노드, 링크, 세션 신원을 표시합니다.</desc>
+            <title id="map-title">Khala node and sync topology</title>
+            <desc id="map-description">Hub-centred map of nodes, sync links and session markers.</desc>
             <g id="map-edges"></g>
             <g id="map-nodes"></g>
           </svg>
-          <div id="fleet-legend" class="legend" aria-label="지도 범례">
+          <div id="fleet-legend" class="legend" aria-label="Map legend">
             <span><i class="legend-node state-fresh">●</i>fresh</span>
             <span><i class="legend-node state-stale">◐</i>stale</span>
             <span><i class="legend-node state-stopping">■</i>stopping</span>
             <span><i class="legend-node state-invalid">×</i>invalid</span>
             <span><i class="legend-node state-absent">○</i>absent</span>
-            <span><i class="legend-hub">◎</i>허브</span>
-            <span><i class="legend-listening">●</i>듣는 신원</span>
-            <span><i class="legend-pending">!</i>ring 대기</span>
-            <span><i class="legend-warning">▲</i>불완전·시계 경고</span>
-            <span><i class="legend-link link-fresh"></i>링크 ≤60초</span>
-            <span><i class="legend-link link-aging"></i>≤300초</span>
-            <span><i class="legend-link link-old"></i>오래됨·없음</span>
+            <span><i class="legend-hub">◎</i>hub</span>
+            <span><i class="legend-listening">●</i>reachable session</span>
+            <span><i class="legend-pending">!</i>unread notify</span>
+            <span><i class="legend-warning">▲</i>truncated · clock skew</span>
+            <span><i class="legend-link link-fresh"></i>synced ≤60s</span>
+            <span><i class="legend-link link-aging"></i>≤300s</span>
+            <span><i class="legend-link link-old"></i>stale · none</span>
           </div>
         </div>
 
         <aside id="detail-panel" class="detail-panel" aria-live="polite">
-          <p class="section-kicker">INSPECTOR</p>
-          <h3 id="detail-title">노드를 선택하세요</h3>
-          <p id="detail-summary" class="detail-summary">지도에서 노드나 위성 신원을 누르면 현재 상태를 펼칩니다.</p>
+          <p class="section-kicker">DETAILS</p>
+          <h3 id="detail-title">Select a node</h3>
+          <p id="detail-summary" class="detail-summary">Click a node or a session marker on the map to see its current state.</p>
           <div id="detail-rows" class="detail-rows"></div>
         </aside>
       </div>
@@ -65,26 +65,26 @@
       <div class="section-heading board-heading">
         <div>
           <p class="section-kicker">PRESENCE</p>
-          <h2 id="session-title">세션 보드</h2>
+          <h2 id="session-title">Sessions</h2>
         </div>
-        <div class="controls" aria-label="세션 필터">
-          <button id="filter-listening" type="button" class="chip" aria-pressed="false">듣는 중</button>
-          <button id="filter-pending" type="button" class="chip" aria-pressed="false">대기 있음</button>
-          <button id="toggle-hidden" type="button" class="chip" aria-pressed="false">전체 보기 (+0)</button>
-          <button id="sort-sessions" type="button" class="chip" aria-pressed="false">최근 본 순</button>
+        <div class="controls" aria-label="Session filters">
+          <button id="filter-listening" type="button" class="chip" aria-pressed="false">Reachable</button>
+          <button id="filter-pending" type="button" class="chip" aria-pressed="false">Unread</button>
+          <button id="toggle-hidden" type="button" class="chip" aria-pressed="false">Show all (+0)</button>
+          <button id="sort-sessions" type="button" class="chip" aria-pressed="false">Newest first</button>
         </div>
       </div>
-      <div id="node-filters" class="node-filters" aria-label="노드 필터"></div>
+      <div id="node-filters" class="node-filters" aria-label="Node filter"></div>
       <div id="session-board" class="session-board"></div>
-      <p id="session-empty" class="empty-state" hidden>현재 필터에 맞는 세션이 없습니다.</p>
+      <p id="session-empty" class="empty-state" hidden>No sessions match the current filters.</p>
     </section>
 
     <section class="lower-grid">
       <section class="board-section" aria-labelledby="watcher-title">
         <div class="section-heading">
           <div>
-            <p class="section-kicker">CADENCE</p>
-            <h2 id="watcher-title">워처 게이지</h2>
+            <p class="section-kicker">WATCHDOGS</p>
+            <h2 id="watcher-title">Watchdog timers</h2>
           </div>
         </div>
         <div id="watcher-board" class="watcher-board"></div>
@@ -94,7 +94,7 @@
         <div class="section-heading">
           <div>
             <p class="section-kicker">TRAFFIC</p>
-            <h2 id="stream-title">스트림</h2>
+            <h2 id="stream-title">Streams</h2>
           </div>
         </div>
         <div id="stream-board" class="stream-board"></div>
@@ -104,21 +104,21 @@
     <section id="letters-section" class="board-section" aria-labelledby="letter-title" hidden>
       <div class="section-heading">
         <div>
-          <p class="section-kicker">LOCAL ONLY</p>
-          <h2 id="letter-title">편지</h2>
+          <p class="section-kicker">INBOX · LOCAL NODE ONLY</p>
+          <h2 id="letter-title">Messages</h2>
         </div>
       </div>
       <div class="letter-layout">
         <div id="letter-feed" class="letter-feed"></div>
-        <section class="letter-reader" aria-label="편지 본문">
-          <p id="letter-reader-title" class="reader-title">편지를 선택하세요</p>
-          <pre id="letter-body">로컬 편지의 제목을 누르면 여기에 본문을 표시합니다.</pre>
+        <section class="letter-reader" aria-label="Message body">
+          <p id="letter-reader-title" class="reader-title">Select a message</p>
+          <pre id="letter-body">Click a subject to read the message body here.</pre>
         </section>
       </div>
     </section>
   </main>
 
-  <footer>원격은 presence·mind·stream·.ear 복제본만 보입니다. inbox 제목과 본문은 이 노드 밖으로 복제되지 않습니다.</footer>
+  <footer>Remote nodes show replicated presence, profile, stream and status-snapshot data only. Inbox subjects and bodies never leave their node.</footer>
   <script src="/app.js"></script>
 </body>
 </html>

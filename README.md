@@ -234,27 +234,29 @@ Remote nodes never show inbox subjects or bodies because inbox files are not
 replicated. Their cards contain only replicated presence, mind, stream, and
 `.ear` data.
 
-The page is a picture, not a table (0.9.2). A headline strip shows fresh
-nodes, listening sessions, pending rings, silent watchers and snapshot age as
-large figures with a colour cue when something needs attention. Below it an
-SVG fleet map puts the hub in the centre: node colour and glyph encode the
+The page is a picture, not a table (0.9.2; English labels and standard
+terminology since 0.9.3). A headline strip shows healthy nodes, reachable
+sessions, unread notifications, overdue watchdogs and snapshot age as large
+figures with a colour cue when something needs attention. Below it an SVG
+topology map puts the hub in the centre: node colour and glyph encode the
 snapshot state (fresh, stale, stopping, invalid, absent), the edge to each
-node's mailbox encodes link age (solid within 60 s, dashed within 300 s,
-dotted older), and every identity is a satellite whose fill says whether the
-conduit can ring it and whose badge counts pending ring letters; a truncated
-snapshot or a clock more than 60 s ahead adds a warning glyph. Clicking a node
-or a satellite opens the inspector with the full record. Then come the session
-board (one tile per session grouped by node, with a decaying last-seen bar,
-route, per-class pending bars and the four-state pending verdict; sessions
-that are unknown or unseen for 7 days are folded behind 전체 보기), watcher
-cadence gauges (elapsed over cadence, alarm past 100 %), and stream bar charts
-with per-identity unread counts plus the recent-entry and letter feeds when
-text is on. The page refreshes in place every 5 s, ticks ages every second,
-and keeps the last good render under a banner when a fetch fails.
+node's upstream encodes the last sync (solid within 60 s, dashed within
+300 s, dotted older), and every session is a marker whose fill says whether
+the conduit can reach it and whose badge counts unread notify letters; a
+truncated snapshot or a clock more than 60 s ahead adds a warning glyph.
+Clicking a node or a session marker opens the details panel with the full
+record. Then come the session board (one tile per session grouped by node,
+with a decaying last-seen bar, route, per-class unread bars and the four-state
+inbox verdict; sessions that are unknown or unseen for 7 days are folded behind
+"Show all"), watchdog timers (elapsed over interval, alarm past 100 %), and
+stream bar charts with per-identity unread counts plus the recent-entry and
+message feeds when text is on. The page refreshes in place every 5 s, ticks
+ages every second, and keeps the last good render under a banner when a fetch
+fails.
 
 Roll the CLI and link binary in order. A 0.9.0 CLI paired with an older
 `khala-link`: the binary does not know `dashboard` yet. The visual page needs
-the 0.9.2 link release; 0.9.1 serves the earlier text-only page.
+the 0.9.2 link release or later; 0.9.1 serves the earlier text-only page.
 
 ## The nerve cord and the conduit (`khala node ensure`)
 
