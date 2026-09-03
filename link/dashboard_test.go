@@ -112,15 +112,30 @@ func TestDashboardR3OptionsAuthMethodsHeadersAndAssets(t *testing.T) {
 	if asset.Code != http.StatusOK {
 		t.Fatalf("app.js status=%d", asset.Code)
 	}
-	for _, forbidden := range []string{"innerHTML", "localStorage", "sessionStorage", "onclick=", "onerror="} {
+	for _, forbidden := range []string{"innerHTML", "localStorage", "sessionStorage", "onclick=", "onerror=", "replaceChildren"} {
 		if strings.Contains(asset.Body.String(), forbidden) {
 			t.Errorf("app.js contains forbidden API %q", forbidden)
 		}
 	}
-	for _, required := range []string{"location.hash", "history.replaceState", "textContent", "/api/v1/fleet"} {
+	for _, required := range []string{
+		"location.hash", "history.replaceState", "textContent", "/api/v1/fleet",
+		"createElementNS", "setInterval", "data-key", "pendingByClass", "localUnread",
+	} {
 		if !strings.Contains(asset.Body.String(), required) {
 			t.Errorf("app.js missing %q", required)
 		}
+	}
+	page := dashboardRequest(t, handler, http.MethodGet, "/", "")
+	if page.Code != http.StatusOK {
+		t.Fatalf("index status=%d", page.Code)
+	}
+	for _, required := range []string{"fleet-map", "fleet-legend", "session-board", "watcher-board", "stream-board", "detail-panel", "error-banner"} {
+		if !strings.Contains(page.Body.String(), `id="`+required+`"`) {
+			t.Errorf("index missing visual surface %q", required)
+		}
+	}
+	if strings.Contains(page.Body.String(), "<table") || strings.Contains(page.Body.String(), "style=") {
+		t.Error("index contains a table or inline style")
 	}
 }
 
