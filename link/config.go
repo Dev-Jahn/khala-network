@@ -21,10 +21,12 @@ var (
 )
 
 type config struct {
-	self       string
-	retainDays uint64
-	mailboxes  []string
-	peers      map[string][]string
+	self        string
+	retainDays  uint64
+	ttl         int64
+	earsEnabled bool
+	mailboxes   []string
+	peers       map[string][]string
 }
 
 type dialEndpoint struct {
@@ -38,8 +40,10 @@ func loadConfig(home string) (config, error) {
 		return config{}, fmt.Errorf("read config: %w", err)
 	}
 	defer f.Close()
-	c := config{retainDays: 30, peers: make(map[string][]string)}
+	c := config{retainDays: 30, ttl: 120, earsEnabled: true, peers: make(map[string][]string)}
 	retainSet := false
+	ttlSet := false
+	earsSet := false
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
@@ -69,6 +73,22 @@ func loadConfig(home string) (config, error) {
 			}
 			c.retainDays = days
 			retainSet = true
+		case "ttl":
+			if len(fields) != 2 || ttlSet {
+				return config{}, errorsf("config ttl must be exactly one positive integer")
+			}
+			ttl, err := strconv.ParseInt(fields[1], 10, 64)
+			if err != nil || ttl <= 0 {
+				return config{}, errorsf("config ttl must be a positive integer")
+			}
+			c.ttl = ttl
+			ttlSet = true
+		case "ears":
+			if len(fields) != 2 || earsSet || (fields[1] != "on" && fields[1] != "off") {
+				return config{}, errorsf("config ears must be exactly one of on or off")
+			}
+			c.earsEnabled = fields[1] == "on"
+			earsSet = true
 		}
 	}
 	if err := s.Err(); err != nil {
@@ -103,6 +123,10 @@ func (c config) dialEndpoints() ([]dialEndpoint, error) {
 }
 
 func validNode(s string) bool { return nodePattern.MatchString(s) }
+
+func isReservedIdentity(identity string) bool {
+	return identity == "conduit" || identity == "khala" || identity == "gateway" || identity == "operator" || identity == "khala-gateway"
+}
 
 func validBasename(s string) bool {
 	return basePattern.MatchString(s) && !strings.HasPrefix(s, ".") && !strings.Contains(s, "/") && s != ".."

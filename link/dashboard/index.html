@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Khala fleet</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <h1>Khala fleet</h1>
+    <p>원격은 presence 뷰 + 스냅샷, 로컬은 전부</p>
+    <div id="summary" aria-live="polite"></div>
+  </header>
+  <main>
+    <section><h2>노드와 세션</h2><div id="nodes" class="grid"></div></section>
+    <section><h2>워처</h2><div id="watchers"></div></section>
+    <section><h2>스트림</h2><div id="streams"></div></section>
+    <section id="letters-section"><h2>편지</h2><div id="letters"></div><pre id="letter-body"></pre></section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

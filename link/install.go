@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -241,6 +242,35 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 				}
 			}
 		}
+		if strings.HasSuffix(o.Basename, ".ear") {
+			node, _ := earSnapshotNode(o.Basename)
+			incoming, parseErr := parseEarsBytes(data, node)
+			if parseErr != nil {
+				_ = os.Remove(tmp)
+				i.logger.Printf("invalid ear snapshot ignored: %s: %v", o.Basename, parseErr)
+				return alreadyStored, dest, nil
+			}
+			if existing, readErr := readRegularBytes(dest, earsReaderMaxBytes+1); readErr == nil {
+				current, currentErr := parseEarsBytes(existing, node)
+				if currentErr == nil {
+					switch {
+					case incoming.Generation < current.Generation:
+						_ = os.Remove(tmp)
+						i.logger.Printf("stale ear snapshot ignored: %s (%d < %d)", o.Basename, incoming.Generation, current.Generation)
+						return alreadyStored, dest, nil
+					case incoming.Generation == current.Generation && bytes.Equal(data, existing):
+						_ = os.Remove(tmp)
+						return alreadyStored, dest, nil
+					case incoming.Generation == current.Generation:
+						quarantine, err := i.quarantineEar(tmp, node, incoming.Generation, digest, sha256.Sum256(existing))
+						if err != nil {
+							return quarantined, tmp, err
+						}
+						return installed, quarantine, nil
+					}
+				}
+			}
+		}
 		if err := os.Rename(tmp, dest); err != nil {
 			return quarantined, tmp, err
 		}
@@ -299,6 +329,67 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	} else {
 		return quarantined, tmp, fmt.Errorf("atomic no-clobber install: %w", installErr)
 	}
+}
+
+func (i *installer) quarantineEar(tmp, node string, generation int64, incoming, existing [sha256.Size]byte) (string, error) {
+	dir := filepath.Join(i.home, "quarantine", "ears")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", err
+	}
+	destination := filepath.Join(dir, fmt.Sprintf("%s.%d.%x", node, generation, incoming[:4]))
+	if err := os.Rename(tmp, destination); err != nil {
+		return "", err
+	}
+	if err := syncDir(dir); err != nil {
+		return "", err
+	}
+	i.logger.Printf("conflicting ear snapshot quarantined: node=%s generation=%d existing=%x incoming=%x", node, generation, existing, incoming)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	type aged struct {
+		name string
+		at   time.Time
+	}
+	items := make([]aged, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err == nil {
+			items = append(items, aged{name: entry.Name(), at: info.ModTime()})
+		}
+	}
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].at.Equal(items[right].at) {
+			return items[left].name < items[right].name
+		}
+		return items[left].at.Before(items[right].at)
+	})
+	for len(items) > 8 {
+		if err := os.Remove(filepath.Join(dir, items[0].name)); err != nil && !os.IsNotExist(err) {
+			return "", err
+		}
+		items = items[1:]
+	}
+	if err := syncDir(dir); err != nil {
+		return "", err
+	}
+	return destination, nil
+}
+
+func readRegularBytes(path string, limit int64) ([]byte, error) {
+	f, err := openRegular(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, limit))
 }
 
 func unsupportedNoReplace(err error) bool {

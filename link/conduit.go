@@ -35,6 +35,7 @@ type deliveryJournal struct {
 	AttemptID    string   `json:"attemptId"`
 	AttemptIndex int      `json:"attemptIndex"`
 	AttemptedAt  string   `json:"attemptedAt"`
+	FirstSeen    string   `json:"firstSeen,omitempty"`
 	LetterIDs    []string `json:"letterIds"`
 	Status       string   `json:"status"`
 	PeerStatus   string   `json:"peerStatus"`
@@ -51,19 +52,23 @@ type deliveryJournalAt struct {
 
 type conduitState struct {
 	generation   string
+	firstSeen    time.Time
 	attemptIndex int
+	writtenRings int
 	lastAttempt  time.Time
+	lastWritten  time.Time
 	nextAttempt  time.Time
 	failures     int
 	echoLogged   bool
 }
 
 type pendingLetter struct {
-	id      string
-	from    string
-	subject string
-	notice  bool
-	urgent  bool
+	id          string
+	installedAt int64
+	from        string
+	subject     string
+	notice      bool
+	urgent      bool
 	// later is set when the envelope carries "Priority: later" — the sender
 	// asked for the doorbell to wait until the session is idle.
 	later bool
@@ -85,6 +90,20 @@ type conduit struct {
 	statesMu            sync.Mutex
 	states              map[string]*conduitState
 	verificationReasons map[string]string
+	earMu               sync.Mutex
+	earInterval         time.Duration
+	earGeneration       int64
+	earLastWrite        time.Time
+	earMailboxes        []string
+	drainedWarned       map[string]bool
+	earLastSignature    string
+	earRegistrationSig  string
+	earSignatureSet     bool
+	earInstances        map[string]bool
+	earForceWrite       bool
+	earSuppressed       bool
+	scanComplete        bool
+	earReady            bool
 	watcher             *fsnotify.Watcher
 	watchedDir          map[string]struct{}
 }
@@ -155,7 +174,13 @@ func runConduit(args []string) int {
 		backoff:   conduitBackoff(), degradeAt: 3, states: make(map[string]*conduitState),
 		verificationReasons: make(map[string]string),
 		watcher:             watcher, watchedDir: make(map[string]struct{}),
+		earInterval:  durationEnv("KHALA_CONDUIT_TEST_EAR_INTERVAL", 60*time.Second),
+		earMailboxes: append([]string(nil), cfg.mailboxes...), drainedWarned: make(map[string]bool),
 	}
+	if c.earInterval < time.Second {
+		c.earInterval = time.Second
+	}
+	c.earGeneration = readEarGeneration(filepath.Join(home, "presence", "conduit@"+cfg.self+".ear"))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	logger.Printf("started pid=%d runtime=%s", os.Getpid(), runtimePath)
@@ -256,14 +281,38 @@ func (c *conduit) run(ctx context.Context) error {
 		return err
 	}
 	c.scan()
+	if c.scanComplete {
+		if model, err := c.captureEarsModel("running"); err != nil {
+			c.logger.Printf("build initial ear snapshot failed: %v", err)
+		} else if err := c.writeEars(model); err != nil {
+			c.logger.Printf("write initial ear snapshot failed: %v", err)
+		}
+	}
+	defer func() {
+		if !c.earReady {
+			return
+		}
+		c.waitEarWriteSlot()
+		if err := c.writeEars(earsModel{Now: time.Now(), State: "stopping", LinkAge: linkFreshAge(c.home, time.Now())}); err != nil {
+			c.logger.Printf("write final ear snapshot failed: %v", err)
+		}
+	}()
 	ticker := time.NewTicker(c.scanEvery)
 	defer ticker.Stop()
+	earTicker := time.NewTicker(c.earInterval)
+	defer earTicker.Stop()
 	debounce := time.NewTimer(time.Hour)
 	if !debounce.Stop() {
 		<-debounce.C
 	}
 	defer debounce.Stop()
 	var debounceC <-chan time.Time
+	earDebounce := time.NewTimer(time.Hour)
+	if !earDebounce.Stop() {
+		<-earDebounce.C
+	}
+	defer earDebounce.Stop()
+	var earDebounceC <-chan time.Time
 	cancelDebounce := func() {
 		if !debounce.Stop() {
 			select {
@@ -278,23 +327,58 @@ func (c *conduit) run(ctx context.Context) error {
 		debounce.Reset(200 * time.Millisecond)
 		debounceC = debounce.C
 	}
+	scheduleEar := func(delay time.Duration) {
+		if !earDebounce.Stop() {
+			select {
+			case <-earDebounce.C:
+			default:
+			}
+		}
+		earDebounce.Reset(delay)
+		earDebounceC = earDebounce.C
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
 			cancelDebounce()
-			c.scan()
+			if c.scan() {
+				scheduleEar(2 * time.Second)
+			}
+		case <-earTicker.C:
+			if wait := c.earWriteDelay(); wait > 0 {
+				scheduleEar(wait)
+			} else if model, err := c.captureEarsModel("running"); err != nil {
+				c.logger.Printf("build periodic ear snapshot failed: %v", err)
+			} else if err := c.writeEars(model); err != nil {
+				c.logger.Printf("write periodic ear snapshot failed: %v", err)
+			}
 		case <-debounceC:
 			debounceC = nil
-			c.scan()
+			if c.scan() {
+				scheduleEar(2 * time.Second)
+			}
+		case <-earDebounceC:
+			earDebounceC = nil
+			if wait := c.earWriteDelay(); wait > 0 {
+				scheduleEar(wait)
+			} else if model, err := c.captureEarsModel("running"); err != nil {
+				c.logger.Printf("build transition ear snapshot failed: %v", err)
+			} else if earsListeningSignature(model.Identities) != c.earLastSignature || c.earForceWrite {
+				if err := c.writeEars(model); err != nil {
+					c.logger.Printf("write transition ear snapshot failed: %v", err)
+				}
+			}
 		case err, ok := <-c.watcher.Errors:
 			if !ok {
 				return nil
 			}
 			c.logger.Printf("fsnotify error; full rescan: %v", err)
 			cancelDebounce()
-			c.scan()
+			if c.scan() {
+				scheduleEar(2 * time.Second)
+			}
 		case event, ok := <-c.watcher.Events:
 			if !ok {
 				return nil
@@ -303,6 +387,10 @@ func (c *conduit) run(ctx context.Context) error {
 				continue
 			}
 			scheduleScan()
+			parent := filepath.Dir(event.Name)
+			if parent == filepath.Join(c.runtime, "sessions") || parent == filepath.Join(c.runtime, "identities") {
+				scheduleEar(2 * time.Second)
+			}
 		}
 	}
 }
@@ -333,20 +421,21 @@ func (c *conduit) refreshWatches() error {
 	return nil
 }
 
-func (c *conduit) scan() {
+func (c *conduit) scan() bool {
+	c.scanComplete = false
 	if err := c.refreshWatches(); err != nil {
 		c.logger.Printf("refresh watches failed: %v", err)
 	}
 	regs, err := loadRegistrations(c.runtime, c.bootID)
 	if err != nil {
 		c.logger.Printf("load registrations failed: %v", err)
-		return
+		return false
 	}
 	c.pruneVerificationReasons(regs)
 	registries, err := loadClaudeRegistries()
 	if err != nil {
 		c.logger.Printf("load Claude registry failed: %v", err)
-		return
+		return false
 	}
 	verifiedRegs := make(map[string]bool, len(regs))
 	for instance, reg := range regs {
@@ -379,19 +468,18 @@ func (c *conduit) scan() {
 	}
 	c.reclaimLeases(regs, verifiedRegs)
 	c.reapDeadRegistrations(regs)
-	leaseEntries, err := os.ReadDir(filepath.Join(c.runtime, "identities"))
+	leases, err := loadEarLeases(c.runtime, c.bootID)
 	if err != nil {
 		c.logger.Printf("load leases failed: %v", err)
-		return
+		return false
 	}
-	for _, entry := range leaseEntries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".lease") {
-			continue
-		}
-		identity := strings.TrimSuffix(entry.Name(), ".lease")
-		if !validNode(identity) {
-			continue
-		}
+	transition := c.registrationEarTransition(regs, leases)
+	identities := make([]string, 0, len(leases))
+	for identity := range leases {
+		identities = append(identities, identity)
+	}
+	sort.Strings(identities)
+	for _, identity := range identities {
 		letters := c.pending(identity)
 		if len(ringLetters(letters)) == 0 {
 			c.statesMu.Lock()
@@ -399,17 +487,110 @@ func (c *conduit) scan() {
 			c.statesMu.Unlock()
 			continue
 		}
-		var lease identityLease
-		if readJSON(filepath.Join(c.runtime, "identities", entry.Name()), &lease) != nil ||
-			lease.BootID != c.bootID || lease.Identity != identity || lease.State != "owned" ||
+		lease := leases[identity]
+		if lease.State != "owned" ||
 			!validInstanceID(lease.InstanceID) {
+			c.observeGeneration(identity, "", letters)
 			continue
 		}
 		reg, ok := regs[lease.InstanceID]
 		if !ok || reg.Identity != identity {
+			c.observeGeneration(identity, "", letters)
 			continue
 		}
 		c.maybeRing(identity, lease, reg, letters)
+	}
+	c.scanComplete = true
+	c.earReady = true
+	return transition
+}
+
+func (c *conduit) registrationEarTransition(registrations map[string]sessionRegistration, leases map[string]identityLease) bool {
+	byIdentity := make(map[string][]sessionRegistration)
+	identitySet := make(map[string]bool)
+	currentInstances := make(map[string]bool, len(registrations))
+	for instance, registration := range registrations {
+		byIdentity[registration.Identity] = append(byIdentity[registration.Identity], registration)
+		identitySet[registration.Identity] = true
+		currentInstances[instance] = true
+	}
+	for identity := range leases {
+		identitySet[identity] = true
+	}
+	names := make([]string, 0, len(identitySet))
+	for identity := range identitySet {
+		names = append(names, identity)
+	}
+	sort.Strings(names)
+	rows := make([]earsIdentity, 0, len(names))
+	for _, identity := range names {
+		row, err := c.buildEarIdentityBase(identity, byIdentity[identity], leases[identity])
+		if err != nil {
+			c.logger.Printf("build ear transition state failed: %v", err)
+			return false
+		}
+		rows = append(rows, row)
+	}
+	current := earsListeningSignature(rows)
+	if !c.earSignatureSet {
+		c.earRegistrationSig = current
+		c.earInstances = currentInstances
+		c.earSignatureSet = true
+		return false
+	}
+	changed := current != c.earRegistrationSig
+	for instance := range c.earInstances {
+		if !currentInstances[instance] {
+			c.earMu.Lock()
+			c.earForceWrite = true
+			c.earMu.Unlock()
+			break
+		}
+	}
+	c.earRegistrationSig = current
+	c.earInstances = currentInstances
+	return changed
+}
+
+func (c *conduit) observeGeneration(identity, instance string, letters []pendingLetter) {
+	if len(ringLetters(letters)) == 0 {
+		return
+	}
+	generation := letterGeneration(letters)
+	c.statesMu.Lock()
+	state := c.states[identity]
+	c.statesMu.Unlock()
+	changed := false
+	if state == nil {
+		if instance == "" {
+			state = &conduitState{generation: generation, firstSeen: time.Now()}
+		} else {
+			state = c.restoreState(identity, instance, generation)
+		}
+		c.statesMu.Lock()
+		if existing := c.states[identity]; existing != nil {
+			state = existing
+		} else {
+			c.states[identity] = state
+		}
+		c.statesMu.Unlock()
+		changed = true
+	}
+	c.statesMu.Lock()
+	if state.generation != generation {
+		state.generation = generation
+		state.firstSeen = time.Now()
+		state.attemptIndex = 0
+		state.writtenRings = 0
+		state.echoLogged = false
+		changed = true
+	}
+	snapshot := *state
+	c.statesMu.Unlock()
+	if changed {
+		if err := c.writeEarSidecar(identity, snapshot); err != nil {
+			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		}
 	}
 }
 
@@ -673,6 +854,14 @@ func (c *conduit) reapDeadRegistrations(regs map[string]sessionRegistration) {
 }
 
 func (c *conduit) pending(identity string) []pendingLetter {
+	return c.readPending(identity, false)
+}
+
+func (c *conduit) pendingForSnapshot(identity string) []pendingLetter {
+	return c.readPending(identity, true)
+}
+
+func (c *conduit) readPending(identity string, includeMtime bool) []pendingLetter {
 	dir := filepath.Join(c.home, "inbox", identity, "new")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -686,8 +875,14 @@ func (c *conduit) pending(identity string) []pendingLetter {
 		letter := pendingLetter{id: entry.Name()}
 		typeValue := ""
 		urgencyValue := ""
-		f, err := os.Open(filepath.Join(dir, entry.Name()))
+		f, err := openRegular(filepath.Join(dir, entry.Name()))
 		if err == nil {
+			if includeMtime {
+				info, statErr := f.Stat()
+				if statErr == nil {
+					letter.installedAt = info.ModTime().Unix()
+				}
+			}
 			scanner := bufio.NewScanner(io.LimitReader(f, 64<<10))
 			for scanner.Scan() {
 				line := scanner.Text()
@@ -749,6 +944,9 @@ func letterGeneration(letters []pendingLetter) string {
 		}
 	}
 	sort.Strings(ids)
+	if len(ids) == 0 {
+		return "-"
+	}
 	hash := sha256.New()
 	for _, id := range ids {
 		_, _ = io.WriteString(hash, id)
@@ -798,12 +996,17 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	}
 	if state.generation != generation {
 		state.generation = generation
+		state.firstSeen = now
 		state.attemptIndex = 0
+		state.writtenRings = 0
 		state.echoLogged = false
 		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 			state.nextAttempt = now
 		} else {
 			state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
+		}
+		if err := c.writeEarSidecar(identity, *state); err != nil {
+			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
 		}
 	}
 	if now.Before(state.nextAttempt) {
@@ -822,7 +1025,8 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	journal := deliveryJournal{
 		BootID: c.bootID, Identity: identity, InstanceID: reg.InstanceID,
 		Generation: generation, AttemptID: attemptID, AttemptIndex: attemptIndex,
-		AttemptedAt: now.UTC().Format(time.RFC3339Nano), PeerStatus: "unknown", CCVersion: reg.CCVersion,
+		AttemptedAt: now.UTC().Format(time.RFC3339Nano), FirstSeen: state.firstSeen.UTC().Format(time.RFC3339Nano),
+		PeerStatus: "unknown", CCVersion: reg.CCVersion,
 	}
 	for _, letter := range ringLetters(letters) {
 		journal.LetterIDs = append(journal.LetterIDs, letter.id)
@@ -910,6 +1114,8 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		// wake for this generation. Re-ring only much later (missed/dropped).
 		state.nextAttempt = now.Add(conduitRewrittenAfter())
 		state.failures = 0
+		state.lastWritten = now
+		state.writtenRings++
 	} else {
 		delayIndex := attemptIndex - 1
 		if delayIndex >= len(c.backoff) {
@@ -919,15 +1125,38 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		state.failures++
 	}
 	failures := state.failures
+	sidecarState := *state
 	c.statesMu.Unlock()
+	if journal.Status == "written" {
+		if err := c.writeEarSidecar(identity, sidecarState); err != nil {
+			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		}
+	}
 	c.updateNativeStatus(reg, failures)
 }
 
 func (c *conduit) restoreState(identity, instance, generation string) *conduitState {
 	state := &conduitState{generation: generation}
+	sidecarCurrent := false
+	if sidecar, err := c.readEarSidecar(identity); err == nil {
+		if sidecar.LastWritten > 0 {
+			state.lastWritten = time.Unix(sidecar.LastWritten, 0)
+		}
+		if sidecar.Generation == generation {
+			sidecarCurrent = true
+			state.firstSeen = time.Unix(sidecar.FirstSeen, 0)
+			state.writtenRings = sidecar.WrittenRings
+		}
+	}
 	dir := filepath.Join(c.runtime, "deliveries", identity, instance)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if generation != "" && state.firstSeen.IsZero() {
+			state.firstSeen = time.Now()
+			if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
+				c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+			}
+		}
 		return state
 	}
 	var journals []deliveryJournalAt
@@ -945,6 +1174,9 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		}
 	}
 	if len(journals) == 0 {
+		if generation != "" {
+			state.firstSeen = time.Now()
+		}
 		return state
 	}
 	sort.Slice(journals, func(i, j int) bool { return journals[i].at.Before(journals[j].at) })
@@ -954,8 +1186,19 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			state.failures++
 		} else if item.journal.Status == "written" {
 			state.failures = 0
+			state.lastWritten = item.at
+			if !sidecarCurrent && item.journal.Generation == generation {
+				state.writtenRings++
+			}
 		}
 		if item.journal.Generation == generation {
+			firstSeen := item.at
+			if recorded, err := time.Parse(time.RFC3339Nano, item.journal.FirstSeen); err == nil {
+				firstSeen = recorded
+			}
+			if state.firstSeen.IsZero() || firstSeen.Before(state.firstSeen) {
+				state.firstSeen = firstSeen
+			}
 			latest = item
 			if item.journal.Via == "channel+socket" {
 				state.echoLogged = true
@@ -963,12 +1206,23 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		}
 	}
 	if latest.at.IsZero() {
+		if generation != "" {
+			if state.firstSeen.IsZero() {
+				state.firstSeen = time.Now()
+			}
+			if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
+				c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+			}
+		}
 		return state
 	}
 	state.attemptIndex = latest.journal.AttemptIndex
 	state.lastAttempt = latest.at
 	if latest.journal.Status == "written" {
 		state.nextAttempt = latest.at.Add(conduitRewrittenAfter())
+		if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
+			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		}
 		return state
 	}
 	index := state.attemptIndex - 1
@@ -979,6 +1233,9 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		index = len(c.backoff) - 1
 	}
 	state.nextAttempt = latest.at.Add(c.backoff[index])
+	if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
+		c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+	}
 	return state
 }
 

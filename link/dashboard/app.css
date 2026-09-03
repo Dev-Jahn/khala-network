@@ -1,0 +1,14 @@
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; background: #0c1117; color: #e7edf4; }
+body { max-width: 1200px; margin: auto; padding: 1.5rem; }
+header { border-bottom: 1px solid #334155; margin-bottom: 2rem; }
+h1, h2, h3 { color: #f8fafc; }
+input, button { padding: .55rem; border: 1px solid #64748b; border-radius: .35rem; background: #111827; color: inherit; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; }
+article { background: #111827; border: 1px solid #334155; border-radius: .6rem; padding: 1rem; }
+ul { list-style: none; padding: 0; }
+li { display: grid; gap: .25rem; border-top: 1px solid #263244; padding: .75rem 0; }
+.badge { display: inline-block; width: fit-content; padding: .1rem .4rem; border-radius: 999px; background: #1e3a5f; }
+small { color: #94a3b8; }
+table { width: 100%; border-collapse: collapse; overflow-wrap: anywhere; }
+th, td { border-bottom: 1px solid #334155; padding: .55rem; text-align: left; }
+pre { white-space: pre-wrap; background: #111827; padding: 1rem; }

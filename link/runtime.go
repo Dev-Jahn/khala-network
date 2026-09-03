@@ -105,6 +105,8 @@ func runRuntime(args []string) int {
 		err = runtimeProcessStart(args[1:])
 	case "native-warning":
 		err = runtimeNativeWarning(args[1:])
+	case "pending-generation":
+		err = runtimePendingGeneration(args[1:])
 	default:
 		err = fmt.Errorf("unknown runtime command %q", args[0])
 	}
@@ -152,7 +154,7 @@ func runtimeRoot() (string, error) {
 	if err := secureDirectory(root); err != nil {
 		return "", err
 	}
-	for _, name := range []string{"sessions", "identities", "deliveries", "channels"} {
+	for _, name := range []string{"sessions", "identities", "deliveries", "channels", "ears"} {
 		if err := secureDirectory(filepath.Join(root, name)); err != nil {
 			return "", err
 		}
@@ -645,6 +647,12 @@ func runtimeRegisterChannel(args []string) error {
 		return err
 	}
 	return mutateRegistration(root, bootID, *instance, func(reg *sessionRegistration) error {
+		if isReservedIdentity(reg.Identity) {
+			return fmt.Errorf("reserved identity %q", reg.Identity)
+		}
+		if !isSessionKind(reg.Kind) {
+			return fmt.Errorf("registration kind %q is not a session kind", reg.Kind)
+		}
 		if reg.ClaudeSessionID != *sessionID {
 			return errors.New("channel caller Claude session id does not match registration")
 		}
@@ -714,11 +722,14 @@ func runtimeRegister(args []string, publicBind bool) error {
 	if !validNode(*identity) {
 		return fmt.Errorf("invalid identity %q", *identity)
 	}
+	if isReservedIdentity(*identity) {
+		return fmt.Errorf("reserved identity %q", *identity)
+	}
 	if *phase != "starting" && *phase != "ready" {
 		return fmt.Errorf("invalid registration phase %q", *phase)
 	}
-	if *kind == "" {
-		return errors.New("registration kind is empty")
+	if !validRegistrationKind(*kind) {
+		return fmt.Errorf("invalid registration kind %q", *kind)
 	}
 	root, err := runtimeRoot()
 	if err != nil {
@@ -888,6 +899,14 @@ func detectSessionKind(pid int) string {
 		return "interactive"
 	}
 	return "unknown"
+}
+
+func validRegistrationKind(kind string) bool {
+	return kind == "auto" || isSessionKind(kind)
+}
+
+func isSessionKind(kind string) bool {
+	return kind == "interactive" || kind == "unknown" || kind == "worker"
 }
 
 func firstNonempty(values ...string) string {
@@ -1345,6 +1364,32 @@ func runtimeNativeWarning(args []string) error {
 		fmt.Fprintln(os.Stdout, "native-degraded")
 	}
 	return nil
+}
+
+func runtimePendingGeneration(args []string) error {
+	fs := flag.NewFlagSet("runtime pending-generation", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
+	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validNode(*identity) {
+		return errors.New("pending-generation needs --identity <name>")
+	}
+	home, err := khalaHome()
+	if err != nil {
+		return err
+	}
+	generation, ring, info := pendingGeneration(home, *identity)
+	fmt.Fprintf(os.Stdout, "%s %d %d\n", generation, ring, info)
+	return nil
+}
+
+func pendingGeneration(home, identity string) (string, int, int) {
+	letters := (&conduit{home: home}).pending(identity)
+	mail, notices, urgent := letterCounts(letters)
+	ring := mail + urgent
+	if ring == 0 {
+		return "-", 0, notices - urgent
+	}
+	return letterGeneration(letters), ring, notices - urgent
 }
 
 func countRegularFiles(path string) int {
