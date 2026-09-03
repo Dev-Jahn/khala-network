@@ -57,7 +57,10 @@ and a quoted heredoc for any nontrivial body. A notice needs no ack or reply.
 Info notices never ring; `--urgent` notices ring like mail. Drain prints mail,
 then notices, then streams, and always ends with
 `drained: letters L, notices N, streams S`. Use `khala watcher declare/list/retire`
-to publish machine identities and configure cadence/dead-man notification.
+to publish machine identities and configure cadence/dead-man notification; an
+event-only watcher runs `khala watcher beat <name>` on its own node to stay
+alive without emitting a notice (`SINCE` in the list is the age of the current
+active/silent state).
 
 ## When the khala channel is on
 

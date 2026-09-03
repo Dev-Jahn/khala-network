@@ -73,6 +73,7 @@ Utilization and memory returned to normal.
 NOTICE
 khala notify operator@hub --as gpu-guard --urgent -s "GPU 2 stalled" </dev/null
 khala watcher declare gpu-guard --cadence 600 --owner operator@hub
+khala watcher beat gpu-guard
 khala watcher list
 khala watcher retire gpu-guard
 ```
@@ -82,8 +83,13 @@ wakes a session. Urgent notices ring exactly like mail. `notify` defaults to
 info and a two-day expiry; `--urgent` changes the doorbell policy and `-e`
 changes the expiry. A declared watcher with a cadence sends its owner one
 urgent notice when it misses twice that cadence, and one quiet info notice
-when notifications resume. `khala presence` shows active watchers below the
-session table; `khala presence --watchers` shows only that section.
+when notifications resume. Before the first notice or beat, the declaration
+time is the dead-man baseline. Event-only watchers should call `watcher beat`
+to refresh liveness without creating a notice, inbox/outbox/spool entry,
+presence heartbeat, or reconcile trigger. `watcher list` and `khala presence`
+show `SINCE`, the age of the current active/silent state. `khala presence`
+shows active watchers below the session table; `khala presence --watchers`
+shows only that section.
 
 ```sh
 khala say -m "build green on hub"          # the commons stream, "khala"

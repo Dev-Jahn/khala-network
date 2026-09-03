@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.8.1
+KHALA_VERSION=0.8.2
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -73,6 +73,7 @@ usage() {
         minds) printf '%s\n' 'usage: khala minds'; return 0 ;;
         watcher)
             printf '%s\n' 'usage: khala watcher declare <name> --cadence <seconds> --owner <session@node>'
+            printf '%s\n' '       khala watcher beat <name>'
             printf '%s\n' '       khala watcher list'
             printf '%s\n' '       khala watcher retire <name>'
             return 0
@@ -111,6 +112,7 @@ usage:
   khala profile [--model model] [--effort effort] [--role role] [--charge charge]
   khala minds
   khala watcher declare <name> --cadence <seconds> --owner <session@node>
+  khala watcher beat <name>
   khala watcher list
   khala watcher retire <name>
   khala retire <session>
@@ -383,11 +385,12 @@ atomic_line() {
 read_watcher_marker() {
     watcher_read_file=$1
     [ -f "$watcher_read_file" ] || return 1
-    # Exactly five newline-terminated lines (a partial sixth line is ignored,
-    # as `wc -l` would have ignored it); read in one pass, no forks — this runs
-    # for every marker on every reconcile.
+    # Exactly five or six newline-terminated lines (a partial trailing line is
+    # ignored, as `wc -l` would have ignored it); read in one pass, no forks —
+    # this runs for every marker on every reconcile.
     watcher_read_n=0
     watcher_read_1= watcher_read_2= watcher_read_3= watcher_read_4= watcher_read_5=
+    watcher_read_6=
     while IFS= read -r watcher_read_line; do
         watcher_read_n=$((watcher_read_n + 1))
         case "$watcher_read_n" in
@@ -396,41 +399,53 @@ read_watcher_marker() {
             3) watcher_read_3=$watcher_read_line ;;
             4) watcher_read_4=$watcher_read_line ;;
             5) watcher_read_5=$watcher_read_line ;;
+            6) watcher_read_6=$watcher_read_line ;;
             *) return 1 ;;
         esac
     done < "$watcher_read_file"
-    [ "$watcher_read_n" -eq 5 ] || return 1
+    [ "$watcher_read_n" -eq 5 ] || [ "$watcher_read_n" -eq 6 ] || return 1
+    watcher_read_retired=0
+    case "$watcher_read_1" in
+        retired\ *)
+            watcher_read_declared=${watcher_read_1#retired }
+            watcher_read_retired=1
+            ;;
+        *) watcher_read_declared=$watcher_read_1 ;;
+    esac
+    bounded_integer "$watcher_read_declared" || return 1
+    bounded_integer "$watcher_read_2" || return 1
+    case "$watcher_read_3" in
+        -) ;;
+        *) valid_address "$watcher_read_3" || valid_name "$watcher_read_3" || return 1 ;;
+    esac
+    bounded_integer "$watcher_read_4" || return 1
+    case "$watcher_read_5" in
+        active)
+            [ "$watcher_read_n" -eq 6 ] || watcher_read_6=$watcher_read_declared
+            ;;
+        silent\ *)
+            watcher_read_silent_since=${watcher_read_5#silent }
+            bounded_integer "$watcher_read_silent_since" || return 1
+            [ "$watcher_read_n" -eq 6 ] || watcher_read_6=$watcher_read_silent_since
+            ;;
+        *) return 1 ;;
+    esac
+    bounded_integer "$watcher_read_6" || return 1
+    watcher_read_declared_normalized=$(normalize_integer "$watcher_read_declared")
+    watcher_read_cadence=$(normalize_integer "$watcher_read_2")
+    watcher_read_last_notify=$(normalize_integer "$watcher_read_4")
+    watcher_read_state_since=$(normalize_integer "$watcher_read_6")
     WATCHER_L1=$watcher_read_1
     WATCHER_L2=$watcher_read_2
     WATCHER_L3=$watcher_read_3
     WATCHER_L4=$watcher_read_4
     WATCHER_L5=$watcher_read_5
-    WATCHER_RETIRED=0
-    case "$WATCHER_L1" in
-        retired\ *)
-            WATCHER_DECLARED=${WATCHER_L1#retired }
-            WATCHER_RETIRED=1
-            ;;
-        *) WATCHER_DECLARED=$WATCHER_L1 ;;
-    esac
-    bounded_integer "$WATCHER_DECLARED" || return 1
-    bounded_integer "$WATCHER_L2" || return 1
-    case "$WATCHER_L3" in
-        -) ;;
-        *) valid_address "$WATCHER_L3" || valid_name "$WATCHER_L3" || return 1 ;;
-    esac
-    bounded_integer "$WATCHER_L4" || return 1
-    case "$WATCHER_L5" in
-        active) ;;
-        silent\ *)
-            watcher_silent_since=${WATCHER_L5#silent }
-            bounded_integer "$watcher_silent_since" || return 1
-            ;;
-        *) return 1 ;;
-    esac
-    WATCHER_DECLARED=$(normalize_integer "$WATCHER_DECLARED")
-    WATCHER_CADENCE=$(normalize_integer "$WATCHER_L2")
-    WATCHER_LAST_NOTIFY=$(normalize_integer "$WATCHER_L4")
+    WATCHER_L6=$watcher_read_6
+    WATCHER_RETIRED=$watcher_read_retired
+    WATCHER_DECLARED=$watcher_read_declared_normalized
+    WATCHER_CADENCE=$watcher_read_cadence
+    WATCHER_LAST_NOTIFY=$watcher_read_last_notify
+    WATCHER_STATE_SINCE=$watcher_read_state_since
     return 0
 }
 
@@ -441,9 +456,10 @@ write_watcher_marker() {
     watcher_write_l3=$4
     watcher_write_l4=$5
     watcher_write_l5=$6
+    watcher_write_l6=$7
     watcher_write_tmp=$(mktemp "$TMP_DIR/watcher.XXXXXX") || return 1
-    if ! printf '%s\n%s\n%s\n%s\n%s\n' "$watcher_write_l1" "$watcher_write_l2" \
-        "$watcher_write_l3" "$watcher_write_l4" "$watcher_write_l5" \
+    if ! printf '%s\n%s\n%s\n%s\n%s\n%s\n' "$watcher_write_l1" "$watcher_write_l2" \
+        "$watcher_write_l3" "$watcher_write_l4" "$watcher_write_l5" "$watcher_write_l6" \
         > "$watcher_write_tmp"; then
         rm -f "$watcher_write_tmp"
         return 1
@@ -494,9 +510,14 @@ acquire_lock() {
     lock_path=$1
     lock_stale_after=$2
     lock_what=$3
-    lock_attempt_limit=60
-    if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ] && [ "$lock_what" = reconcile ]; then
-        lock_attempt_limit=3
+    lock_attempt_limit=240
+    lock_retry_delay=0.25
+    if [ "$lock_what" = reconcile ]; then
+        lock_attempt_limit=60
+        lock_retry_delay=1
+        if [ "${KHALA_LINK_SCAN_GATE-}" = 1 ]; then
+            lock_attempt_limit=3
+        fi
     fi
     if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
         error "$KHALA_ROOT/run: lock 디렉터리를 준비하지 못했습니다"
@@ -537,7 +558,7 @@ acquire_lock() {
         fi
         lock_attempt=$((lock_attempt + 1))
         [ "$lock_attempt" -lt "$lock_attempt_limit" ] || break
-        sleep 1
+        sleep "$lock_retry_delay"
     done
     error "$lock_path: ${lock_attempt_limit}회 시도 후에도 lock을 얻지 못했습니다"
     return 1
@@ -2497,6 +2518,8 @@ watcher_deadman() {
         if [ "$WATCHER_LAST_NOTIFY" -gt 0 ]; then
             deadman_anchor=$WATCHER_LAST_NOTIFY
         else
+            # An event-only watcher may never have notified; its declaration
+            # epoch is the explicit dead-man baseline until the first beat.
             deadman_anchor=$WATCHER_DECLARED
         fi
         if [ "$deadman_now" -ge "$deadman_anchor" ]; then
@@ -2543,7 +2566,7 @@ watcher_deadman() {
         fi
         rm -f "$deadman_body"
         if ! write_watcher_marker "$deadman_marker" "$WATCHER_L1" "$WATCHER_L2" \
-            "$WATCHER_L3" "$WATCHER_L4" "$deadman_next_state"; then
+            "$WATCHER_L3" "$WATCHER_L4" "$deadman_next_state" "$deadman_now"; then
             rm -f "$KHALA_ROOT/spool/for/$deadman_node/$NOTICE_ID"
             sync_error "$deadman_marker: dead-man 상태를 기록하지 못했습니다"
         fi
@@ -3330,6 +3353,7 @@ cmd_notify() {
         WATCHER_L3=-
         WATCHER_L4=0
         WATCHER_L5=active
+        WATCHER_L6=$notify_now
         notify_auto_declared=1
     fi
     if [ "$notify_status" -eq 0 ] && ! queue_notice "$notify_from" "$notify_to" \
@@ -3338,7 +3362,8 @@ cmd_notify() {
         notify_status=1
     fi
     if [ "$notify_status" -eq 0 ] && ! write_watcher_marker "$notify_marker" \
-        "$WATCHER_L1" "$WATCHER_L2" "$WATCHER_L3" "$notify_now" "$WATCHER_L5"; then
+        "$WATCHER_L1" "$WATCHER_L2" "$WATCHER_L3" "$notify_now" "$WATCHER_L5" \
+        "$WATCHER_L6"; then
         rm -f "$KHALA_ROOT/spool/for/${notify_to#*@}/$NOTICE_ID"
         error "$notify_marker: last-notify를 갱신하지 못했습니다"
         notify_status=1
@@ -3747,7 +3772,7 @@ relative_age() {
 print_watcher_table() {
     watcher_table_mode=$1
     watcher_table_now=$(date +%s) || return 1
-    printf 'NAME\tNODE\tOWNER\tCADENCE\tLAST\tSTATE\n'
+    printf 'NAME\tNODE\tOWNER\tCADENCE\tLAST\tSTATE\tSINCE\n'
     for watcher_table_file in "$KHALA_ROOT"/presence/*.watcher; do
         [ -f "$watcher_table_file" ] || continue
         watcher_table_address=$(basename "$watcher_table_file" .watcher)
@@ -3767,11 +3792,14 @@ print_watcher_table() {
         watcher_table_last=$(relative_age "$WATCHER_LAST_NOTIFY" "$watcher_table_now")
         if [ "$WATCHER_RETIRED" -eq 1 ]; then
             watcher_table_state=retired
+            watcher_table_since=$(relative_age "$WATCHER_DECLARED" "$watcher_table_now")
         else
             watcher_table_state=${WATCHER_L5%% *}
+            watcher_table_since=$(relative_age "$WATCHER_STATE_SINCE" "$watcher_table_now")
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$watcher_table_name" "$watcher_table_node" \
-            "$WATCHER_L3" "$WATCHER_CADENCE" "$watcher_table_last" "$watcher_table_state"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$watcher_table_name" "$watcher_table_node" \
+            "$WATCHER_L3" "$WATCHER_CADENCE" "$watcher_table_last" \
+            "$watcher_table_state" "$watcher_table_since"
     done
     return 0
 }
@@ -3858,10 +3886,11 @@ cmd_watcher() {
             else
                 WATCHER_L4=0
                 WATCHER_L5=active
+                WATCHER_L6=$watcher_now
             fi
             if [ "$watcher_status" -eq 0 ] && ! write_watcher_marker "$watcher_marker" \
                 "$watcher_now" "$watcher_cadence" "$watcher_owner" \
-                "$WATCHER_L4" "$WATCHER_L5"; then
+                "$WATCHER_L4" "$WATCHER_L5" "$WATCHER_L6"; then
                 error "$watcher_marker: watcher 선언을 기록하지 못했습니다"
                 watcher_status=1
             fi
@@ -3871,6 +3900,47 @@ cmd_watcher() {
             fi
             [ "$watcher_status" -eq 0 ] || return 1
             printf 'declared %s@%s\n' "$watcher_name" "$watcher_node"
+            return 0
+            ;;
+        beat)
+            [ "$#" -eq 1 ] || { usage watcher; return 1; }
+            watcher_name=$1
+            if ! valid_name "$watcher_name"; then
+                error "잘못된 watcher 이름: $watcher_name"
+                return 1
+            fi
+            watcher_node=$(self_node) || return 1
+            watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
+            watcher_lock=$KHALA_ROOT/run/brain.lock.d
+            if ! acquire_lock "$watcher_lock" 300 watcher-beat; then
+                error "watcher beat용 brain lock을 얻지 못했습니다"
+                return 1
+            fi
+            watcher_status=0
+            if [ ! -f "$watcher_marker" ]; then
+                error "$watcher_name@$watcher_node: 선언된 watcher가 아닙니다"
+                watcher_status=1
+            elif ! read_watcher_marker "$watcher_marker"; then
+                error "$watcher_marker: 잘못된 watcher marker"
+                watcher_status=1
+            elif [ "$WATCHER_RETIRED" -eq 1 ]; then
+                error "$watcher_name@$watcher_node: retired watcher입니다"
+                watcher_status=1
+            else
+                watcher_now=$(date +%s) || watcher_status=1
+                if [ "$watcher_status" -eq 0 ] && ! write_watcher_marker "$watcher_marker" \
+                    "$WATCHER_L1" "$WATCHER_L2" "$WATCHER_L3" "$watcher_now" \
+                    "$WATCHER_L5" "$WATCHER_L6"; then
+                    error "$watcher_marker: last-notify를 갱신하지 못했습니다"
+                    watcher_status=1
+                fi
+            fi
+            if ! release_lock "$watcher_lock"; then
+                error "watcher beat용 brain lock을 해제하지 못했습니다"
+                return 1
+            fi
+            [ "$watcher_status" -eq 0 ] || return 1
+            printf 'beat %s@%s\n' "$watcher_name" "$watcher_node"
             return 0
             ;;
         retire)
@@ -3896,7 +3966,8 @@ cmd_watcher() {
                 error "$watcher_marker: 잘못된 watcher marker"
                 watcher_status=1
             elif ! write_watcher_marker "$watcher_marker" "retired $watcher_now" \
-                "$WATCHER_L2" "$WATCHER_L3" "$WATCHER_L4" "$WATCHER_L5"; then
+                "$WATCHER_L2" "$WATCHER_L3" "$WATCHER_L4" "$WATCHER_L5" \
+                "$WATCHER_L6"; then
                 error "$watcher_marker: watcher retire를 기록하지 못했습니다"
                 watcher_status=1
             fi
