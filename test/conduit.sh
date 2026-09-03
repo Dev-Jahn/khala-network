@@ -892,9 +892,204 @@ grep -Fq "started pid=$H18_CONDUIT_PID runtime=$H18_RUNTIME" "$H18_HOME/log/cond
 stop_pid "$H18_CONDUIT_PID"
 pass H18 "a live status survives a replaced lock inode; a dead status permits startup"
 
+# H21 — one real conduit snapshot is bounded, leak-free, transition-driven,
+# and replaced by an empty snapshot on clean shutdown.
+H21_HOME=$RIG/h21-home
+init_home "$H21_HOME"
+printf 'peer mini h21-peer-sentinel.invalid\n' >> "$H21_HOME/config"
+start_listener h21-socket-sentinel h21-session
+H21_LISTENER_PID=$LISTENER_PID
+H21_SOCKET=$LISTENER_SOCKET
+H21_REG=$(register_session "$H21_HOME" earsafe h21-session "$H21_LISTENER_PID" \
+    "$H21_SOCKET" interactive ready) || fail H21 "ready registration failed"
+H21_INSTANCE=$(printf '%s\n' "$H21_REG" | sed -n 's/^instance //p')
+stage_letter "$H21_HOME" earsafe 21 sentinel-sender@alpha "h21-subject-sentinel"
+printf '\nh21-body-sentinel\n' >> "$H21_HOME/inbox/earsafe/new/1700000000.1.21.sender@alpha"
+start_conduit "$H21_HOME" env KHALA_CONDUIT_TEST_EAR_INTERVAL=30s \
+    KHALA_CONDUIT_TEST_BACKOFF=500ms
+H21_CONDUIT_PID=$CONDUIT_PID
+H21_EAR=$H21_HOME/presence/conduit@alpha.ear
+wait_file "$H21_EAR" 100 || fail H21 "initial snapshot was not written"
+uv run --no-project python - "$H21_EAR" <<'PY' || fail H21 "snapshot shape/caps failed"
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = path.read_bytes()
+lines = data.decode().splitlines()
+assert len(data) <= 16 * 1024, len(data)
+assert lines[:10] == [
+    "ears 1", "node alpha", lines[2], lines[3], "interval 30", "state running",
+    "complete yes", "component conduit release=0.9.1 adapter=1 ears=1",
+    "mailbox -", "link -",
+], lines[:10]
+assert lines[2].startswith("generation ")
+assert lines[3].startswith("written-at ")
+rows = [line for line in lines if line.startswith("identity name=earsafe ")]
+assert len(rows) == 1, rows
+fields = rows[0].split()
+required = {
+    "principal=session", "listening=yes", "route=socket", "phase=ready",
+    "cc=2.1.233", "reason=-", "pending-ring=1", "pending-info=0",
+    "pending-operator=0", "last-drain-before=-", "last-drain-after=-",
+}
+assert required <= set(fields), fields
+assert len(rows[0].encode()) <= 1024
+PY
+for h21_sentinel in h21-peer-sentinel h21-socket-sentinel h21-subject-sentinel \
+    h21-body-sentinel sentinel-sender "$H21_INSTANCE" "$H21_LISTENER_PID"; do
+    ! grep -Fq "$h21_sentinel" "$H21_EAR" || fail H21 "snapshot leaked $h21_sentinel"
+done
+! grep -q '/' "$H21_EAR" || fail H21 "snapshot leaked a path separator"
+H21_PENDING=$(runtime_env KHALA_HOME="$H21_HOME" "$BIN" runtime pending-generation \
+    --identity earsafe 2>"$RIG/h21.pending.err") || fail H21 "pending-generation failed"
+[ ! -s "$RIG/h21.pending.err" ] || fail H21 "pending-generation wrote stderr"
+H21_PENDING_GENERATION=${H21_PENDING%% *}
+uv run --no-project python - "$LISTENER_OUTPUT" "$H21_PENDING_GENERATION" <<'PY' || \
+    fail H21 "pending-generation differs from the doorbell frame"
+import json, sys
+frame = json.loads(open(sys.argv[1], encoding="utf-8").readline())
+content = frame["message"]["content"].splitlines()
+assert "generation: " + sys.argv[2] in content, (content, sys.argv[2])
+PY
+cp "$H21_EAR" "$RIG/h21.before-pending"
+stage_letter "$H21_HOME" earsafe 22 another@alpha
+sleep 0.6
+cmp -s "$RIG/h21.before-pending" "$H21_EAR" || fail H21 "pending-only change rewrote snapshot"
+runtime_env KHALA_HOME="$H21_HOME" "$BIN" runtime release --identity earsafe \
+    --instance "$H21_INSTANCE" >/dev/null || fail H21 "runtime release failed"
+H21_OLD_GENERATION=$(sed -n 's/^generation //p' "$RIG/h21.before-pending")
+h21_wait=0
+while [ "$h21_wait" -lt 60 ]; do
+    H21_NEW_GENERATION=$(sed -n 's/^generation //p' "$H21_EAR" 2>/dev/null || :)
+    [ -n "$H21_NEW_GENERATION" ] && [ "$H21_NEW_GENERATION" -gt "$H21_OLD_GENERATION" ] && break
+    sleep 0.05
+    h21_wait=$((h21_wait + 1))
+done
+[ "$h21_wait" -lt 60 ] || fail H21 "lease-release transition took more than 3 seconds"
+! grep -q '^identity name=earsafe ' "$H21_EAR" || fail H21 "released-only identity remained in snapshot"
+stop_pid "$H21_CONDUIT_PID"
+[ "$(grep -c '^identity ' "$H21_EAR" || :)" -eq 0 ] || fail H21 "clean shutdown snapshot retained identities"
+grep -q '^state stopping$' "$H21_EAR" || fail H21 "clean shutdown snapshot did not say stopping"
+pass H21 "ear snapshot is exact, leak-free, transition-driven, and empty on shutdown"
+
+# H22 — dashboard binds the requested ephemeral address, authenticates every
+# API call, returns the security headers, and leaves KHALA_HOME byte-for-byte
+# unchanged as a file tree.
+H22_HOME=$RIG/h22-home
+init_home "$H22_HOME"
+stage_letter "$H22_HOME" local 22 sender@alpha "h22-secret-subject"
+mkdir -p "$H22_HOME/minds/alpha/local"
+cat > "$H22_HOME/minds/alpha/local/1700000000.1" <<'EOF'
+Generation: 1700000000.1
+Session: local
+Node: alpha
+State: active
+Model: opus
+Effort: high
+Role: builder
+Charge: test
+Focus: h22-secret-focus
+Stance: h22-secret-stance
+Declared-State: 1700000000
+Declared-Model: 1700000000
+Declared-Effort: 1700000000
+Declared-Role: 1700000000
+Declared-Charge: 1700000000
+Declared-Focus: 1700000000
+Declared-Stance: 1700000000
+
+EOF
+find "$H22_HOME" -printf '%P\t%y\n' | sort > "$RIG/h22.tree.before"
+KHALA_HOME=$H22_HOME KHALA_RUNTIME_DIR=$H22_HOME/runtime-must-not-exist \
+    "$BIN" dashboard --port 0 --no-text \
+    >"$RIG/h22.dashboard.out" 2>"$RIG/h22.dashboard.err" &
+H22_DASHBOARD_PID=$!
+PIDS="$PIDS $H22_DASHBOARD_PID"
+h22_wait=0
+while [ "$(line_count "$RIG/h22.dashboard.out")" -lt 1 ] && [ "$h22_wait" -lt 100 ]; do
+    sleep 0.05
+    h22_wait=$((h22_wait + 1))
+done
+[ "$h22_wait" -lt 100 ] || fail H22 "dashboard did not report address and token"
+[ "$(line_count "$RIG/h22.dashboard.out")" -eq 1 ] || fail H22 "dashboard printed more than one stdout line"
+H22_ADDRESS=$(sed -n 's|^dashboard: http://\([^/]*\)/#.*$|\1|p' "$RIG/h22.dashboard.out")
+H22_TOKEN=$(sed -n 's|^dashboard: http://[^/]*/#\(.*\)$|\1|p' "$RIG/h22.dashboard.out")
+[ -n "$H22_ADDRESS" ] && [ -n "$H22_TOKEN" ] || fail H22 "dashboard stdout contract is malformed"
+uv run --no-project python - "$H22_ADDRESS" "$H22_TOKEN" <<'PY' || fail H22 "HTTP contract failed"
+import json, sys, urllib.error, urllib.request
+address, token = sys.argv[1:]
+base = "http://" + address
+
+def call(path, auth=None, method="GET"):
+    request = urllib.request.Request(base + path, method=method)
+    if auth is not None:
+        request.add_header("Authorization", "Bearer " + auth)
+    try:
+        response = urllib.request.urlopen(request, timeout=2)
+    except urllib.error.HTTPError as error:
+        response = error
+    headers = response.headers
+    assert headers["Cache-Control"] == "no-store", headers
+    assert headers["X-Content-Type-Options"] == "nosniff", headers
+    assert headers["Referrer-Policy"] == "no-referrer", headers
+    assert headers["Content-Security-Policy"] == "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'", headers
+    assert headers["X-Frame-Options"] == "DENY", headers
+    assert "Access-Control-Allow-Origin" not in headers, headers
+    return response.status, response.read()
+
+assert call("/api/v1/fleet")[0] == 401
+assert call("/api/v1/fleet?token=" + token)[0] == 401
+assert call("/api/v1/fleet", "wrong")[0] == 401
+status, body = call("/api/v1/fleet", token)
+assert status == 200, (status, body)
+payload = json.loads(body)
+assert payload["apiVersion"] == 1
+lower = body.lower()
+for forbidden in (b'"subject"', b'"body"', b'"focus"', b'"stance"', b'h22-secret'):
+    assert forbidden not in lower, forbidden
+assert call("/api/v1/letter?identity=local&id=bad", token)[0] == 404
+assert call("/api/v1/fleet", token, "POST")[0] == 405
+assert call("/")[0] == 200
+PY
+kill "$H22_DASHBOARD_PID" 2>/dev/null || fail H22 "dashboard was not running at shutdown"
+wait "$H22_DASHBOARD_PID"
+H22_STATUS=$?
+[ "$H22_STATUS" -eq 0 ] || fail H22 "SIGTERM exited $H22_STATUS, want 0"
+find "$H22_HOME" -printf '%P\t%y\n' | sort > "$RIG/h22.tree.after"
+cmp -s "$RIG/h22.tree.before" "$RIG/h22.tree.after" || fail H22 "dashboard changed KHALA_HOME tree"
+[ ! -e "$H22_HOME/runtime-must-not-exist" ] || fail H22 "dashboard created or chmodded runtime"
+if KHALA_HOME=$H22_HOME "$BIN" dashboard --listen 0.0.0.0:0 \
+    >"$RIG/h22.nonloop.out" 2>"$RIG/h22.nonloop.err"; then
+    fail H22 "removed --listen option succeeded"
+else
+    H22_STATUS=$?
+fi
+[ "$H22_STATUS" -eq 2 ] || fail H22 "removed --listen exited $H22_STATUS, want 2"
+"$RIG/venv/bin/python" - "$RIG/h22.port" <<'PY' &
+import socket, sys, time
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+sock.listen()
+open(sys.argv[1], "w", encoding="utf-8").write(f"127.0.0.1:{sock.getsockname()[1]}\n")
+time.sleep(10)
+PY
+H22_PORT_PID=$!
+PIDS="$PIDS $H22_PORT_PID"
+wait_file "$RIG/h22.port" 100 || fail H22 "port holder did not bind"
+H22_BUSY=$(sed -n '1p' "$RIG/h22.port")
+H22_BUSY_PORT=${H22_BUSY##*:}
+if KHALA_HOME=$H22_HOME "$BIN" dashboard --port "$H22_BUSY_PORT" \
+    >"$RIG/h22.busy.out" 2>"$RIG/h22.busy.err"; then
+    fail H22 "busy port silently hopped"
+else
+    H22_STATUS=$?
+fi
+[ "$H22_STATUS" -eq 1 ] || fail H22 "busy port exited $H22_STATUS, want 1"
+stop_pid "$H22_PORT_PID"
+pass H22 "dashboard auth, headers, guards, ephemeral bind, and read-only tree passed"
+
 bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-start.sh" "$ROOT/plugin/hooks/stop.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H20 delivery, channel routing, lease, hook, restart, watch, runtime, and link properties passed\n'
+printf 'Conduit H1-H22 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'

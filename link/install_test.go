@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -441,5 +443,77 @@ func TestWatcherDeclarationNeverRegresses(t *testing.T) {
 	plain := []byte("1700000050\n")
 	if _, _, err := i.receive(testOffer("presence", "alpha", "guard@alpha", plain), plain); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEarInstallMatrix(t *testing.T) {
+	for _, endpoint := range []struct{ role, peer string }{{"serve", "alpha"}, {"dial", "beta"}} {
+		t.Run(endpoint.role, func(t *testing.T) {
+			home := testKhalaHome(t)
+			i := installer{home: home, role: endpoint.role, peer: endpoint.peer, logger: testLogger{t}}
+			name := "conduit@alpha.ear"
+			ears := func(generation int64, writtenAt int64) []byte {
+				return []byte(strings.Replace(validEarsFixture("alpha", generation), "written-at 1788402001", fmt.Sprintf("written-at %d", writtenAt), 1))
+			}
+			destination := filepath.Join(home, "presence", name)
+			current := ears(20, 100)
+			if err := os.WriteFile(destination, current, 0600); err != nil {
+				t.Fatal(err)
+			}
+			unparsable := []byte("not ears\n")
+			assertReceive := func(incoming, want []byte) string {
+				t.Helper()
+				_, path, err := i.receive(testOffer("presence", "alpha", name, incoming), incoming)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := os.ReadFile(destination)
+				if err != nil || !bytes.Equal(got, want) {
+					t.Fatalf("installed bytes differ: got=%q want=%q err=%v", got, want, err)
+				}
+				return path
+			}
+			assertReceive(unparsable, current)
+			assertReceive(ears(19, 90), current)
+			before, _ := os.Stat(destination)
+			assertReceive(current, current)
+			after, _ := os.Stat(destination)
+			if !before.ModTime().Equal(after.ModTime()) {
+				t.Fatal("equal generation and bytes rewrote destination")
+			}
+			conflict := ears(20, 101)
+			quarantine := assertReceive(conflict, current)
+			wantDigest := fmt.Sprintf("%x", sha256.Sum256(conflict))[:8]
+			if filepath.Base(quarantine) != "alpha.20."+wantDigest {
+				t.Fatalf("quarantine=%q", quarantine)
+			}
+			assertReceive(ears(21, 110), ears(21, 110))
+
+			if err := os.WriteFile(destination, unparsable, 0600); err != nil {
+				t.Fatal(err)
+			}
+			valid := ears(22, 120)
+			assertReceive(valid, valid)
+		})
+	}
+}
+
+func TestEarConflictQuarantineIsCappedAtEight(t *testing.T) {
+	home := testKhalaHome(t)
+	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
+	name := "conduit@alpha.ear"
+	current := []byte(validEarsFixture("alpha", 20))
+	if err := os.WriteFile(filepath.Join(home, "presence", name), current, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 10; index++ {
+		incoming := []byte(strings.Replace(string(current), "written-at 1788402001", fmt.Sprintf("written-at %d", 1788402100+index), 1))
+		if _, _, err := i.receive(testOffer("presence", "alpha", name, incoming), incoming); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(home, "quarantine", "ears"))
+	if err != nil || len(entries) != 8 {
+		t.Fatalf("quarantine entries=%d err=%v", len(entries), err)
 	}
 }

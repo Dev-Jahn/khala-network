@@ -43,6 +43,65 @@ func TestLoadConfigRetainDays(t *testing.T) {
 	}
 }
 
+func TestLoadConfigTTL(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		line    string
+		want    int64
+		wantErr bool
+	}{
+		{name: "default", want: 120},
+		{name: "configured", line: "ttl 300\n", want: 300},
+		{name: "zero", line: "ttl 0\n", wantErr: true},
+		{name: "negative", line: "ttl -1\n", wantErr: true},
+		{name: "nonnumeric", line: "ttl often\n", wantErr: true},
+		{name: "duplicate", line: "ttl 120\nttl 121\n", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := testKhalaHome(t)
+			if err := os.WriteFile(filepath.Join(home, "config"), []byte("self alpha\n"+test.line), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := loadConfig(home)
+			if test.wantErr && err == nil {
+				t.Fatalf("loadConfig accepted %q", test.line)
+			}
+			if !test.wantErr && (err != nil || got.ttl != test.want) {
+				t.Fatalf("ttl=%d want=%d err=%v", got.ttl, test.want, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfigEarsSwitch(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		line    string
+		enabled bool
+		wantErr bool
+	}{
+		{name: "default", enabled: true},
+		{name: "on", line: "ears on\n", enabled: true},
+		{name: "off", line: "ears off\n"},
+		{name: "invalid", line: "ears maybe\n", wantErr: true},
+		{name: "duplicate", line: "ears on\nears off\n", wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			home := testKhalaHome(t)
+			if err := os.WriteFile(filepath.Join(home, "config"), []byte("self alpha\n"+test.line), 0600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := loadConfig(home)
+			if test.wantErr != (err != nil) {
+				t.Fatalf("loadConfig err=%v wantErr=%t", err, test.wantErr)
+			}
+			if err == nil && got.earsEnabled != test.enabled {
+				t.Fatalf("earsEnabled=%t want=%t", got.earsEnabled, test.enabled)
+			}
+		})
+	}
+}
+
 func TestGenerationValidationMatchesBrainGrammar(t *testing.T) {
 	for _, generation := range []string{"0.0", "1.0", "1786655513.42"} {
 		if !validGeneration(generation) {

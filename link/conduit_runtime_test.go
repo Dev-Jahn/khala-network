@@ -69,6 +69,9 @@ func newConduitFixture(t *testing.T) *conduitFixture {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(home, "config"), []byte("self alpha\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("KHALA_CLAUDE_SESSIONS_DIR", registry)
 	t.Setenv("KHALA_RUNTIME_DIR", runtimeRoot)
 	t.Setenv("KHALA_TEST_BOOT_ID", "test-boot")
@@ -323,6 +326,63 @@ func TestInfoNoticeDoesNotAffectGenerationOrPriorityAndNeverRingsAlone(t *testin
 	}
 	if entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID)); !os.IsNotExist(err) || len(entries) != 0 {
 		t.Fatalf("info-only inbox journaled delivery: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestPendingGenerationUsesConduitEnumeration(t *testing.T) {
+	f := newConduitFixture(t)
+	f.stageEnvelope("ink", "1.mail", "Type: message\n\nbody\n")
+	f.stageEnvelope("ink", "2.info", "Type: notice\nUrgency: info\n\nbody\n")
+	f.stageEnvelope("ink", "3.urgent", "Type: notice\nUrgency: urgent\n\nbody\n")
+	generation, ring, info := pendingGeneration(f.home, "ink")
+	want := letterGeneration(f.conduit.pending("ink"))
+	if generation != want || ring != 2 || info != 1 {
+		t.Fatalf("pending-generation=(%s,%d,%d), want (%s,2,1)", generation, ring, info, want)
+	}
+	if generation, ring, info := pendingGeneration(f.home, "unknown"); generation != "-" || ring != 0 || info != 0 {
+		t.Fatalf("unknown=(%s,%d,%d)", generation, ring, info)
+	}
+	if got := letterGeneration(nil); got != "-" {
+		t.Fatalf("empty generation=%q", got)
+	}
+	frame := f.conduit.frame("ink", generation, "attempt", 0, f.conduit.pending("ink"))
+	content := frame["message"].(map[string]string)["content"]
+	if !strings.Contains(content, "generation: "+generation+"\n") {
+		t.Fatalf("doorbell generation differs: %s", content)
+	}
+	missingRuntime := filepath.Join(f.runtime, "must-not-exist")
+	t.Setenv("KHALA_RUNTIME_DIR", missingRuntime)
+	if err := runtimePendingGeneration([]string{"--identity", "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(missingRuntime); !os.IsNotExist(err) {
+		t.Fatalf("pending-generation created runtime: %v", err)
+	}
+}
+
+func TestRuntimePrincipalAndKindPolicy(t *testing.T) {
+	for _, identity := range []string{"conduit", "khala", "gateway", "operator", "khala-gateway"} {
+		if !isReservedIdentity(identity) {
+			t.Errorf("reserved identity accepted: %s", identity)
+		}
+	}
+	for _, kind := range []string{"auto", "interactive", "unknown", "worker"} {
+		if !validRegistrationKind(kind) {
+			t.Errorf("known registration kind rejected: %s", kind)
+		}
+	}
+	for _, kind := range []string{"", "gateway", "daemon", "Interactive"} {
+		if validRegistrationKind(kind) {
+			t.Errorf("unknown registration kind accepted: %s", kind)
+		}
+	}
+	for _, kind := range []string{"interactive", "unknown", "worker"} {
+		if !isSessionKind(kind) {
+			t.Errorf("session kind rejected: %s", kind)
+		}
+	}
+	if isSessionKind("gateway") {
+		t.Fatal("gateway treated as a session kind")
 	}
 }
 
@@ -662,6 +722,11 @@ func TestWithRuntimeLockDoesNotRewriteUnchangedBootID(t *testing.T) {
 	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old = oldInfo.ModTime()
 	if err := withRuntimeLock(path, "test-boot", func() error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -1022,5 +1087,69 @@ func TestRuntimeReleaseOnlyClearsOwnedLeaseAndLogs(t *testing.T) {
 	want := "released lease shared for instance owner"
 	if got := strings.Count(string(data), want); got != 1 {
 		t.Fatalf("release log count=%d want 1; log=%s", got, data)
+	}
+}
+
+func TestRuntimeReservedIdentities(t *testing.T) {
+	for _, identity := range []string{"conduit", "khala", "gateway", "operator", "khala-gateway"} {
+		for _, publicBind := range []bool{false, true} {
+			err := runtimeRegister([]string{"--identity", identity}, publicBind)
+			if err == nil || err.Error() != fmt.Sprintf("reserved identity %q", identity) {
+				t.Errorf("runtime register identity=%q bind=%t err=%v", identity, publicBind, err)
+			}
+		}
+	}
+	f := newConduitFixture(t)
+	reserved := sessionRegistration{BootID: f.bootID, InstanceID: "reserved-instance", Identity: "gateway", ClaudeSessionID: "session"}
+	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", reserved.InstanceID+".json"), reserved, 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := runtimeRegisterChannel([]string{"--instance", reserved.InstanceID, "--session-id", reserved.ClaudeSessionID, "--clear"})
+	if err == nil || err.Error() != `reserved identity "gateway"` {
+		t.Fatalf("runtime register-channel err=%v", err)
+	}
+	if isReservedIdentity("ordinary") {
+		t.Fatal("ordinary identity is reserved")
+	}
+}
+
+func TestRuntimeRegisterAcceptsAutoAndWorkerAndRefusesGatewayKind(t *testing.T) {
+	f := newConduitFixture(t)
+	for _, test := range []struct {
+		identity string
+		kind     string
+		ok       bool
+	}{{"auto-ok", "auto", true}, {"worker-ok", "worker", true}, {"gateway-bad", "gateway", false}} {
+		args := []string{"--identity", test.identity, "--kind", test.kind, "--pid", strconv.Itoa(os.Getpid()), "--session-id", test.identity + "-session", "--phase", "starting"}
+		err := runtimeRegister(args, false)
+		if test.ok && err != nil {
+			t.Errorf("kind %s failed: %v", test.kind, err)
+		}
+		if !test.ok && (err == nil || err.Error() != `invalid registration kind "gateway"`) {
+			t.Errorf("kind gateway err=%v", err)
+		}
+	}
+	registrations, err := loadRegistrations(f.runtime, f.bootID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seenAuto, seenWorker := false, false
+	for _, registration := range registrations {
+		if registration.Identity == "auto-ok" && isSessionKind(registration.Kind) {
+			seenAuto = true
+		}
+		if registration.Identity == "worker-ok" && registration.Kind == "worker" {
+			seenWorker = true
+		}
+	}
+	if !seenAuto || !seenWorker {
+		t.Fatalf("registrations=%+v", registrations)
+	}
+	nonSession := sessionRegistration{BootID: f.bootID, InstanceID: "non-session", Identity: "ordinary", ClaudeSessionID: "session", Kind: "gateway"}
+	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", nonSession.InstanceID+".json"), nonSession, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtimeRegisterChannel([]string{"--instance", nonSession.InstanceID, "--session-id", nonSession.ClaudeSessionID, "--clear"}); err == nil || !strings.Contains(err.Error(), "not a session kind") {
+		t.Fatalf("register-channel non-session err=%v", err)
 	}
 }
