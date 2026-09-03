@@ -119,7 +119,9 @@ independent defaults of 10 items / 16384 bytes and the flags
 `--max-notices` / `--max-notice-bytes`. Use `--mail-only` to leave notices in
 `new/`, or `--notices-only` to leave mail and stream cursors untouched. Every
 drain ends with `drained: letters L, notices N, streams S`, including an
-explicit all-zero result.
+explicit all-zero result. While still holding the brain lock it atomically
+records the drain time, pending generation before and after, ring/info/stream
+counts, and `ok|partial` status in `run/drained/<identity>`.
 
 ## Minds: who is here, and what they are doing
 
@@ -205,6 +207,36 @@ khala sync                                  # one exchange cycle (idempotent)
 khala inbox --drain                         # letters, notices, then streams
 khala presence                              # sessions, then machine watchers
 ```
+
+`WATCHING=yes` means either the session's direct `.watching` marker is fresh or
+the node's fresh `.ear` snapshot says its conduit currently has a verified
+socket/channel route for that identity. `-` means neither source establishes a
+listening route; it does not mean the session process is dead.
+
+## Dashboard
+
+```sh
+khala dashboard [--port N] [--no-text]
+```
+
+The dashboard is an on-demand, read-only fleet view served only on
+`127.0.0.1` by `khala-link` (port 47000 by default). Each run prints a URL whose
+fragment contains a new in-memory access token; the page removes that fragment
+immediately and does not store the token. Text is included by default;
+`--no-text` removes local letter subjects/bodies, focus/stance, and stream text
+from the API. To view another machine, forward the loopback port:
+
+```sh
+ssh -L 47000:127.0.0.1:47000 <node>
+```
+
+Remote nodes never show inbox subjects or bodies because inbox files are not
+replicated. Their cards contain only replicated presence, mind, stream, and
+`.ear` data.
+
+Roll the CLI and link binary in order. A 0.9.0 CLI paired with an older
+`khala-link`: the binary does not know `dashboard` yet. Install the 0.9.1 link
+release before expecting the server to start.
 
 ## The nerve cord and the conduit (`khala node ensure`)
 

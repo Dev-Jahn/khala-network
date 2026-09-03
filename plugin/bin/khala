@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.8.2
+KHALA_VERSION=0.9.0
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -58,7 +58,7 @@ usage() {
             return 0
             ;;
         say)
-            printf '%s\n' 'usage: khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]'
+            printf '%s\n' 'usage: khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message] [--as session]'
             return 0
             ;;
         join) printf '%s\n' 'usage: khala join <stream> [--from-start] [--quiet]'; return 0 ;;
@@ -86,6 +86,7 @@ usage() {
             printf '%s\n' '       khala link --serve [--max-object-bytes bytes]'
             return 0
             ;;
+        dashboard) printf '%s\n' 'usage: khala dashboard [--port N] [--no-text]'; return 0 ;;
         watch)
             printf '%s\n' 'usage: khala watch [--session session] [--interval seconds] [--max-wait seconds]'
             return 0
@@ -103,7 +104,7 @@ usage:
   khala invite <ssh-target> --name <alias> [--mailbox-coord <user@host>]
   khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]
   khala notify <session@node> --as <watcher> [-s|--subject subject] [--urgent] [-e seconds]
-  khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message]
+  khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message] [--as session]
   khala join <stream> [--from-start] [--quiet]
   khala leave <stream>
   khala streams
@@ -120,6 +121,7 @@ usage:
   khala sync
   khala link [restart] [--max-object-bytes bytes]
   khala link --serve [--max-object-bytes bytes]
+  khala dashboard [--port N] [--no-text]
   khala watch [--session session] [--interval seconds] [--max-wait seconds]
   khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
   khala presence [--watchers]
@@ -138,6 +140,35 @@ valid_name() {
     case "$1" in
         ''|-*|*[!a-z0-9-]*) return 1 ;;
     esac
+    return 0
+}
+
+reserved_name() {
+    case "$1" in
+        conduit|khala|khala-gateway|gateway|operator) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+hidden_reserved_name() {
+    case "$1" in
+        conduit|khala|gateway|operator) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+recipient_reserved_name() {
+    case "$1" in
+        conduit|khala|gateway|operator) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+reject_reserved_name() {
+    if reserved_name "$1"; then
+        error "예약된 이름입니다: $1"
+        return 1
+    fi
     return 0
 }
 
@@ -310,6 +341,7 @@ session_name() {
         error "잘못된 세션 이름: $session"
         return 1
     fi
+    reject_reserved_name "$session" || return 1
     printf '%s\n' "$session"
 }
 
@@ -742,26 +774,277 @@ watching_status() {
     watching_file=$1
     watching_now=$2
     watching_ttl=$3
-    if [ ! -f "$watching_file" ]; then
-        printf '%s\n' '-'
-        return 0
+    watching_address=${4-}
+    watching_value=-
+    if [ -f "$watching_file" ]; then
+        watching_marker_epoch=$(sed -n '1p' "$watching_file")
+        watching_marker_interval=$(sed -n '2p' "$watching_file")
+        if ! positive_or_zero_integer "$watching_marker_epoch" || \
+            ! positive_integer "$watching_marker_interval"; then
+            error "$watching_file: 잘못된 watching marker"
+        else
+            watching_marker_epoch=$(normalize_integer "$watching_marker_epoch")
+            watching_marker_interval=$(normalize_integer "$watching_marker_interval")
+            if [ "$((watching_now - watching_marker_epoch))" -le \
+                "$((watching_marker_interval + watching_ttl))" ]; then
+                watching_value=yes
+            fi
+        fi
     fi
-    watching_marker_epoch=$(sed -n '1p' "$watching_file")
-    watching_marker_interval=$(sed -n '2p' "$watching_file")
-    if ! positive_or_zero_integer "$watching_marker_epoch" || \
-        ! positive_integer "$watching_marker_interval"; then
-        error "$watching_file: 잘못된 watching marker"
-        printf '%s\n' '-'
-        return 0
+    if [ "$watching_value" != yes ] && [ -n "$watching_address" ]; then
+        case "$EAR_LISTENING" in
+            *"|$watching_address|"*) watching_value=yes ;;
+        esac
     fi
-    watching_marker_epoch=$(normalize_integer "$watching_marker_epoch")
-    watching_marker_interval=$(normalize_integer "$watching_marker_interval")
-    if [ "$((watching_now - watching_marker_epoch))" -le \
-        "$((watching_marker_interval + watching_ttl))" ]; then
-        printf '%s\n' yes
+    if [ "$watching_value" != yes ] && [ -n "$watching_address" ]; then
+        watching_node=${watching_address#*@}
+        case "$EAR_INCOMPLETE_NODES" in
+            *"|$watching_node|"*)
+                case "$EAR_IDENTITIES" in
+                    *"|$watching_address|"*) ;;
+                    *) watching_value=? ;;
+                esac
+                ;;
+        esac
+    fi
+    printf '%s\n' "$watching_value"
+    return 0
+}
+
+valid_ear_value() {
+    [ "${#1}" -ge 1 ] && [ "${#1}" -le 64 ] || return 1
+    case "$1" in *[!A-Za-z0-9._:+-]*) return 1 ;; esac
+    return 0
+}
+
+normalize_ear_integer() {
+    EAR_NORMALIZED_INTEGER=$1
+    while case "$EAR_NORMALIZED_INTEGER" in 0?*) true ;; *) false ;; esac; do
+        EAR_NORMALIZED_INTEGER=${EAR_NORMALIZED_INTEGER#0}
+    done
+    [ -n "$EAR_NORMALIZED_INTEGER" ] || EAR_NORMALIZED_INTEGER=0
+}
+
+bounded_ear_integer() {
+    positive_or_zero_integer "$1" || return 1
+    normalize_ear_integer "$1"
+    [ "${#EAR_NORMALIZED_INTEGER}" -le 18 ]
+}
+
+read_ear_snapshot() {
+    ear_read_file=$1
+    ear_read_now=$2
+    ear_read_basename=${ear_read_file##*/}
+    case "$ear_read_basename" in
+        conduit@*.ear) ;;
+        *) return 1 ;;
+    esac
+    ear_read_node=${ear_read_basename#conduit@}
+    ear_read_node=${ear_read_node%.ear}
+    valid_name "$ear_read_node" || return 1
+    ear_read_lines=0
+    ear_read_bytes=0
+    ear_read_node_seen=0
+    ear_read_generation_seen=0
+    ear_read_written_at_seen=0
+    ear_read_interval_seen=0
+    ear_read_state_seen=0
+    ear_read_complete_seen=0
+    ear_read_mailbox_seen=0
+    ear_read_link_seen=0
+    ear_read_truncated_seen=0
+    EAR_READ_GENERATION=
+    EAR_READ_WRITTEN_AT=
+    EAR_READ_INTERVAL=
+    EAR_READ_STATE=
+    EAR_READ_COMPLETE=
+    ear_read_identities=
+    ear_read_names=
+    ear_read_routes=
+    while IFS= read -r ear_read_line || [ -n "$ear_read_line" ]; do
+        ear_read_lines=$((ear_read_lines + 1))
+        ear_read_bytes=$((ear_read_bytes + ${#ear_read_line} + 1))
+        [ "$ear_read_lines" -le 320 ] || return 1
+        [ "$ear_read_bytes" -le 131072 ] || return 1
+        [ "${#ear_read_line}" -le 1024 ] || return 1
+        [ "$ear_read_truncated_seen" -eq 0 ] || return 1
+        if [ "$ear_read_lines" -eq 1 ]; then
+            [ "$ear_read_line" = 'ears 1' ] || return 1
+            continue
+        fi
+        ear_read_restore_glob=0
+        case "$-" in *f*) ;; *) set -f; ear_read_restore_glob=1 ;; esac
+        set -- $ear_read_line
+        [ "$ear_read_restore_glob" -eq 0 ] || set +f
+        [ "$#" -gt 0 ] || return 1
+        case "${1-}" in
+            ears) return 1 ;;
+            node)
+                [ "$#" -eq 2 ] && [ "$ear_read_node_seen" -eq 0 ] || return 1
+                valid_name "$2" && [ "$2" = "$ear_read_node" ] || return 1
+                ear_read_node_seen=1
+                ;;
+            generation)
+                [ "$#" -eq 2 ] && [ "$ear_read_generation_seen" -eq 0 ] || return 1
+                bounded_ear_integer "$2" || return 1
+                EAR_READ_GENERATION=$EAR_NORMALIZED_INTEGER
+                ear_read_generation_seen=1
+                ;;
+            written-at)
+                [ "$#" -eq 2 ] && [ "$ear_read_written_at_seen" -eq 0 ] || return 1
+                bounded_ear_integer "$2" || return 1
+                EAR_READ_WRITTEN_AT=$EAR_NORMALIZED_INTEGER
+                ear_read_written_at_seen=1
+                ;;
+            interval)
+                [ "$#" -eq 2 ] && [ "$ear_read_interval_seen" -eq 0 ] || return 1
+                positive_integer "$2" && bounded_ear_integer "$2" || return 1
+                EAR_READ_INTERVAL=$EAR_NORMALIZED_INTEGER
+                ear_read_interval_seen=1
+                ;;
+            state)
+                [ "$#" -eq 2 ] && [ "$ear_read_state_seen" -eq 0 ] || return 1
+                case "$2" in running|stopping) ;; *) return 1 ;; esac
+                EAR_READ_STATE=$2
+                ear_read_state_seen=1
+                ;;
+            complete)
+                [ "$#" -eq 2 ] && [ "$ear_read_complete_seen" -eq 0 ] || return 1
+                case "$2" in yes|no) ;; *) return 1 ;; esac
+                EAR_READ_COMPLETE=$2
+                ear_read_complete_seen=1
+                ;;
+            component)
+                [ "$#" -ge 3 ] && valid_ear_value "$2" || return 1
+                shift 2
+                for ear_read_token in "$@"; do
+                    case "$ear_read_token" in *=*) ;;
+                        *) return 1 ;;
+                    esac
+                    valid_ear_value "${ear_read_token%%=*}" && \
+                        valid_ear_value "${ear_read_token#*=}" || return 1
+                done
+                ;;
+            mailbox)
+                [ "$#" -ge 2 ] && [ "$ear_read_mailbox_seen" -eq 0 ] || return 1
+                shift
+                for ear_read_token in "$@"; do
+                    [ "$ear_read_token" = - ] || valid_name "$ear_read_token" || return 1
+                done
+                ear_read_mailbox_seen=1
+                ;;
+            link)
+                [ "$#" -eq 2 ] && [ "$ear_read_link_seen" -eq 0 ] || return 1
+                [ "$2" = - ] || bounded_ear_integer "$2" || return 1
+                ear_read_link_seen=1
+                ;;
+            identity)
+                shift
+                ear_identity_name= ear_identity_principal= ear_identity_listening=
+                ear_identity_route= ear_identity_reason=
+                ear_identity_keys=
+                for ear_read_token in "$@"; do
+                    case "$ear_read_token" in *=*) ;;
+                        *) return 1 ;;
+                    esac
+                    ear_read_key=${ear_read_token%%=*}
+                    ear_read_value=${ear_read_token#*=}
+                    valid_ear_value "$ear_read_key" || return 1
+                    valid_ear_value "$ear_read_value" || return 1
+                    case "$ear_identity_keys" in *"|$ear_read_key|"*) return 1 ;; esac
+                    ear_identity_keys=$ear_identity_keys"|$ear_read_key|"
+                    case "$ear_read_key" in
+                        name) ear_identity_name=$ear_read_value ;;
+                        principal) ear_identity_principal=$ear_read_value ;;
+                        listening) ear_identity_listening=$ear_read_value ;;
+                        route) ear_identity_route=$ear_read_value ;;
+                        reason) ear_identity_reason=$ear_read_value ;;
+                        generation)
+                            if [ "$ear_read_value" != - ]; then
+                                [ "${#ear_read_value}" -eq 64 ] || return 1
+                                case "$ear_read_value" in *[!0-9a-f]*) return 1 ;; esac
+                            fi
+                            ;;
+                        pending-ring|pending-info|pending-operator|first-seen|oldest-pending|written-rings|last-written|last-drain)
+                            bounded_ear_integer "$ear_read_value" || return 1
+                            ;;
+                        last-drain-before|last-drain-after)
+                            if [ "$ear_read_value" != - ]; then
+                                [ "${#ear_read_value}" -eq 64 ] || return 1
+                                case "$ear_read_value" in *[!0-9a-f]*) return 1 ;; esac
+                            fi
+                            ;;
+                        last-drain-status)
+                            case "$ear_read_value" in ok|partial|-) ;; *) return 1 ;; esac
+                            ;;
+                    esac
+                done
+                valid_name "$ear_identity_name" || return 1
+                case "$ear_identity_principal" in session|watcher|gateway) ;; *) return 1 ;; esac
+                case "$ear_identity_listening" in yes|no) ;; *) return 1 ;; esac
+                case "$ear_identity_route" in socket|channel|channel+socket|none) ;; *) return 1 ;; esac
+                case "$ear_identity_reason" in -|noreg|boot|phase|optin|pid|session|socket|registry|lease) ;; *) return 1 ;; esac
+                case "$ear_read_names" in
+                    *"|$ear_identity_name|"*) return 1 ;;
+                esac
+                ear_read_names=$ear_read_names"|$ear_identity_name|"
+                ear_read_identities=$ear_read_identities"|$ear_identity_name@$ear_read_node|"
+                if ! hidden_reserved_name "$ear_identity_name" && \
+                    [ "$ear_identity_listening" = yes ]; then
+                    ear_read_routes=$ear_read_routes"|$ear_identity_name@$ear_read_node|"
+                fi
+                ;;
+            truncated)
+                [ "$#" -eq 2 ] && [ "$ear_read_truncated_seen" -eq 0 ] && \
+                    bounded_ear_integer "$2" || return 1
+                ear_read_truncated_seen=1
+                ;;
+            *)
+                for ear_read_token in "$@"; do valid_ear_value "$ear_read_token" || return 1; done
+                ;;
+        esac
+    done < "$ear_read_file"
+    [ "$ear_read_lines" -gt 0 ] && [ "$ear_read_node_seen" -eq 1 ] && \
+        [ "$ear_read_generation_seen" -eq 1 ] && [ "$ear_read_written_at_seen" -eq 1 ] && \
+        [ "$ear_read_interval_seen" -eq 1 ] && [ "$ear_read_state_seen" -eq 1 ] && \
+        [ "$ear_read_complete_seen" -eq 1 ] && [ "$ear_read_mailbox_seen" -eq 1 ] && \
+        [ "$ear_read_link_seen" -eq 1 ] || return 1
+    if [ "$EAR_READ_COMPLETE" = no ]; then
+        [ "$ear_read_truncated_seen" -eq 1 ] || return 1
     else
-        printf '%s\n' '-'
+        [ "$ear_read_truncated_seen" -eq 0 ] || return 1
     fi
+    EAR_READ_IDENTITIES=$ear_read_identities
+    EAR_READ_LISTENING=$ear_read_routes
+    return 0
+}
+
+load_ear_snapshots() {
+    ear_load_now=$1
+    EAR_LISTENING=
+    EAR_IDENTITIES=
+    EAR_INCOMPLETE_NODES=
+    for ear_load_file in "$KHALA_ROOT"/presence/conduit@*.ear; do
+        [ -f "$ear_load_file" ] || continue
+        if ! read_ear_snapshot "$ear_load_file" "$ear_load_now"; then
+            error "$ear_load_file: 잘못된 ear snapshot"
+            continue
+        fi
+        ear_load_age=$((ear_load_now - EAR_READ_WRITTEN_AT))
+        # The interval is the writer's own claim: clamp it to [10, 600] so a
+        # snapshot declaring `interval 86400` cannot stay fresh for days.
+        ear_load_interval=$EAR_READ_INTERVAL
+        [ "$ear_load_interval" -ge 10 ] || ear_load_interval=10
+        [ "$ear_load_interval" -le 600 ] || ear_load_interval=600
+        if [ "$EAR_READ_STATE" = running ] && [ "$ear_load_age" -ge -60 ] && \
+            [ "$ear_load_age" -le "$((2 * ear_load_interval + 60))" ]; then
+            EAR_LISTENING=$EAR_LISTENING$EAR_READ_LISTENING
+            EAR_IDENTITIES=$EAR_IDENTITIES$EAR_READ_IDENTITIES
+            if [ "$EAR_READ_COMPLETE" = no ]; then
+                EAR_INCOMPLETE_NODES=$EAR_INCOMPLETE_NODES"|$ear_read_node|"
+            fi
+        fi
+    done
     return 0
 }
 
@@ -1829,6 +2112,8 @@ mailbox_rsync() {
     rsync_remove_source=$5
     rsync_ignore_existing=${6-0}
     rsync_ensure_destination=${7-0}
+    rsync_filter=${8-}
+    rsync_filter_self=${9-}
 
     case "$rsync_endpoint" in
         /*)
@@ -1882,10 +2167,131 @@ mailbox_rsync() {
     if [ "$rsync_ignore_existing" -eq 1 ]; then
         set -- "$@" --ignore-existing
     fi
+    case "$rsync_filter" in
+        exclude-ears) set -- "$@" '--exclude=*.ear' ;;
+        ears-only)
+            set -- "$@" --checksum "--exclude=conduit@$rsync_filter_self.ear" \
+                '--include=conduit@*.ear' '--exclude=*'
+            ;;
+    esac
     if [ "$rsync_remote" -eq 1 ]; then
         set -- "$@" -e "ssh -o ConnectTimeout=5 -o BatchMode=yes"
     fi
     rsync "$@" "$rsync_source" "$rsync_destination"
+}
+
+file_sha256() {
+    sha_file=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha_value=$(sha256sum "$sha_file") || return 1
+    else
+        sha_value=$(shasum -a 256 "$sha_file") || return 1
+    fi
+    sha_value=${sha_value%% *}
+    [ "${#sha_value}" -eq 64 ] || return 1
+    case "$sha_value" in *[!0-9a-f]*) return 1 ;; esac
+    printf '%s\n' "$sha_value"
+}
+
+prune_ear_quarantine() {
+    prune_ear_node=$1
+    while :; do
+        prune_ear_count=0
+        prune_ear_oldest=
+        prune_ear_oldest_mtime=
+        for prune_ear_file in "$KHALA_ROOT"/quarantine/ears/"$prune_ear_node".*; do
+            [ -f "$prune_ear_file" ] || continue
+            prune_ear_count=$((prune_ear_count + 1))
+            prune_ear_mtime=$(file_mtime "$prune_ear_file") || prune_ear_mtime=0
+            if [ -z "$prune_ear_oldest" ] || [ "$prune_ear_mtime" -lt "$prune_ear_oldest_mtime" ] || \
+                { [ "$prune_ear_mtime" -eq "$prune_ear_oldest_mtime" ] && \
+                    [ "$prune_ear_file" \< "$prune_ear_oldest" ]; }; then
+                prune_ear_oldest=$prune_ear_file
+                prune_ear_oldest_mtime=$prune_ear_mtime
+            fi
+        done
+        [ "$prune_ear_count" -le 8 ] && return 0
+        rm -f "$prune_ear_oldest" || return 1
+    done
+}
+
+quarantine_pulled_ear() {
+    quarantine_ear_file=$1
+    quarantine_ear_node=$2
+    quarantine_ear_generation=$3
+    quarantine_ear_digest=$(file_sha256 "$quarantine_ear_file") || return 1
+    quarantine_ear_digest=${quarantine_ear_digest%${quarantine_ear_digest#????????}}
+    quarantine_ear_dir=$KHALA_ROOT/quarantine/ears
+    mkdir -p "$quarantine_ear_dir" || return 1
+    quarantine_ear_destination=$quarantine_ear_dir/$quarantine_ear_node.$quarantine_ear_generation.$quarantine_ear_digest
+    if [ -e "$quarantine_ear_destination" ]; then
+        rm -f "$quarantine_ear_file" || return 1
+    else
+        mv "$quarantine_ear_file" "$quarantine_ear_destination" || return 1
+        touch "$quarantine_ear_destination" || return 1
+    fi
+    prune_ear_quarantine "$quarantine_ear_node"
+}
+
+install_pulled_ears() {
+    install_ear_root=$1
+    install_ear_now=$(date +%s) || return 1
+    for install_ear_file in "$install_ear_root"/conduit@*.ear; do
+        [ -f "$install_ear_file" ] || continue
+        install_ear_basename=${install_ear_file##*/}
+        install_ear_node=${install_ear_basename#conduit@}
+        install_ear_node=${install_ear_node%.ear}
+        if ! valid_name "$install_ear_node" || \
+            ! read_ear_snapshot "$install_ear_file" "$install_ear_now"; then
+            error "$install_ear_file: 잘못된 pull ear snapshot — 버립니다"
+            rm -f "$install_ear_file" || return 1
+            continue
+        fi
+        install_ear_incoming_generation=$EAR_READ_GENERATION
+        install_ear_destination=$KHALA_ROOT/presence/$install_ear_basename
+        if [ -f "$install_ear_destination" ] && \
+            read_ear_snapshot "$install_ear_destination" "$install_ear_now"; then
+            install_ear_existing_generation=$EAR_READ_GENERATION
+            if [ "$install_ear_incoming_generation" -lt "$install_ear_existing_generation" ]; then
+                rm -f "$install_ear_file" || return 1
+                continue
+            fi
+            if [ "$install_ear_incoming_generation" -eq "$install_ear_existing_generation" ]; then
+                if cmp -s "$install_ear_file" "$install_ear_destination"; then
+                    rm -f "$install_ear_file" || return 1
+                else
+                    quarantine_pulled_ear "$install_ear_file" "$install_ear_node" \
+                        "$install_ear_incoming_generation" || return 1
+                    error "$install_ear_destination: 같은 generation의 ear snapshot이 달라 격리했습니다"
+                fi
+                continue
+            fi
+        fi
+        install_ear_tmp=$(mktemp "$TMP_DIR/ear-install.XXXXXX") || return 1
+        if ! cp "$install_ear_file" "$install_ear_tmp" || ! touch "$install_ear_tmp" || \
+            ! mv "$install_ear_tmp" "$install_ear_destination"; then
+            rm -f "$install_ear_tmp"
+            return 1
+        fi
+    done
+    return 0
+}
+
+pull_ears_from_endpoint() {
+    ear_endpoint=$1
+    ear_self=$2
+    ear_stage=$(mktemp -d "$TMP_DIR/ears-pull.XXXXXX") || return 1
+    if ! mailbox_rsync "$ear_endpoint" pull "$ear_stage/" presence/ 0 0 0 \
+        ears-only "$ear_self"; then
+        rm -rf -- "$ear_stage"
+        return 1
+    fi
+    if ! install_pulled_ears "$ear_stage"; then
+        rm -rf -- "$ear_stage"
+        return 1
+    fi
+    rm -rf -- "$ear_stage"
+    return 0
 }
 
 install_pulled_streams() {
@@ -2038,7 +2444,8 @@ exchange_with_endpoint() {
     # become stale under the display-side freshness rule.
     for exchange_presence in "$KHALA_ROOT"/presence/*@"$exchange_self" \
         "$KHALA_ROOT"/presence/*@"$exchange_self".watching \
-        "$KHALA_ROOT"/presence/*@"$exchange_self".watcher; do
+        "$KHALA_ROOT"/presence/*@"$exchange_self".watcher \
+        "$KHALA_ROOT"/presence/conduit@"$exchange_self".ear; do
         [ -f "$exchange_presence" ] || continue
         if ! mailbox_rsync "$exchange_endpoint" push "$exchange_presence" \
             presence/ 0; then
@@ -2046,7 +2453,10 @@ exchange_with_endpoint() {
         fi
     done
     if ! mailbox_rsync "$exchange_endpoint" pull \
-        "$KHALA_ROOT/presence/" presence/ 0; then
+        "$KHALA_ROOT/presence/" presence/ 0 0 0 exclude-ears; then
+        return 1
+    fi
+    if ! pull_ears_from_endpoint "$exchange_endpoint" "$exchange_self"; then
         return 1
     fi
     for exchange_dir in "$KHALA_ROOT"/spool/for/*; do
@@ -2087,8 +2497,70 @@ exchange_with_mailbox() {
     fi
 }
 
+# print_letter_with_auth <file> <auth-value>: the letter with one drain-written
+# `Auth: <value>` line appended to its header block (r3b §3.5). Incoming Auth
+# headers never reach the inbox (validate_spool_file quarantines them).
+print_letter_with_auth() {
+    auth_file=$1
+    auth_value=$2
+    auth_in_headers=1
+    while IFS= read -r auth_line || [ -n "$auth_line" ]; do
+        if [ "$auth_in_headers" -eq 1 ] && [ -z "$auth_line" ]; then
+            printf 'Auth: %s\n' "$auth_value"
+            auth_in_headers=0
+        fi
+        printf '%s\n' "$auth_line"
+    done < "$auth_file"
+    if [ "$auth_in_headers" -eq 1 ]; then
+        printf 'Auth: %s\n' "$auth_value"
+    fi
+}
+
 validate_spool_file() {
     spool_file=$1
+    SPOOL_INVALID_IMMEDIATE=0
+    spool_control_seen=
+    while IFS= read -r spool_header_line || [ -n "$spool_header_line" ]; do
+        [ -n "$spool_header_line" ] || break
+        case "$spool_header_line" in
+            *:*) spool_header_key=${spool_header_line%%:*} ;;
+            *) continue ;;
+        esac
+        # Key = everything before the first ':' with trailing blanks removed,
+        # so `Auth:verified x` and `Auth : verified x` are the same header as
+        # `Auth: verified x` (eddy merge gate B3). Auth is matched case-insensitively.
+        while case "$spool_header_key" in *' '|*'	') true ;; *) false ;; esac; do
+            spool_header_key=${spool_header_key%?}
+        done
+        case "$spool_header_key" in
+            [Aa][Uu][Tt][Hh])
+                # Auth is written only by the drain (r3b): an incoming letter
+                # carrying one is quarantined like a duplicated control header,
+                # so the session ever sees exactly one Auth line.
+                sync_error "$spool_file: 수신 편지의 Auth 헤더: 격리"
+                spool_dead=$KHALA_ROOT/spool/dead
+                if mkdir -p "$spool_dead" && \
+                    mv "$spool_file" "$spool_dead/invalid.${spool_file##*/}"; then
+                    SPOOL_INVALID_IMMEDIATE=1
+                fi
+                return 1
+                ;;
+            Khala|Envelope-Version|Id|From|To|Date|Type|Refs|In-Reply-To|Priority|Urgency|Expires|Actor|Origin|Conversation|Origin-Ref|Key-Id|Signature)
+                case "$spool_control_seen" in
+                    *"|$spool_header_key|"*)
+                        sync_error "$spool_file: 중복 제어 헤더: $spool_header_key"
+                        spool_dead=$KHALA_ROOT/spool/dead
+                        if mkdir -p "$spool_dead" && \
+                            mv "$spool_file" "$spool_dead/invalid.${spool_file##*/}"; then
+                            SPOOL_INVALID_IMMEDIATE=1
+                        fi
+                        return 1
+                        ;;
+                esac
+                spool_control_seen=$spool_control_seen"|$spool_header_key|"
+                ;;
+        esac
+    done < "$spool_file"
     spool_id=$(header_value Id "$spool_file")
     if [ -z "$spool_id" ] || [ "$(basename "$spool_file")" != "$spool_id" ]; then
         sync_error "$spool_file: filename과 Id가 다릅니다"
@@ -2271,11 +2743,11 @@ deliver_messages() {
     for incoming_file in "$local_spool"/*; do
         [ -f "$incoming_file" ] || continue
         if ! validate_spool_file "$incoming_file"; then
-            move_old_invalid_spool_file "$incoming_file"
+            [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$incoming_file"
             continue
         fi
         incoming_type=$(header_value Type "$incoming_file")
-        if [ "$incoming_type" = message ]; then
+        if [ "$incoming_type" = message ] || [ "$incoming_type" = operator ]; then
             deliver_regular_message "$incoming_file"
         fi
     done
@@ -2330,7 +2802,7 @@ deliver_infrastructure() {
     for incoming_file in "$local_spool"/*; do
         [ -f "$incoming_file" ] || continue
         if ! validate_spool_file "$incoming_file"; then
-            move_old_invalid_spool_file "$incoming_file"
+            [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$incoming_file"
             continue
         fi
         incoming_type=$(header_value Type "$incoming_file")
@@ -2345,7 +2817,7 @@ settle_acks() {
     for ack_file in "$local_spool"/*; do
         [ -f "$ack_file" ] || continue
         if ! validate_spool_file "$ack_file"; then
-            move_old_invalid_spool_file "$ack_file"
+            [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$ack_file"
             continue
         fi
         ack_type=$(header_value Type "$ack_file")
@@ -2736,6 +3208,17 @@ prune_presence() {
         [ -f "$prune_presence_file" ] || continue
         case "$prune_presence_file" in
             *.watching) continue ;;
+            *.ear)
+                [ -L "$prune_presence_file" ] && continue
+                prune_presence_mtime=$(file_mtime "$prune_presence_file") || continue
+                if [ "$((prune_presence_mtime + prune_presence_seconds))" -lt \
+                    "$prune_presence_now" ]; then
+                    if ! rm -f "$prune_presence_file"; then
+                        sync_error "$prune_presence_file: retention 지난 ear snapshot을 지우지 못했습니다"
+                    fi
+                fi
+                continue
+                ;;
             *.watcher)
                 [ -L "$prune_presence_file" ] && continue
                 if ! read_watcher_marker "$prune_presence_file"; then
@@ -3131,6 +3614,10 @@ cmd_send() {
         error "잘못된 주소: $send_to"
         return 1
     fi
+    if recipient_reserved_name "${send_to%@*}"; then
+        error "예약된 이름입니다: ${send_to%@*}"
+        return 1
+    fi
     send_subject=
     send_ttl=2592000
     send_body=
@@ -3275,6 +3762,10 @@ cmd_notify() {
         error "잘못된 주소: $notify_to"
         return 1
     fi
+    if recipient_reserved_name "${notify_to%@*}"; then
+        error "예약된 이름입니다: ${notify_to%@*}"
+        return 1
+    fi
     notify_as=
     notify_as_set=0
     notify_subject=
@@ -3313,6 +3804,7 @@ cmd_notify() {
         error "잘못된 watcher 이름: $notify_as"
         return 1
     fi
+    reject_reserved_name "$notify_as" || return 1
     if ! bounded_integer "$notify_ttl"; then
         error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
         return 1
@@ -3408,6 +3900,8 @@ cmd_say() {
     say_ref=
     say_body=
     say_body_set=0
+    say_as=
+    say_as_set=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -s|--subject)
@@ -3426,8 +3920,14 @@ cmd_say() {
                 say_body_set=1
                 shift 2
                 ;;
+            --as)
+                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
+                say_as=$2
+                say_as_set=1
+                shift 2
+                ;;
             --*)
-                error "알 수 없는 say 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -r"
+                error "알 수 없는 say 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -r, --as"
                 return 1
                 ;;
             *) error "알 수 없는 say 옵션: $1"; return 1 ;;
@@ -3442,7 +3942,7 @@ cmd_say() {
         return 1
     fi
     say_node=$(self_node) || return 1
-    say_session=$(session_name "" 0) || return 1
+    say_session=$(session_name "$say_as" "$say_as_set") || return 1
     say_from=$say_session@$say_node
     say_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
     say_id=$(new_message_id "$say_from") || return 1
@@ -3780,6 +4280,8 @@ print_watcher_table() {
             error "$watcher_table_file: 잘못된 watcher marker 파일명"
             return 1
         fi
+        watcher_table_name=${watcher_table_address%@*}
+        hidden_reserved_name "$watcher_table_name" && continue
         if ! read_watcher_marker "$watcher_table_file"; then
             error "$watcher_table_file: 잘못된 watcher marker"
             return 1
@@ -3787,7 +4289,6 @@ print_watcher_table() {
         if [ "$watcher_table_mode" = active ] && [ "$WATCHER_RETIRED" -eq 1 ]; then
             continue
         fi
-        watcher_table_name=${watcher_table_address%@*}
         watcher_table_node=${watcher_table_address#*@}
         watcher_table_last=$(relative_age "$WATCHER_LAST_NOTIFY" "$watcher_table_now")
         if [ "$WATCHER_RETIRED" -eq 1 ]; then
@@ -3807,6 +4308,10 @@ print_watcher_table() {
 have_active_watchers() {
     for watcher_active_file in "$KHALA_ROOT"/presence/*.watcher; do
         [ -f "$watcher_active_file" ] || continue
+        watcher_active_address=${watcher_active_file##*/}
+        watcher_active_address=${watcher_active_address%.watcher}
+        valid_address "$watcher_active_address" || continue
+        hidden_reserved_name "${watcher_active_address%@*}" && continue
         if watcher_marker_non_retired "$watcher_active_file"; then
             return 0
         fi
@@ -3839,6 +4344,7 @@ cmd_watcher() {
                 error "잘못된 watcher 이름: $watcher_name"
                 return 1
             fi
+            reject_reserved_name "$watcher_name" || return 1
             watcher_cadence=
             watcher_owner=
             while [ "$#" -gt 0 ]; do
@@ -3867,6 +4373,12 @@ cmd_watcher() {
                     error "잘못된 watcher owner: $watcher_owner (session@node)"
                     return 1
                 fi
+            fi
+            watcher_owner_name=${watcher_owner%@*}
+            if reserved_name "$watcher_owner_name" && \
+                [ "$watcher_owner_name" != khala-gateway ]; then
+                error "예약된 이름입니다: $watcher_owner_name"
+                return 1
             fi
             watcher_cadence=$(normalize_integer "$watcher_cadence")
             watcher_node=$(self_node) || return 1
@@ -3909,6 +4421,7 @@ cmd_watcher() {
                 error "잘못된 watcher 이름: $watcher_name"
                 return 1
             fi
+            reject_reserved_name "$watcher_name" || return 1
             watcher_node=$(self_node) || return 1
             watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
             watcher_lock=$KHALA_ROOT/run/brain.lock.d
@@ -3992,6 +4505,7 @@ cmd_minds() {
     positive_integer "$minds_ttl" || { error "config의 ttl이 양의 정수가 아닙니다"; return 1; }
     minds_ttl=$(normalize_integer "$minds_ttl")
     minds_now=$(date +%s) || return 1
+    load_ear_snapshots "$minds_now"
     minds_addresses=$(mktemp "$TMP_DIR/minds-addresses.XXXXXX") || return 1
     minds_sorted=$(mktemp "$TMP_DIR/minds-sorted.XXXXXX") || {
         rm -f "$minds_addresses"
@@ -4000,17 +4514,21 @@ cmd_minds() {
     : > "$minds_addresses"
     for minds_presence in "$KHALA_ROOT"/presence/*; do
         [ -f "$minds_presence" ] || continue
-        minds_address=$(basename "$minds_presence")
+        minds_address=${minds_presence##*/}
         case "$minds_address" in
             *.watching) minds_address=${minds_address%.watching} ;;
+            *.watcher|*.ear) continue ;;
         esac
-        valid_address "$minds_address" && printf '%s\n' "$minds_address" >> "$minds_addresses"
+        if valid_address "$minds_address" && ! hidden_reserved_name "${minds_address%@*}"; then
+            printf '%s\n' "$minds_address" >> "$minds_addresses"
+        fi
     done
     for minds_session_dir in "$KHALA_ROOT"/minds/*/*; do
         [ -d "$minds_session_dir" ] || continue
         minds_node=$(basename "$(dirname "$minds_session_dir")")
         minds_session=$(basename "$minds_session_dir")
-        if valid_name "$minds_node" && valid_name "$minds_session"; then
+        if valid_name "$minds_node" && valid_name "$minds_session" && \
+            ! hidden_reserved_name "$minds_session"; then
             printf '%s@%s\n' "$minds_session" "$minds_node" >> "$minds_addresses"
         fi
     done
@@ -4018,6 +4536,7 @@ cmd_minds() {
     printf 'ADDRESS\tSTATE\tWATCHING\tMODEL\tMODEL_AGE\tEFFORT\tEFFORT_AGE\tROLE\tROLE_AGE\tCHARGE\tCHARGE_AGE\tFOCUS\tFOCUS_AGE\tSTANCE\tSTANCE_AGE\tFRESHNESS\n'
     while IFS= read -r minds_address; do
         [ -n "$minds_address" ] || continue
+        hidden_reserved_name "${minds_address%@*}" && continue
         if watcher_marker_non_retired "$KHALA_ROOT/presence/$minds_address.watcher"; then
             continue
         fi
@@ -4025,7 +4544,8 @@ cmd_minds() {
         minds_node=${minds_address#*@}
         minds_presence=$KHALA_ROOT/presence/$minds_address
         minds_presence_state=unknown
-        minds_watching=$(watching_status "$minds_presence.watching" "$minds_now" "$minds_ttl")
+        minds_watching=$(watching_status "$minds_presence.watching" "$minds_now" \
+            "$minds_ttl" "$minds_address")
         minds_retired=0
         if [ -f "$minds_presence" ]; then
             IFS=' ' read -r minds_first minds_second minds_extra < "$minds_presence"
@@ -4358,6 +4878,41 @@ cmd_status() {
         return 1
     }
     "$LINK_BINARY" runtime status
+}
+
+cmd_dashboard() {
+    require_config || return 1
+    find_link_binary || {
+        error "khala dashboard에는 khala-link 바이너리가 필요합니다"
+        return 1
+    }
+    exec "$LINK_BINARY" dashboard "$@"
+}
+
+pending_generation() {
+    pending_identity=$1
+    if ! find_link_binary; then
+        printf '%s\n' -
+        return 0
+    fi
+    pending_output=$("$LINK_BINARY" runtime pending-generation --identity \
+        "$pending_identity" 2>/dev/null) || {
+        printf '%s\n' -
+        return 0
+    }
+    pending_restore_glob=0
+    case "$-" in *f*) ;; *) set -f; pending_restore_glob=1 ;; esac
+    set -- $pending_output
+    [ "$pending_restore_glob" -eq 0 ] || set +f
+    if [ "$#" -ne 3 ] || ! bounded_integer "$2" || ! bounded_integer "$3"; then
+        printf '%s\n' -
+        return 0
+    fi
+    if [ "$1" != - ]; then
+        [ "${#1}" -eq 64 ] || { printf '%s\n' -; return 0; }
+        case "$1" in *[!0-9a-f]*) printf '%s\n' -; return 0 ;; esac
+    fi
+    printf '%s\n' "$1"
 }
 
 node_accept_configured() {
@@ -4881,7 +5436,11 @@ cmd_inbox() {
             error "$inbox_read_id: 편지를 찾지 못했습니다"
             return 1
         fi
-        cat "$inbox_read_file"
+        if [ "$(header_value Type "$inbox_read_file")" = operator ]; then
+            print_letter_with_auth "$inbox_read_file" unverified
+        else
+            cat "$inbox_read_file"
+        fi
         return $?
     fi
     inbox_lock=$KHALA_ROOT/run/brain.lock.d
@@ -4889,7 +5448,9 @@ cmd_inbox() {
         error "inbox drain용 brain lock을 얻지 못했습니다"
         return 1
     fi
+    inbox_before_generation=$(pending_generation "$inbox_session")
     inbox_drain_status=0
+    inbox_drain_changed=0
     trap '' PIPE
     if [ "$inbox_drain_selection" != notices ]; then
         # A drain prunes streams unconditionally so that it never prints or
@@ -4901,6 +5462,8 @@ cmd_inbox() {
     drained_bytes=0
     drained_letters=0
     drained_notices=0
+    drained_ring=0
+    drained_info=0
     drained_notice_bytes=0
     drained_streams=0
     remaining_n=0
@@ -4920,11 +5483,17 @@ cmd_inbox() {
                     break
                 fi
                 touch "$inbox_cur_file" 2>/dev/null || :
+                inbox_drain_changed=1
                 drained_n=$((drained_n + 1))
                 drained_letters=$((drained_letters + 1))
+                drained_ring=$((drained_ring + 1))
                 drained_bytes=$((drained_bytes + file_bytes))
                 printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
-                cat "$inbox_cur_file" 2>/dev/null || :
+                if [ "$(header_value Type "$inbox_cur_file")" = operator ]; then
+                    print_letter_with_auth "$inbox_cur_file" unverified 2>/dev/null || :
+                else
+                    cat "$inbox_cur_file" 2>/dev/null || :
+                fi
                 printf '\n' 2>/dev/null || :
             else
                 remaining_n=$((remaining_n + 1))
@@ -4969,10 +5538,17 @@ cmd_inbox() {
                     break
                 fi
                 touch "$inbox_cur_file" 2>/dev/null || :
+                inbox_drain_changed=1
                 notice_from=$(header_value From "$inbox_cur_file")
                 notice_subject=$(header_value Subject "$inbox_cur_file")
                 notice_urgency=$(header_value Urgency "$inbox_cur_file")
                 [ "$notice_urgency" = info ] || notice_urgency=urgent
+                drained_notices=$((drained_notices + 1))
+                if [ "$notice_urgency" = info ]; then
+                    drained_info=$((drained_info + 1))
+                else
+                    drained_ring=$((drained_ring + 1))
+                fi
                 if ! {
                     printf '%s\n' "--- notice $inbox_basename --- $notice_from · $notice_urgency · $notice_subject"
                     cat "$inbox_cur_file"
@@ -4982,7 +5558,6 @@ cmd_inbox() {
                     inbox_drain_status=1
                     break
                 fi
-                drained_notices=$((drained_notices + 1))
                 drained_notice_bytes=$((drained_notice_bytes + file_bytes))
             else
                 notice_remaining_n=$((notice_remaining_n + 1))
@@ -5062,6 +5637,7 @@ cmd_inbox() {
                         inbox_drain_status=1
                         break
                     fi
+                    inbox_drain_changed=1
                     drained_n=$((drained_n + 1))
                     drained_streams=$((drained_streams + 1))
                     drained_bytes=$((drained_bytes + file_bytes))
@@ -5075,6 +5651,21 @@ cmd_inbox() {
             fi
             [ "$inbox_drain_status" -eq 0 ] || break
         done
+    fi
+    if [ "$inbox_drain_status" -eq 0 ] || [ "$inbox_drain_changed" -eq 1 ]; then
+        inbox_after_generation=$(pending_generation "$inbox_session")
+        inbox_drain_epoch=$(date +%s) || inbox_drain_status=1
+        if [ "$inbox_drain_status" -eq 0 ]; then
+            inbox_stamp_status=ok
+        else
+            inbox_stamp_status=partial
+        fi
+        if [ -n "${inbox_drain_epoch-}" ] && ! atomic_line \
+            "$KHALA_ROOT/run/drained/$inbox_session" \
+            "drain 1 $inbox_drain_epoch $inbox_before_generation $inbox_after_generation $drained_ring $drained_info $drained_streams $inbox_stamp_status" drained; then
+            error "$KHALA_ROOT/run/drained/$inbox_session: drain stamp를 기록하지 못했습니다"
+            inbox_drain_status=1
+        fi
     fi
     if ! release_lock "$inbox_lock"; then
         trap - PIPE
@@ -5111,12 +5702,13 @@ cmd_presence() {
     fi
     presence_ttl=$(normalize_integer "$presence_ttl")
     presence_now=$(date +%s) || return 1
+    load_ear_snapshots "$presence_now"
     printf 'ADDRESS\tSTATE\tLAST_SEEN\tWATCHING\n'
     for presence_file in "$KHALA_ROOT"/presence/*; do
         [ -f "$presence_file" ] || continue
-        presence_address=$(basename "$presence_file")
+        presence_address=${presence_file##*/}
         case "$presence_address" in
-            *.watching|*.watcher) continue ;;
+            *.watching|*.watcher|*.ear) continue ;;
         esac
         if ! valid_address "$presence_address"; then
             error "$presence_file: 잘못된 heartbeat 파일명"
@@ -5127,6 +5719,7 @@ cmd_presence() {
         fi
         presence_session=${presence_address%@*}
         presence_node=${presence_address#*@}
+        hidden_reserved_name "$presence_session" && continue
         IFS=' ' read -r presence_first presence_second presence_extra < "$presence_file"
         if [ "$presence_first" = retired ]; then
             if ! positive_or_zero_integer "$presence_second" || [ -n "${presence_extra-}" ]; then
@@ -5152,27 +5745,29 @@ cmd_presence() {
             presence_state=asleep
         fi
         presence_watching=$(watching_status "$presence_file.watching" \
-            "$presence_now" "$presence_ttl")
+            "$presence_now" "$presence_ttl" "$presence_address")
         printf '%s@%s\t%s\t%s\t%s\n' "$presence_session" "$presence_node" \
             "$presence_state" "$presence_epoch" "$presence_watching"
     done
     for presence_marker in "$KHALA_ROOT"/presence/*.watching; do
         [ -f "$presence_marker" ] || continue
-        presence_address=$(basename "$presence_marker" .watching)
+        presence_address=${presence_marker##*/}
+        presence_address=${presence_address%.watching}
         if ! valid_address "$presence_address"; then
             error "$presence_marker: 잘못된 watching marker 파일명"
             continue
         fi
+        hidden_reserved_name "${presence_address%@*}" && continue
         if watcher_marker_non_retired \
             "$KHALA_ROOT/presence/$presence_address.watcher"; then
             continue
         fi
         [ ! -f "$KHALA_ROOT/presence/$presence_address" ] || continue
         presence_watching=$(watching_status "$presence_marker" \
-            "$presence_now" "$presence_ttl")
+            "$presence_now" "$presence_ttl" "$presence_address")
         printf '%s\tunknown\t-\t%s\n' "$presence_address" "$presence_watching"
     done
-    printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch)'
+    printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch); .ear = 노드 conduit이 듣는 중'
     print_watcher_section
     return 0
 }
@@ -5185,7 +5780,7 @@ fi
 command_name=$1
 shift
 case "$command_name" in
-    version|init|invite|send|notify|say|join|leave|streams|stream|mind|profile|minds|watcher|retire|reconcile|sync|link|watch|inbox|presence)
+    version|init|invite|send|notify|say|join|leave|streams|stream|mind|profile|minds|watcher|retire|reconcile|sync|link|dashboard|watch|inbox|presence)
         if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
             usage "$command_name"
             exit 0
@@ -5219,6 +5814,7 @@ case "$command_name" in
     reconcile) cmd_reconcile "$@" ;;
     sync) cmd_sync "$@" ;;
     link) cmd_link "$@" ;;
+    dashboard) cmd_dashboard "$@" ;;
     node) cmd_node "$@" ;;
     bind) cmd_bind "$@" ;;
     status) cmd_status "$@" ;;
