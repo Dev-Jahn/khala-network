@@ -157,5 +157,18 @@ grep -q '^RESULT: PASS$' "$TEST_DIR/exchange-roundtrip.out" || \
     fail 6 "exchange regression did not report PASS"
 pass 6 "local and exchange roundtrip regressions pass unchanged"
 
+. "$ROOT/plugin/hooks/lib.sh"
+KHALA_SESSION=khala-gateway
+if khala_resolve_session 0 1 >"$TEST_DIR/reserved-hook.out"; then
+    fail 7 "hook accepted a reserved session identity"
+fi
+grep -Fqx 'khala: 예약된 이름입니다: khala-gateway' "$TEST_DIR/reserved-hook.out" ||
+    fail 7 "hook reserved-name diagnostic differs"
+for reserved_identity in conduit khala khala-gateway gateway operator; do
+    grep -Fq "'$reserved_identity'" "$ROOT/plugin/channel/server.ts" ||
+        fail 7 "channel server reserved list omits $reserved_identity"
+done
+pass 7 "hook and channel server diagnose the complete reserved identity set early"
+
 printf 'RESULT: PASS\n'
 printf 'pruning, isolation, spool hygiene, and regressions passed\n'

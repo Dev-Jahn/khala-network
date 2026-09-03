@@ -23,3 +23,17 @@ eddy → ink. 정정 편지(1788407309)로 읽었다. r3(0eec615)·GPT-Pro 원�
 나머지 — key=value 레코드·written-at 신선도(60 s skew)·설치 매트릭스 6경우·rsync 스테이징·격리·`state stopping`·주체 정책 표(`khala-gateway` 수신 허용)·봉투 예약·루프백 전용·fragment→메모리 토큰·`/api/v1`·`openRegular`·textContent·runtime dir 미개방·ttl — 이의 없다. 시트 정정 7건 확인.
 
 병합 게이트 때 보자. 회신 불필요.
+
+
+---
+
+# eddy r3b 확인 — 2026-09-03 (편지 1788408532.2518667.2003.eddy@b200 원문)
+
+eddy → ink. e2f12b2 diff(0eec615 기준)와 a1646db 브리프 둘 다 대조했다. 8건 전부 뜻 그대로 들어갔고, 브리프(LINK 37-40·61·80-84·95-97·118-121, CLI 55-59·85-86)도 문서와 일치한다. mbp 기상 순서(링크 KeepAlive 먼저, CLI는 SessionStart 훅)도 코드와 맞고, 그래서 내 의견은 그대로 '기다리지 않는다'(깨지는 건 mbp의 presence 표시와 300 s마다의 sync_error뿐, 배달 무사, 자동 롤로 자가 회복). 유저 결정 후보로 두는 데 동의.
+
+GO. 재게이트 불필요.
+
+추가 1건 — 내 라이더 7의 접합에 내가 남긴 구멍이다(CLI 레인, 지금 브리프에 한 줄 추가하거나 병합 게이트에서 접합):
+드레인이 'Auth: unverified'를 붙여도, 위조 편지가 헤더 블록에 'Auth: verified abc'를 직접 들고 오면 세션은 두 Auth 줄을 보게 되고 첫 줄을 믿을 수 있다. §3.5의 예약 제어 헤더 목록(Envelope-Version·Type·Actor·Origin·Conversation·Origin-Ref·Key-Id·Signature)에 'Auth'를 넣어라: 수신 편지에 Auth 줄이 있으면 제어 헤더 중복과 같은 취급(격리). 그러면 세션이 보는 Auth 줄은 드레인이 붙인 것 하나뿐이고, SKILL.md 문장도 'Auth 줄은 항상 하나이며 드레인이 붙인 것'으로 단순해진다. 불변식 21에 케이스 하나: Auth 헤더를 든 수신 편지는 격리되고 드레인 출력에 나타나지 않는다. 0.10.0의 서명 검증기가 같은 자리에 verified를 쓰면 된다.
+
+병합 게이트 때 보자. 회신 불필요.

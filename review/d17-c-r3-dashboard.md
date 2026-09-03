@@ -110,7 +110,7 @@ identity name=ink principal=session listening=no route=none phase=ready cc=2.1.2
   `socket`); `listening=no`면 `none`.
 - `reason=-|noreg|boot|phase|optin|pid|session|socket|registry|lease` — `verifyRegistration`의 사유 순서
   (link/conduit.go:442-494) + `lease`(검증됐지만 lease 튜플 불일치) + `noreg`.
-- `phase=ready|starting|-`, `cc=<CC 버전|->` — 값 문법 `[A-Za-z0-9._:-]{1,64}`에 맞지 않으면 `-`.
+- `phase=ready|starting|-`, `cc=<CC 버전|->` — 값 문법 `[A-Za-z0-9._:+-]{1,64}`에 맞지 않으면 `-`.
 - `pending-ring`(message + urgent notice), `pending-info`, `pending-operator`(0.9.1은 항상 0; B가 채운다) —
   inbox/new 기준 정수.
 - `generation=<64 hex|->` — 대기 ring 집합의 **전체** SHA-256(link/conduit.go `letterGeneration`). **ring 집합이
@@ -126,7 +126,8 @@ identity name=ink principal=session listening=no route=none phase=ready cc=2.1.2
   `last-drain-status=ok|partial|-` — §3.3의 스탬프에서 그대로(이름이 모호한 `last-drained-generation`은 쓰지
   않는다).
 
-**값 문법**: 모든 값은 `[A-Za-z0-9._:-]{1,64}`(generation은 정확히 64 hex 또는 `-`). 작성자는 여기 맞지 않는
+**값 문법**: 모든 값은 `[A-Za-z0-9._:+-]{1,64}`(generation은 정확히 64 hex 또는 `-`; `+`는 `route=channel+socket`
+때문에 있다 — eddy 병합 게이트 B1: 독자 문법이 작성자의 enum 값을 거부하면 안 된다). 작성자는 여기 맞지 않는
 값을 `-`로 바꾼다(공백·`/`·개행 포함 문자열은 절대 그대로 싣지 않는다). 레코드 한 줄 ≤ 1024바이트.
 
 **작성자 상한**: identity 256개, 파일 96 KiB. 초과분은 싣지 않고 `complete no` + `truncated <n>`.
