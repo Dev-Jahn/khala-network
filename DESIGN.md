@@ -437,7 +437,7 @@ outbox/dead/              # dead-letter (§5.2 bounce 1회성의 종착지)
 spool/for/<node>/         # 라우팅 큐; 우체통 노드에선 교환 지점
 inbox/<session>/new|cur/  # 세션별 우편함 (드레인이 new→cur 이동)
 presence/<session>        # heartbeat 파일 (내용 = epoch 한 줄)
-presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (5행)
+presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (6행; legacy 5행 read)
 log/delivered             # dedup 로그: "<epoch> <msg_id>" 줄
 tmp/
 ```
@@ -491,7 +491,7 @@ notice의 제어 필드는 봉투에서만 읽는다. `Urgency: info`만 quiet�
 `urgent`이거나 없거나 다른 값이면 보수적으로 urgent로 분류한다. notice에는
 `Refs`, `In-Reply-To`, `Priority`가 없다.
 
-watcher marker `presence/<name>@<node>.watcher` (5행, 전체를 원자 교체):
+watcher marker `presence/<name>@<node>.watcher` (6행, 전체를 원자 교체):
 
 ```
 <declared-epoch> | retired <epoch>
@@ -499,11 +499,20 @@ watcher marker `presence/<name>@<node>.watcher` (5행, 전체를 원자 교체):
 <owner-session@node> | -              # 전체 주소; 원격 owner 허용
 <last-notify-epoch>               # 0 = never
 active | silent <since-epoch>
+<state-since-epoch>               # 현재 active/silent 상태에 들어간 시각
 ```
 
-`notify --as`는 plain heartbeat를 쓰지 않고 marker의 4행만 갱신한다. marker가
-없으면 cadence 0, owner `-`, active로 한 번 안내하고 자동 선언한다. 삭제는
-복제되지 않으므로 retire는 1행을 다시 쓴다.
+모든 writer는 6행을 쓴다. reader는 0.8.0/0.8.1의 5행 marker도 받으며, 이때 L6는
+active이면 선언 시각(L1), silent이면 L5의 `since-epoch`로 해석한다. 6행 marker를 먼저
+복제받은 0.8.1 노드는 CLI를 0.8.2로 올릴 때까지 reconcile마다 `잘못된 watcher marker`
+sync_error를 남기고 그 row를 숨긴다. 5행 fallback을 쓰지 않으므로 rollout은 CLI를
+순차 갱신해 이 짧은 mixed-fleet 구간을 끝낸다.
+
+`notify --as`와 `khala watcher beat <name>`은 plain heartbeat를 쓰지 않고 marker의
+4행만 갱신한다. `beat`는 notice/inbox/outbox/spool/reconcile trigger를 만들지 않으며,
+선언되지 않았거나 retired인 watcher를 거부한다. `notify`는 marker가 없으면 cadence 0,
+owner `-`, active로 한 번 안내하고 자동 선언한다. last-notify가 0이면 dead-man의 기준은
+선언 시각(L1)이다. 삭제는 복제되지 않으므로 retire는 1행을 다시 쓴다.
 
 타입별 취급:
 
@@ -593,8 +602,9 @@ CLI 인터페이스 (한 머신 마일스톤 범위):
   발신 세션명: `--as` > `$KHALA_SESSION` > `$PWD` basename (D5). 안착 = 성공(§5.2).
 - `khala notify <session@node> --as <watcher> [-s 제목] [--urgent] [-e 만료초]` —
   본문은 stdin, outbox/ack 없음. 기본 info/2일.
-- `khala watcher declare <name> --cadence <초> --owner <session@node> | list | retire <name>` —
-  machine identity와 dead-man 상태 관리.
+- `khala watcher declare <name> --cadence <초> --owner <session@node> | beat <name> | list |
+  retire <name>` — machine identity, event 없는 생존 신호, dead-man 상태 관리. list의
+  `SINCE`는 현재 active/silent 상태에 들어간 뒤 지난 시간을 `LAST`와 같은 형식으로 보인다.
 - `khala sync` — 위 한 사이클. 실패는 파일 단위로 소리 내고 계속(R10) — 전체 abort 금지.
 - `khala reconcile` — (a)+(c)만 한 패스 실행하며 네트워크 I/O는 하지 않는다.
 - `khala inbox [--drain [--max-n N] [--max-bytes B] [--max-notices N]
