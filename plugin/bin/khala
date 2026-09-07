@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.4
+KHALA_VERSION=0.9.5
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -43,6 +43,7 @@ error() {
 
 usage() {
     case "${1-}" in
+        capabilities) printf '%s\n' 'usage: khala capabilities'; return 0 ;;
         version) printf '%s\n' 'usage: khala version'; return 0 ;;
         init) printf '%s\n' 'usage: khala init <node>'; return 0 ;;
         invite)
@@ -50,7 +51,7 @@ usage() {
             return 0
             ;;
         send)
-            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]'
+            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--request-id key] [--as session]'
             return 0
             ;;
         notify)
@@ -92,17 +93,18 @@ usage() {
             return 0
             ;;
         inbox)
-            printf '%s\n' 'usage: khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]'
+            printf '%s\n' 'usage: khala inbox [list | read <Id> | ack-read <Id>... | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]'
             return 0
             ;;
         presence) printf '%s\n' 'usage: khala presence [--watchers]'; return 0 ;;
     esac
     cat >&2 <<'EOF'
 usage:
+  khala capabilities
   khala version
   khala init <node>
   khala invite <ssh-target> --name <alias> [--mailbox-coord <user@host>]
-  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--as session]
+  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--request-id key] [--as session]
   khala notify <session@node> --as <watcher> [-s|--subject subject] [--urgent] [-e seconds]
   khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message] [--as session]
   khala join <stream> [--from-start] [--quiet]
@@ -123,7 +125,7 @@ usage:
   khala link --serve [--max-object-bytes bytes]
   khala dashboard [--port N] [--no-text]
   khala watch [--session session] [--interval seconds] [--max-wait seconds]
-  khala inbox [list | read <Id> | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
+  khala inbox [list | read <Id> | ack-read <Id>... | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
   khala presence [--watchers]
 EOF
 }
@@ -3596,104 +3598,7 @@ cmd_invite() {
     return 0
 }
 
-cmd_send() {
-    require_config || return 1
-    if [ "$#" -lt 1 ]; then
-        usage
-        return 1
-    fi
-    send_to=$1
-    shift
-    case "$send_to" in
-        --*)
-            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --as"
-            return 1
-            ;;
-    esac
-    if ! valid_address "$send_to"; then
-        error "잘못된 주소: $send_to"
-        return 1
-    fi
-    if recipient_reserved_name "${send_to%@*}"; then
-        error "예약된 이름입니다: ${send_to%@*}"
-        return 1
-    fi
-    send_subject=
-    send_ttl=2592000
-    send_body=
-    send_body_set=0
-    send_as=
-    send_as_set=0
-    send_reply_to=
-    send_later=0
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            -s|--subject)
-                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
-                send_subject=$2
-                shift 2
-                ;;
-            -e)
-                [ "$#" -ge 2 ] || { error "-e 값이 없습니다"; return 1; }
-                send_ttl=$2
-                shift 2
-                ;;
-            -m|--message|--body)
-                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
-                send_body=$2
-                send_body_set=1
-                shift 2
-                ;;
-            --reply-to)
-                [ "$#" -ge 2 ] || { error "--reply-to 값이 없습니다"; return 1; }
-                send_reply_to=$2
-                shift 2
-                ;;
-            --later)
-                send_later=1
-                shift
-                ;;
-            --as)
-                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
-                send_as=$2
-                send_as_set=1
-                shift 2
-                ;;
-            --*)
-                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --as"
-                return 1
-                ;;
-            *)
-                error "알 수 없는 send 옵션: $1"
-                return 1
-                ;;
-        esac
-    done
-    if ! bounded_integer "$send_ttl"; then
-        error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
-        return 1
-    fi
-    send_ttl=$(normalize_integer "$send_ttl")
-    # The delivered-Id dedup log is kept 60 days; a letter that could still be
-    # retransmitted after its dedup entry expired would be installed twice.
-    if [ "$send_ttl" -gt 5097600 ]; then
-        error "만료 초는 5097600(59일) 이하여야 합니다 — dedup 기록 보존(60일) 안에 들어야 합니다"
-        return 1
-    fi
-    case "$send_subject" in
-        *'
-'*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
-    esac
-    if [ -n "$send_reply_to" ] && ! valid_message_id "$send_reply_to"; then
-        error "잘못된 reply Id: $send_reply_to"
-        return 1
-    fi
-    send_node=$(self_node) || return 1
-    send_session=$(session_name "$send_as" "$send_as_set") || return 1
-    if [ "$send_as_set" -eq 1 ]; then
-        printf '%s\n' 'khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요' >&2
-    fi
-    send_from=$send_session@$send_node
+prepare_send_message() {
     send_now=$(date +%s) || { error "현재 시각을 읽지 못했습니다"; return 1; }
     send_expires=$((send_now + send_ttl))
     send_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ') || return 1
@@ -3732,6 +3637,261 @@ cmd_send() {
         error "메시지를 쓰지 못했습니다"
         return 1
     fi
+}
+
+# Durable retry key for tool clients whose response may be lost. The immutable
+# intent is installed BEFORE the outbox entry; retries recover the same Id.
+# Records are deliberately not subject to outbox retention. Removing a record
+# permits that key to send again. Filesystem trust is identical to normal send.
+cmd_send_request() {
+    case "$send_request_id" in
+        ''|*[!a-zA-Z0-9_-]*) error "request-id must contain only ASCII letters, digits, _ or -"; return 1 ;;
+    esac
+    [ "${#send_request_id}" -le 128 ] || { error "request-id exceeds 128 characters"; return 1; }
+    request_parent=$KHALA_ROOT/requests/send/$send_session
+    request_dir=$request_parent/$send_request_id
+    request_work=$(mktemp -d "$TMP_DIR/send-request.XXXXXX") || return 1
+    if [ "$send_body_set" -eq 1 ]; then
+        printf '%s\n' "$send_body" > "$request_work/body" || { rm -rf -- "$request_work"; return 1; }
+    else
+        cat > "$request_work/body" || { rm -rf -- "$request_work"; return 1; }
+    fi
+    # Fixed-order text headers followed by exact body bytes. Header values
+    # cannot contain LF, so the complete input remains unambiguous and greppable.
+    if ! { printf 'Khala-Request: 1\nFrom: %s\nTo: %s\nSubject: %s\nTTL: %s\nIn-Reply-To: %s\nLater: %s\n\n' \
+        "$send_from" "$send_to" "$send_subject" "$send_ttl" "$send_reply_to" "$send_later"; \
+        cat "$request_work/body"; } \
+        > "$request_work/input"; then
+        rm -rf -- "$request_work"
+        return 1
+    fi
+    request_lock=$KHALA_ROOT/run/send-request.lock.d
+    if ! acquire_lock "$request_lock" 300 send-request; then
+        rm -rf -- "$request_work"
+        return 1
+    fi
+    request_status=0
+    cmd_send_request_locked || request_status=$?
+    rm -rf -- "$request_work"
+    release_lock "$request_lock" || return 1
+    return "$request_status"
+}
+
+cmd_send_request_locked() {
+    if [ -d "$request_dir" ]; then
+        if ! cmp -s "$request_work/input" "$request_dir/input"; then
+            # The first PR revision used NUL separators. Preserve its retry
+            # keys by checking exact legacy bytes before atomically migrating
+            # only the input representation; Id/envelope/publication stay fixed.
+            if ! { printf '%s\0' request-v1 "$send_from" "$send_to" "$send_subject" \
+                "$send_ttl" "$send_reply_to" "$send_later"; cat "$request_work/body"; } \
+                > "$request_work/input-legacy"; then
+                return 1
+            fi
+            if ! cmp -s "$request_work/input-legacy" "$request_dir/input"; then
+                error "request-id already used with different arguments or body"
+                return 1
+            fi
+            mv "$request_work/input" "$request_dir/input" || return 1
+        fi
+    else
+        # Freeze the exact envelope before any outbox/spool publication.
+        send_body_set=0
+        prepare_send_message < "$request_work/body" || return 1
+        mv "$send_tmp" "$request_work/message" || return 1
+        mkdir -p "$request_parent" || return 1
+        # body is redundant once both canonical input and envelope are written.
+        rm -f "$request_work/body"
+        mv "$request_work" "$request_dir" || return 1
+    fi
+    send_id=$(header_value Id "$request_dir/message")
+    valid_message_id "$send_id" || { error "invalid saved request Id"; return 1; }
+    if [ -f "$request_dir/published" ]; then
+        printf '%s\n' "$send_id"
+        return 0
+    fi
+    request_found=0
+    for request_state in new acked dead; do
+        if [ -f "$KHALA_ROOT/outbox/$request_state/$send_id" ]; then
+            request_found=1
+        fi
+    done
+    if [ "$request_found" -eq 0 ]; then
+        request_expires=$(header_value Expires "$request_dir/message")
+        if [ "$request_expires" -le "$(date +%s)" ]; then
+            error "saved request expired before publication; use a new request-id to send again"
+            return 1
+        fi
+        ln "$request_dir/message" "$KHALA_ROOT/outbox/new/$send_id" || return 1
+    fi
+    # Mark published before eager spool materialization; reconcile is the
+    # authoritative repair path if interrupted after this point.
+    atomic_line "$request_dir/published" "$send_id" send-request-published || return 1
+    if [ -f "$KHALA_ROOT/outbox/new/$send_id" ]; then
+        request_to=$(header_value To "$request_dir/message")
+        mkdir -p "$KHALA_ROOT/spool/for/${request_to#*@}" || return 1
+        atomic_copy "$request_dir/message" "$KHALA_ROOT/spool/for/${request_to#*@}/$send_id" || :
+    fi
+    printf '%s\n' "$send_id"
+}
+
+# Explicit read acknowledgement: selecting and fetching a message never drains
+# unrelated mail. Retry is safe when an earlier response was lost. Validation
+# of the complete batch precedes mutation, under the same lock as drain.
+cmd_inbox_ack_read() {
+    require_config || return 1
+    [ "$#" -ge 1 ] && [ "$#" -le 100 ] || { error "ack-read expects 1..100 Ids"; return 1; }
+    ack_session=$(session_name "" 0) || return 1
+    ack_dir=$KHALA_ROOT/inbox/$ack_session
+    for ack_id in "$@"; do
+        valid_message_id "$ack_id" || { error "invalid message Id: $ack_id"; return 1; }
+    done
+    ack_lock=$KHALA_ROOT/run/brain.lock.d
+    acquire_lock "$ack_lock" 300 inbox-ack-read || return 1
+    for ack_id in "$@"; do
+        if [ ! -f "$ack_dir/new/$ack_id" ] && [ ! -f "$ack_dir/cur/$ack_id" ]; then
+            error "$ack_id: message not found"
+            release_lock "$ack_lock"
+            return 1
+        fi
+        if [ -f "$ack_dir/new/$ack_id" ] && [ -f "$ack_dir/cur/$ack_id" ] && \
+            ! cmp -s "$ack_dir/new/$ack_id" "$ack_dir/cur/$ack_id"; then
+            error "$ack_id: conflicting new and cur copies"
+            release_lock "$ack_lock"
+            return 1
+        fi
+    done
+    mkdir -p "$ack_dir/cur" || { release_lock "$ack_lock"; return 1; }
+    for ack_id in "$@"; do
+        if [ -f "$ack_dir/new/$ack_id" ]; then
+            if [ -f "$ack_dir/cur/$ack_id" ]; then
+                rm -f "$ack_dir/new/$ack_id" || { release_lock "$ack_lock"; return 1; }
+            else
+                # Timestamp before rename: interruption must not leave an old
+                # unread file in cur with an already-expired retention mtime.
+                if ! touch "$ack_dir/new/$ack_id" || \
+                    ! mv "$ack_dir/new/$ack_id" "$ack_dir/cur/$ack_id"; then
+                    release_lock "$ack_lock"
+                    return 1
+                fi
+            fi
+        fi
+    done
+    # No whole-inbox drain stamp: unread letters/notices/streams may remain.
+    release_lock "$ack_lock" || return 1
+    printf '%s\n' "$@"
+}
+
+cmd_send() {
+    require_config || return 1
+    if [ "$#" -lt 1 ]; then
+        usage
+        return 1
+    fi
+    send_to=$1
+    shift
+    case "$send_to" in
+        --*)
+            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --request-id, --as"
+            return 1
+            ;;
+    esac
+    if ! valid_address "$send_to"; then
+        error "잘못된 주소: $send_to"
+        return 1
+    fi
+    if recipient_reserved_name "${send_to%@*}"; then
+        error "예약된 이름입니다: ${send_to%@*}"
+        return 1
+    fi
+    send_subject=
+    send_ttl=2592000
+    send_body=
+    send_body_set=0
+    send_as=
+    send_as_set=0
+    send_reply_to=
+    send_later=0
+    send_request_id=
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -s|--subject)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
+                send_subject=$2
+                shift 2
+                ;;
+            -e)
+                [ "$#" -ge 2 ] || { error "-e 값이 없습니다"; return 1; }
+                send_ttl=$2
+                shift 2
+                ;;
+            -m|--message|--body)
+                [ "$#" -ge 2 ] || { error "$1 값이 없습니다"; return 1; }
+                send_body=$2
+                send_body_set=1
+                shift 2
+                ;;
+            --reply-to)
+                [ "$#" -ge 2 ] || { error "--reply-to 값이 없습니다"; return 1; }
+                send_reply_to=$2
+                shift 2
+                ;;
+            --request-id)
+                [ "$#" -ge 2 ] || { error "--request-id requires a value"; return 1; }
+                [ -n "$2" ] || { error "request-id must not be empty"; return 1; }
+                send_request_id=$2
+                shift 2
+                ;;
+            --later)
+                send_later=1
+                shift
+                ;;
+            --as)
+                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
+                send_as=$2
+                send_as_set=1
+                shift 2
+                ;;
+            --*)
+                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --request-id, --as"
+                return 1
+                ;;
+            *)
+                error "알 수 없는 send 옵션: $1"
+                return 1
+                ;;
+        esac
+    done
+    if ! bounded_integer "$send_ttl"; then
+        error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
+        return 1
+    fi
+    send_ttl=$(normalize_integer "$send_ttl")
+    # The delivered-Id dedup log is kept 60 days; a letter that could still be
+    # retransmitted after its dedup entry expired would be installed twice.
+    if [ "$send_ttl" -gt 5097600 ]; then
+        error "만료 초는 5097600(59일) 이하여야 합니다 — dedup 기록 보존(60일) 안에 들어야 합니다"
+        return 1
+    fi
+    case "$send_subject" in
+        *'
+'*) error "제목에는 줄바꿈을 넣을 수 없습니다"; return 1 ;;
+    esac
+    if [ -n "$send_reply_to" ] && ! valid_message_id "$send_reply_to"; then
+        error "잘못된 reply Id: $send_reply_to"
+        return 1
+    fi
+    send_node=$(self_node) || return 1
+    send_session=$(session_name "$send_as" "$send_as_set") || return 1
+    if [ "$send_as_set" -eq 1 ]; then
+        printf '%s\n' 'khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요' >&2
+    fi
+    send_from=$send_session@$send_node
+    if [ -n "$send_request_id" ]; then
+        cmd_send_request
+        return $?
+    fi
+    prepare_send_message || return 1
     send_destination=$KHALA_ROOT/outbox/new/$send_id
     if ! ln "$send_tmp" "$send_destination" 2>/dev/null; then
         rm -f "$send_tmp"
@@ -5298,6 +5458,11 @@ cmd_watch() {
 }
 
 cmd_inbox() {
+    if [ "${1-}" = ack-read ]; then
+        shift
+        cmd_inbox_ack_read "$@"
+        return $?
+    fi
     require_config || return 1
     inbox_mode=summary
     # AMBIGUOUS: §9.6 requires drain bounds but does not specify their defaults.
@@ -5780,7 +5945,7 @@ fi
 command_name=$1
 shift
 case "$command_name" in
-    version|init|invite|send|notify|say|join|leave|streams|stream|mind|profile|minds|watcher|retire|reconcile|sync|link|dashboard|watch|inbox|presence)
+    capabilities|version|init|invite|send|notify|say|join|leave|streams|stream|mind|profile|minds|watcher|retire|reconcile|sync|link|dashboard|watch|inbox|presence)
         if [ "$#" -eq 1 ] && [ "$1" = --help ]; then
             usage "$command_name"
             exit 0
@@ -5793,6 +5958,10 @@ case "$command_name" in
         ;;
 esac
 case "$command_name" in
+    capabilities)
+        [ "$#" -eq 0 ] || { usage; exit 1; }
+        printf '%s\n' '{"send_request_id":1,"inbox_ack_read":1}'
+        ;;
     version)
         [ "$#" -eq 0 ] || { usage; exit 1; }
         printf 'khala %s\n' "$KHALA_VERSION"
@@ -5823,3 +5992,4 @@ case "$command_name" in
     presence) cmd_presence "$@" ;;
     *) usage; exit 1 ;;
 esac
+
