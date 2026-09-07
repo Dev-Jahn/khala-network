@@ -39,8 +39,8 @@ to make those slices converge.
   tool calls of a running turn, as Claude Code's own SendMessage does; a letter
   sent with `khala send --later` waits for idle instead), and the session
   reads it as a `<cross-session-message>` and runs `khala inbox --drain`. The
-  doorbell is lossy by design; the letter in `new/` is the truth and only the
-  drain moves it. With a live nerve,
+  doorbell is lossy by design; the letter in `new/` is the truth and only an
+  explicit read acknowledgement (`--drain` or `ack-read`) moves it. With a live nerve,
   send-to-doorbell is second-scale end to end.
 
 Severing the nerve cord does not cast a node out of the communion — it
@@ -154,8 +154,9 @@ replication path, so the fleet's live window stays identical everywhere
 while this one node remembers. `stream cat` there merges live and archive;
 grep works across years of plain text. Archiving is fail-closed: if the
 archive cannot be written, expired entries are kept and the preserver
-complains loudly rather than forgetting silently. Mail is never archived —
-letters belong to their recipients.
+complains loudly rather than forgetting silently. Mail is never archived by
+preservers — letters belong to their recipients. The optional sender-owned
+retry ledger described below is separate from this stream archive.
 
 Reconcile silently removes notices after their envelope `Expires` time,
 whether they are waiting in a spool or are already in inbox `new/` or `cur/`.
@@ -320,11 +321,43 @@ inherits its mail.
 Without Claude Code, the CLI works standalone: copy `bin/khala` to
 `~/.local/bin/khala` yourself and use send/sync/inbox directly.
 
+## Pull-only mailbox clients
+
+Clients such as a ChatGPT MCP bridge can send mail and explicitly check a
+mailbox without a wake or Claude registration. Use `khala capabilities` to check
+for `{"send_request_id":1,"inbox_ack_read":1}` before enabling these options:
+
+```sh
+KHALA_SESSION=web-client khala send worker@hub --request-id action-123 -m "Please review this change"
+KHALA_SESSION=web-client khala inbox read "$message_id"
+KHALA_SESSION=web-client khala inbox ack-read "$message_id"
+```
+
+Choose a fresh request key for each intended send. After a lost response, retry
+the same key and exact arguments/body: the original Id is returned, and changed
+content is rejected. `ack-read` accepts 1..100 selected Ids and is safe to retry;
+listing/reading does not consume mail, and other pending messages and stream
+cursors remain untouched. These options keep the existing envelope and carrier
+protocol, so only the client node needs the updated CLI. A bridge must enforce
+user/mailbox ownership and verify that messages were fetched before marking them
+read; the CLI still trusts its local caller. Delivery ACK is not proof of reading
+or task completion.
+
+**Retention exception:** `requests/send/<session>/<key>/` retains the original
+input, envelope and publication marker independently of `retain` (default 30
+days). These records contain message bodies and grow with each distinct key.
+Deleting them on a timer could turn a late retry into a new send. Back them up
+with the node, monitor their size, and remove them only after the owning client
+has been retired or can no longer retry or reuse those keys. The complete format,
+recovery rules and retention decision are specified in
+[DESIGN §9.6](DESIGN.md#pull-only-mailbox-clients).
+
 ## Development
 
-Test suites (`test/` shell properties and Go unit tests) live on the `dev`
-branch; `main` carries only what a node runs. To try the plugin from a
-checkout without installing it:
+The existing test suites (`test/` shell properties and Go unit tests) live on the
+`dev` branch. The pull-only mailbox extension also includes its focused
+regression suite: run `python3 test/mailbox-compat.py` from a checkout on an
+executable filesystem. To try the plugin from a checkout without installing it:
 
 ```sh
 claude --plugin-dir /absolute/path/to/khala-network/plugin

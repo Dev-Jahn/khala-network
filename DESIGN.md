@@ -434,15 +434,129 @@ config                    # 함대 설정 (줄 단위)
 outbox/new/               # 발신 큐 — end-to-end ack까지 보관 (§5.2)
 outbox/acked/             # ack 수신 완료
 outbox/dead/              # dead-letter (§5.2 bounce 1회성의 종착지)
+requests/send/<session>/<key>/input # canonical text input; local retry ledger
+requests/send/<session>/<key>/message # immutable, frozen outgoing envelope
+requests/send/<session>/<key>/published # original Id + LF; queue publication receipt
 spool/for/<node>/         # 라우팅 큐; 우체통 노드에선 교환 지점
 inbox/<session>/new|cur/  # 세션별 우편함 (드레인이 new→cur 이동)
 presence/<session>        # heartbeat 파일 (내용 = epoch 한 줄)
 presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (6행; legacy 5행 read)
 presence/conduit@<node>.ear # 노드 conduit의 귀 스냅샷
 run/drained/<identity>     # drain 1: epoch, 전후 generation, ring/info/streams, ok|partial
+run/brain.lock.d/          # shared reconcile/drain/ack-read lock
+run/send-request.lock.d/   # serializes retry ledger writes and keyed sends
 log/delivered             # dedup 로그: "<epoch> <msg_id>" 줄
 tmp/
 ```
+
+#### Pull-only mailbox clients
+
+This optional extension keeps the Khala 0.1 envelope and carrier protocol.
+`khala capabilities` returns `{"send_request_id":1,"inbox_ack_read":1}`.
+Only a node serving such a client needs these CLI capabilities; its peers do not.
+The CLI continues to trust the local OS user. OAuth, mailbox ownership and proof
+that a remote client fetched a message belong in the bridge, not in the carrier.
+
+**Request identity and input.** `send --request-id <key>` scopes the key to the
+resolved sender session in this node's `KHALA_HOME`. Keys contain 1..128 ASCII
+letters, digits, underscores or hyphens. Callers must persist the key and exact
+request before sending, reuse both after an ambiguous result, and use a new key
+for a new intended send. Reusing a key with different input fails. An ordinary
+send without this option keeps its existing behavior.
+
+Each record is created lazily at `requests/send/<session>/<key>/`, with the
+normal node umask 077 (directories 0700, files 0600). It contains:
+
+| File | Exact contents |
+|---|---|
+| `input` | The fixed-order text header block below, followed by the exact body bytes |
+| `message` | The complete immutable outgoing Khala envelope, including the original Id, Date and Expires |
+| `published` | The original message Id followed by one LF; absent until queue publication is recorded |
+
+The canonical `input` header block is:
+
+```text
+Khala-Request: 1
+From: <resolved-session@node>
+To: <recipient-session@node>
+Subject: <subject or empty>
+TTL: <normalized base-10 seconds>
+In-Reply-To: <Id or empty>
+Later: <0 or 1>
+
+<exact body bytes>
+```
+
+All seven header lines, including empty optional values, are always present.
+Headers cannot contain LF, and the first empty line starts the body, so bytewise
+comparison is unambiguous and the durable format remains greppable. `-m` adds its
+normal trailing LF; stdin preserves its exact bytes. Generated Id, Date and
+absolute Expires are stored in `message`, not regenerated during a retry.
+
+The first public PR revision wrote a NUL-delimited `request-v1` input. A retry
+may read that legacy format only by comparing its exact canonical bytes. On a
+match, it atomically replaces `input` with the text format under the request
+lock, without changing the Id, envelope or publication marker. A mismatched
+retry cannot migrate or overwrite the record. New records always use text.
+
+**Publication and recovery.** Input/body preparation happens before locking, in
+a private `tmp/send-request.*/` directory. The sender then takes
+`run/send-request.lock.d` using the existing lock-owner format and 300-second
+stale-lock threshold. The lock covers record lookup/comparison, first record
+installation, queue publication and the `published` marker. The implementation
+does not nest this lock with the brain lock; `ack-read` uses only the brain lock.
+
+For a new key, prepare the canonical input and frozen envelope completely, then
+rename the temporary directory into `requests/send/<session>/<key>/` before
+installing any outbox entry. Publish the immutable `message` with a no-clobber
+hard link into `outbox/new/<Id>`, then atomically install `published` via `tmp/`
+and rename. Eager spool materialization follows the marker. All paths are on the
+same filesystem. Never modify the shared message inode in place.
+
+An interruption before record installation leaves no published send. A record
+without `published` is resumed with its saved Id: an existing `outbox/new`,
+`outbox/acked` or `outbox/dead` copy is recognized, otherwise the frozen envelope
+is enqueued if it has not expired. An expired, unpublished intent fails; it must
+not silently become a fresh message. With `published` present, a retry returns
+the saved Id without re-enqueueing, even after normal outbox retention. Reconcile
+repairs a missing spool copy after queue publication. This is enqueue
+idempotency, not exactly-once execution by a recipient. It uses the existing
+local-filesystem/process-interruption assumptions and adds no power-loss/fsync
+guarantee.
+
+**Retention decision for this extension (2026-09-07).** The request ledger is an
+explicit exception to `retain` and `retention-interval`: no automatic sweep removes
+prepared or published request records, including their bodies. A response may be
+lost after publication, and request keys carry no expiration or bounded retry
+window. Removing a published record after 30 days would let the same key create
+a fresh Id. The recipient's 60-day Id dedup log cannot prevent that new-Id send.
+Likewise, removing an expired unpublished intent would turn its required failure
+into a fresh send. Outbox/inbox retention and idempotency record lifetime therefore
+cannot be treated as the same clock.
+
+This choice has a real storage cost: each distinct key retains an input copy of
+the body and a frozen envelope, and record count can grow without bound. Operators
+must protect and consistently back up this ledger with the node, monitor its
+size, and remove records only after the owning client has been retired or can no
+longer retry or reuse those keys. Maintenance must run with keyed-send writers
+stopped or under their request lock. Deletion explicitly ends the retry guarantee
+for those keys. If bounded automatic retention is required, a future change must
+first define a retry horizon that rejects expired keys or retained tombstones
+that still prevent duplicate sends; adding an unconditional 30-day prune is not
+compatible with this contract. No such GC or body compaction is implemented here.
+
+**Selective read acknowledgement.** `inbox ack-read <Id>...` accepts 1..100 Ids
+from the caller's resolved session mailbox. It validates all Ids and all selected
+files before mutation under `run/brain.lock.d`, shared with drain/reconcile. A
+missing Id or conflicting `new`/`cur` copies fails before any move. Identical
+duplicate copies are coalesced into `cur`. Selected `new` files have their mtime
+updated before the atomic move to `cur`, so an interruption cannot leave an old
+unread timestamp subject to immediate archive retention. Already-read files
+succeed without refreshing mtime. An I/O failure can leave a partly moved batch;
+retry completes it. Only selected files change: other mail/notices, stream
+cursors and the full-drain stamp remain untouched. The command does not claim to
+have drained the whole inbox or prove that a remote caller read the contents.
+Carrier ACK still means recipient disk delivery, not reading or task completion.
 
 #### D17-C 관찰 온디스크 계약 (0.9.0/0.9.1)
 
@@ -787,12 +901,19 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   pass 비용은 fork 수가 지배한다(트리 사본 실측, 0.7.3 → 0.8.1 게이트 pass: b200 3.3 s → 0.2-0.3 s, mini 허브 3.0 s → 0.6-0.8 s; 5분마다의 정리 pass는 2.2 s / 5.1 s).
   `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
   last-notify가 모두 오래됐을 때만 삭제한다.
+  The local `requests/send/` ledger is excluded from these age-out sweeps;
+  its explicit retention decision is specified in **Pull-only mailbox clients** above.
 
 **한 머신 마일스톤 = (a)+(c) 경로의 실증** (self=우체통이라 (b)=no-op). cross-machine은
 (b)의 rsync만 추가 — 코드 경로가 같아서 에뮬레이션이 아니라 부분집합이다.
 
 CLI 인터페이스 (한 머신 마일스톤 범위):
 
+- `khala capabilities` — report optional CLI capabilities without joining a session.
+- `khala send <session@node> --request-id <key> ...` — retry-safe enqueue using
+  the local request ledger specified above; other send arguments are unchanged.
+- `khala inbox ack-read <Id>...` — selectively acknowledge 1..100 fetched messages;
+  list/read remain non-consuming, and the bridge must enforce its own read receipts.
 - `khala init <자기별칭>` — 디렉터리 생성(0700), config 골격, identity 기록.
 - `khala send <session@node> [-s 제목] [-e 만료초]` — 본문은 stdin 또는 `-m`.
   발신 세션명: `--as` > `$KHALA_SESSION` > `$PWD` basename (D5). 안착 = 성공(§5.2).
