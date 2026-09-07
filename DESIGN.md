@@ -588,6 +588,15 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
   `before == 대기 generation`이면 "드레인이 이 집합을 보고도 남겼다"(`--notices-only`, 실패한 이동 —
   **가장 강한 경보**), `after == 대기`면 "드레인 뒤 새로 온 것 없음"(부분 드레인의 잔여), 그 외는 "드레인 뒤
   도착한 새 대기". `last-drain` 시각만으로는 아무것도 판정하지 않는다.
+- **conduit 초인종 정책**: 신원별 첫 초인종은 즉시 쓰고, 성공적으로 쓴 프레임은 그 뒤의 드레인 스탬프가 소비를
+  증명할 때까지 하나의 outstanding wake로 남는다. 소비 증거는 스탬프의 `at`이 마지막 성공 쓰기의 초 단위 시각보다
+  이르지 않은 것(같아도 소비)이다. outstanding count는 프레임을 쓴 등록 프로세스(`InstanceID`·`PID`·`PIDStart`)에
+  귀속되어 ring 대상이 다른 프로세스로 바뀌면 기존 전송 `backoff[0]` 간격만 두고 0에서 즉시 시작하되, conduit 재시작
+  때 journal에는 `PID`·`PIDStart`가 남지 않으므로 같은 `InstanceID`를 재사용한 새 프로세스는 기존 count를 물려받을 수
+  있고 hook 기반 등록은 SessionStart drain stamp로 이를 해소한다. 그 전의 새 편지는 generation과 다음 프레임의 요약만
+  갱신하며 즉시 프레임을 더 만들지 않는다. 미소비 재호출 간격은 10→20→40→80→160→320분이고 이후 320분(5시간
+  20분)에 머문다. 소비되면 다음 대기 generation은 즉시 울리고 사다리는 10분부터 다시 시작한다. 0.9.1보다 오래되어
+  스탬프를 쓰지 않는 CLI는 소비 증거가 없으므로 이 bounded 사다리만 계속 따른다.
 
 #### 3.4 예약 이름과 주체 정책
 

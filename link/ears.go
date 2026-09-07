@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -90,6 +91,7 @@ type earDrainStamp struct {
 	LastDrainBefore string
 	LastDrainAfter  string
 	LastDrainStatus string
+	Token           string
 }
 
 func parseEars(path string) (earsSnapshot, error) {
@@ -883,11 +885,20 @@ func (c *conduit) writeEarSidecar(identity string, state conduitState) error {
 
 func (c *conduit) readDrainStamp(identity string) earDrainStamp {
 	result := earDrainStamp{LastDrainBefore: "-", LastDrainAfter: "-", LastDrainStatus: "-"}
-	data, err := readRegularBytes(filepath.Join(c.home, "run", "drained", identity), 4097)
+	f, err := openRegular(filepath.Join(c.home, "run", "drained", identity))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return result
 		}
+		return c.malformedDrain(identity, result)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return c.malformedDrain(identity, result)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
 		return c.malformedDrain(identity, result)
 	}
 	fields := strings.Fields(string(data))
@@ -904,6 +915,7 @@ func (c *conduit) readDrainStamp(identity string) earDrainStamp {
 		return c.malformedDrain(identity, result)
 	}
 	result.LastDrain, result.LastDrainBefore, result.LastDrainAfter, result.LastDrainStatus = at, fields[3], fields[4], fields[8]
+	result.Token = fmt.Sprintf("%d:%x", info.ModTime().UnixNano(), sha256.Sum256(data))
 	return result
 }
 
