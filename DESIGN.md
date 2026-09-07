@@ -620,7 +620,13 @@ identity name=ink principal=session listening=no route=none phase=ready cc=2.1.2
   `socket`); `listening=no`면 `none`.
 - `reason=-|noreg|boot|phase|optin|pid|session|socket|registry|lease` — `verifyRegistration`의 사유 순서
   (link/conduit.go:442-494) + `lease`(검증됐지만 lease 튜플 불일치) + `noreg`.
-- `phase=ready|starting|-`, `cc=<CC 버전|->` — 값 문법 `[A-Za-z0-9._:+-]{1,64}`에 맞지 않으면 `-`.
+- `phase=ready|starting|-`, `cc=<CC 버전|codex:<Codex 버전>|->` — 값 문법 `[A-Za-z0-9._:+-]{1,64}`에 맞지 않으면 `-`.
+  0.9.7부터 `harness=codex` 등록은 `codex:` 접두사로 표시한다(문법 불변; 0.9.x 독자는 문자열 그대로 읽는다).
+- **harness**(0.9.7) — 등록 JSON의 `harness` 필드(`claude`|`codex`, 없으면 `claude`). `codex` 등록은 CC 소켓과 Claude
+  registry 없이 **검증된 채널 소켓만으로** ring 게이트를 통과한다(`verifyRegistration`: `channelVerified ∧ 채널 pid/start·
+  소켓 경로 검사`; 실패 사유는 `socket`으로 매핑). 채널 실패 시 소켓 후퇴·에코 없이 backoff 재시도만 하며 journal은
+  `via=channel`이다. `route`는 항상 `channel`, `cc=codex:<버전>`. `runtime register --harness codex`는 `--socket`
+  (환경 상속 포함)을 거부하고 기존 인스턴스의 harness 변경도 거부한다. `.ear` 문법·프레임·CLI 와이어는 불변.
 - `pending-ring`(message + urgent notice), `pending-info`, `pending-operator`(0.9.1은 항상 0; B가 채운다) —
   inbox/new 기준 정수.
 - `generation=<64 hex|->` — 대기 ring 집합의 **전체** SHA-256(link/conduit.go `letterGeneration`). **ring 집합이
@@ -738,6 +744,11 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
 - Go `runtime register|bind`의 `--kind` 허용 집합 = `auto`(훅의 기본값, plugin/hooks/session-start.sh:102;
   `detectSessionKind`가 조상에서 `interactive|worker|unknown`으로 해석, link/runtime.go:800-801, 861-890) +
   `interactive|worker|unknown`(명시). 그 외(`gateway` 포함)는 거부(오늘은 빈 값만 거부, runtime.go:721).
+- Go `runtime register|bind`의 `--harness` 허용 집합 = `claude`(기본; 필드 없음과 동치) + `codex`(0.9.7). `codex`는
+  채널 전용 등록(§3.1 harness 항목); `--kind`는 그대로 적용되므로 수신하려면 `interactive`를 명시하거나
+  `--receive-opt-in`이 필요하다(`auto`는 조상에서 `claude`를 찾으므로 Codex 아래에서는 `unknown`). `runtime
+  watch-ready`도 `codex` 등록은 채널 소켓으로 판정한다. `--session-id`의 환경 기본값 순서는 `KHALA_HARNESS_SESSION_ID`
+  → `KHALA_CLAUDE_SESSION_ID` → `CLAUDE_CODE_SESSION_ID`(CLI `watch`와 Go `register|release|watch-ready` 공통; 0.9.7).
   불변식: 훅과 같은 `--kind auto` 등록이 여전히 성공하고 `--kind gateway`는 거부된다. gateway 주체는 0.10.0에
   별도 등록 경로를 갖는다(Claude 레지스트리·소켓 검증을 흉내 내지 않는다).
 - 기존 함대 presence에 충돌 신원 없음(09-03 실측).

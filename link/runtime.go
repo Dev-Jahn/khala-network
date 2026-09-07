@@ -24,6 +24,7 @@ type sessionRegistration struct {
 	BootID             string `json:"bootId"`
 	InstanceID         string `json:"instanceId"`
 	Identity           string `json:"identity"`
+	Harness            string `json:"harness,omitempty"`
 	PID                int    `json:"pid"`
 	PIDStart           string `json:"pidStart"`
 	ClaudeSessionID    string `json:"claudeSessionId"`
@@ -471,6 +472,9 @@ func flagPassed(fs *flag.FlagSet, name string) bool {
 }
 
 func matchingRegistry(reg sessionRegistration, registries []claudeRegistry) (claudeRegistry, bool) {
+	if reg.Harness == "codex" {
+		return claudeRegistry{}, false
+	}
 	for _, candidate := range registries {
 		if reg.SocketPath != "" && candidate.Socket != reg.SocketPath {
 			continue
@@ -707,9 +711,10 @@ func runtimeRegister(args []string, publicBind bool) error {
 	fs.SetOutput(io.Discard)
 	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
 	instance := fs.String("instance", os.Getenv("KHALA_SESSION_INSTANCE"), "")
-	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
+	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_HARNESS_SESSION_ID"), os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
 	socketPath := fs.String("socket", os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET"), "")
 	kind := fs.String("kind", firstNonempty(os.Getenv("KHALA_SESSION_KIND"), "auto"), "")
+	harness := fs.String("harness", "", "")
 	phase := fs.String("phase", "ready", "")
 	ccVersion := fs.String("cc-version", os.Getenv("CLAUDE_CODE_VERSION"), "")
 	pid := fs.Int("pid", envInt("KHALA_SESSION_PID"), "")
@@ -731,6 +736,9 @@ func runtimeRegister(args []string, publicBind bool) error {
 	if !validRegistrationKind(*kind) {
 		return fmt.Errorf("invalid registration kind %q", *kind)
 	}
+	if *harness != "" && *harness != "claude" && *harness != "codex" {
+		return fmt.Errorf("invalid harness %q", *harness)
+	}
 	root, err := runtimeRoot()
 	if err != nil {
 		return err
@@ -749,7 +757,8 @@ func runtimeRegister(args []string, publicBind bool) error {
 	}
 	if *instance == "" {
 		for _, existing := range registrations {
-			if existing.Identity == *identity && *sessionID != "" && existing.ClaudeSessionID == *sessionID {
+			if existing.Identity == *identity && *sessionID != "" && existing.ClaudeSessionID == *sessionID &&
+				firstNonempty(existing.Harness, "claude") == firstNonempty(*harness, "claude") {
 				*instance = existing.InstanceID
 				break
 			}
@@ -776,6 +785,9 @@ func runtimeRegister(args []string, publicBind bool) error {
 	if exists && reg.Identity != *identity {
 		return errors.New("registration instance belongs to another identity")
 	}
+	if exists && *harness != "" && firstNonempty(reg.Harness, "claude") != *harness {
+		return errors.New("registration instance belongs to another harness")
+	}
 	if !exists {
 		reg = sessionRegistration{
 			BootID: bootID, InstanceID: *instance, Identity: *identity,
@@ -783,6 +795,15 @@ func runtimeRegister(args []string, publicBind bool) error {
 		}
 	}
 	reg.ClaudeSessionID = firstNonempty(*sessionID, reg.ClaudeSessionID)
+	reg.Harness = firstNonempty(*harness, reg.Harness, "claude")
+	if reg.Harness == "codex" {
+		if !flagPassed(fs, "socket") {
+			*socketPath = ""
+		}
+		if *socketPath != "" || reg.SocketPath != "" {
+			return errors.New("Codex registrations use a channel, not a Claude socket")
+		}
+	}
 	// A socket inherited from the environment (CLAUDE_CODE_MESSAGING_SOCKET
 	// reaches every Bash child of a session) must not replace the socket an
 	// existing registration already binds — a session running `khala bind` on
@@ -1048,7 +1069,7 @@ func runtimeRelease(args []string) error {
 	fs.SetOutput(io.Discard)
 	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
 	instance := fs.String("instance", os.Getenv("KHALA_SESSION_INSTANCE"), "")
-	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
+	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_HARNESS_SESSION_ID"), os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
 	callerPIDFlag := fs.Int("caller-pid", os.Getppid(), "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return errors.New("invalid release arguments")
@@ -1192,8 +1213,15 @@ func runtimeStatus(args []string) error {
 		}
 		native := firstNonempty(reg.NativeStatus, "-")
 		adapter := "-"
+		version := firstNonempty(reg.CCVersion, "-")
 		if reg.ConduitVerified {
 			adapter = "socket-v1"
+		}
+		if reg.Harness == "codex" {
+			version = "codex:" + version
+			if reg.ConduitVerified {
+				adapter = "codex-channel-v1"
+			}
 		}
 		lastAttempt, lastStatus, ack := "-", "-", "-"
 		if journal, ok := latestDeliveryJournal(root, identity, reg.InstanceID, bootID); ok {
@@ -1211,7 +1239,7 @@ func runtimeStatus(args []string) error {
 		}
 		fmt.Fprintf(os.Stdout, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", identity, pending,
 			yesNo(lease.BootID == bootID && lease.InstanceID != "" && lease.State == "owned"), firstNonempty(lease.InstanceID, "-"),
-			firstNonempty(reg.Phase, "-"), socket, channel, firstNonempty(reg.CCVersion, "-"), adapter,
+			firstNonempty(reg.Phase, "-"), socket, channel, version, adapter,
 			lastAttempt, lastStatus, ack, native)
 	}
 	return nil
@@ -1248,7 +1276,7 @@ func runtimeWatchReady(args []string) error {
 	fs.SetOutput(io.Discard)
 	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
 	instance := fs.String("instance", os.Getenv("KHALA_SESSION_INSTANCE"), "")
-	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
+	sessionID := fs.String("session-id", firstNonempty(os.Getenv("KHALA_HARNESS_SESSION_ID"), os.Getenv("KHALA_CLAUDE_SESSION_ID"), os.Getenv("CLAUDE_CODE_SESSION_ID")), "")
 	callerPID := fs.Int("caller-pid", os.Getppid(), "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validNode(*identity) ||
 		(*instance != "" && !validInstanceID(*instance)) {
@@ -1272,15 +1300,30 @@ func runtimeWatchReady(args []string) error {
 		return errors.New("no live identity lease")
 	}
 	reg, ok := regs[lease.InstanceID]
-	if !ok || reg.Identity != *identity || !reg.ConduitVerified || reg.Phase != "ready" || reg.SocketPath == "" ||
+	if !ok || reg.Identity != *identity || !reg.ConduitVerified || reg.Phase != "ready" ||
 		lease.Epoch == 0 || lease.Epoch != reg.LeaseEpoch || lease.PID != reg.PID ||
 		lease.PIDStart != reg.PIDStart || lease.ClaudeSessionID != reg.ClaudeSessionID ||
 		!processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
 		return errors.New("registration is not conduit verified")
 	}
-	info, err := os.Lstat(reg.SocketPath)
-	if err != nil || info.Mode()&os.ModeSocket == 0 {
-		return errors.New("registration socket is unavailable")
+	if reg.Harness == "codex" {
+		// A Codex registration has no Claude inbox socket: its verified channel
+		// socket is the only conduit path, so that is what readiness means.
+		if reg.ChannelSocket == "" || !reg.ChannelVerified {
+			return errors.New("registration channel is not verified")
+		}
+		info, err := os.Lstat(reg.ChannelSocket)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			return errors.New("registration channel socket is unavailable")
+		}
+	} else {
+		if reg.SocketPath == "" {
+			return errors.New("registration is not conduit verified")
+		}
+		info, err := os.Lstat(reg.SocketPath)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			return errors.New("registration socket is unavailable")
+		}
 	}
 	own := (*instance != "" && reg.InstanceID == *instance) ||
 		(*sessionID != "" && reg.ClaudeSessionID == *sessionID) || processIsAncestor(reg.PID, *callerPID)

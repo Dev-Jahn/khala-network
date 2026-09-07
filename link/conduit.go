@@ -671,6 +671,12 @@ func (c *conduit) verifyRegistration(reg sessionRegistration, registries []claud
 		verified, reason = false, "pid/start mismatch"
 	case resolved.ClaudeSessionID == "":
 		verified, reason = false, "Claude session id is empty"
+	case resolved.Harness == "codex":
+		if !resolved.ChannelVerified {
+			verified, reason = false, "Codex channel is not verified"
+		} else if err := c.verifyChannelSocket(resolved); err != nil {
+			verified, reason = false, "Codex channel socket is invalid"
+		}
 	case resolved.SocketPath == "":
 		verified, reason = false, "socket is not bound"
 	default:
@@ -1127,7 +1133,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 			}
 			if deliveryErr == nil {
 				journal.Via = "channel"
-				if !reg.ChannelVerified {
+				if !reg.ChannelVerified && reg.Harness != "codex" {
 					info, socketErr := os.Lstat(reg.SocketPath)
 					if socketErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode()&os.ModeSocket != 0 {
 						deliveryErr = writeDoorbell(reg.SocketPath, frame)
@@ -1146,10 +1152,18 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 				}
 			} else {
 				journal.ChannelError = deliveryErr.Error()
-				c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
-				journal.Via = "socket"
-				deliveryErr = writeDoorbell(reg.SocketPath, frame)
+				if reg.Harness == "codex" {
+					journal.Via = "channel"
+					c.logger.Printf("Codex channel doorbell %s failed: %v", reg.InstanceID, deliveryErr)
+				} else {
+					c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
+					journal.Via = "socket"
+					deliveryErr = writeDoorbell(reg.SocketPath, frame)
+				}
 			}
+		} else if reg.Harness == "codex" {
+			journal.Via = "channel"
+			deliveryErr = errors.New("Codex channel is not bound")
 		} else {
 			journal.Via = "socket"
 			deliveryErr = writeDoorbell(reg.SocketPath, frame)
