@@ -356,6 +356,18 @@ func (f *conduitFixture) writeDrainStampWithGenerations(identity string, at int6
 	}
 }
 
+func (f *conduitFixture) writeTurnStamp(identity string, at int64) {
+	f.t.Helper()
+	dir := filepath.Join(f.home, "run", "turns")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	stamp := fmt.Sprintf("turn 1 %d\n", at)
+	if err := os.WriteFile(filepath.Join(dir, identity), []byte(stamp), 0600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
 func TestConduitRewriteSchedule(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "")
 	for ring, want := range []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 320 * time.Minute} {
@@ -439,6 +451,178 @@ func TestConduitDrainResetsOutstandingLadder(t *testing.T) {
 	f.conduit.statesMu.Unlock()
 	if reset.outstandingRings != 1 || reset.nextAttempt.Sub(reset.lastWritten) != 10*time.Millisecond {
 		t.Fatalf("drain did not reset ladder: state=%+v", reset)
+	}
+}
+
+func TestConduitTurnStampGatesEachRering(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.writeTurnStamp("ink", time.Now().Unix()-60)
+	f.stageLetter("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame was not immediate")
+	}
+
+	for i := 0; i < 4; i++ {
+		f.conduit.statesMu.Lock()
+		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.conduit.statesMu.Unlock()
+		f.conduit.maybeRing("ink", lease, reg, letters)
+	}
+	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
+		t.Fatalf("parked session received %d frames, want 1", got)
+	}
+
+	f.conduit.statesMu.Lock()
+	firstWritten := f.conduit.states["ink"].outstandingWritten
+	f.conduit.statesMu.Unlock()
+	f.writeTurnStamp("ink", firstWritten.Unix())
+	if !waitForTest(time.Until(time.Unix(firstWritten.Unix()+1, 0))+time.Second, func() bool {
+		return time.Now().Unix() > firstWritten.Unix()
+	}) {
+		t.Fatal("clock did not advance past first frame second")
+	}
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(time.Hour)
+	f.conduit.statesMu.Unlock()
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
+		t.Fatalf("turn bypassed the ladder deadline: got %d frames", got)
+	}
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.conduit.statesMu.Unlock()
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
+		t.Fatal("turn after first frame did not allow the scheduled re-ring")
+	}
+
+	for i := 0; i < 3; i++ {
+		f.conduit.statesMu.Lock()
+		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.conduit.statesMu.Unlock()
+		f.conduit.maybeRing("ink", lease, reg, letters)
+	}
+	if got := f.deliveries[reg.InstanceID].Load(); got != 2 {
+		t.Fatalf("stale turn stamp allowed %d frames, want 2", got)
+	}
+
+	f.conduit.statesMu.Lock()
+	secondWritten := f.conduit.states["ink"].outstandingWritten
+	f.conduit.statesMu.Unlock()
+	f.writeTurnStamp("ink", secondWritten.Unix())
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.conduit.statesMu.Unlock()
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 3 }) {
+		t.Fatal("new turn after second frame did not allow the next scheduled re-ring")
+	}
+}
+
+func TestConduitMalformedTurnStampFailsOpenOnce(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.writeTurnStamp("ink", time.Now().Unix())
+	turnPath := filepath.Join(f.home, "run", "turns", "ink")
+	if err := os.WriteFile(turnPath, []byte("not a turn stamp\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f.stageLetter("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame was not immediate")
+	}
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(time.Hour)
+	f.conduit.statesMu.Unlock()
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if strings.Contains(f.logs.String(), "malformed turn stamp ignored: ink") {
+		t.Fatalf("turn stamp was read before the ladder deadline; logs=%s", f.logs.String())
+	}
+	for i := 0; i < 2; i++ {
+		f.conduit.statesMu.Lock()
+		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.conduit.statesMu.Unlock()
+		f.conduit.maybeRing("ink", lease, reg, letters)
+	}
+	if got := f.deliveries[reg.InstanceID].Load(); got != 3 {
+		t.Fatalf("malformed stamp did not fail open to ladder: got %d frames", got)
+	}
+	if got := strings.Count(f.logs.String(), "malformed turn stamp ignored: ink"); got != 1 {
+		t.Fatalf("malformed stamp log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+}
+
+func TestConduitTurnStampRefusesSymlink(t *testing.T) {
+	f := newConduitFixture(t)
+	dir := filepath.Join(f.home, "run", "turns")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(f.home, "turn-target")
+	if err := os.WriteFile(target, []byte(fmt.Sprintf("turn 1 %d\n", time.Now().Unix())), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "ink")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if stamp := f.conduit.readTurnStamp("ink"); stamp.Present {
+			t.Fatalf("symlink turn stamp was accepted: %+v", stamp)
+		}
+	}
+	if got := strings.Count(f.logs.String(), "malformed turn stamp ignored: ink"); got != 1 {
+		t.Fatalf("symlink stamp log count=%d want 1; logs=%s", got, f.logs.String())
+	}
+}
+
+func TestConduitRestartRestoresTurnGate(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.writeTurnStamp("ink", time.Now().Unix()-60)
+	f.stageLetter("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame missing")
+	}
+
+	restarted := &conduit{
+		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.conduit.self,
+		logger: f.conduit.logger, backoff: f.conduit.backoff, degradeAt: 3,
+		states: make(map[string]*conduitState), drainedWarned: make(map[string]bool),
+	}
+	restored := restarted.restoreState("ink", reg.InstanceID, letterGeneration(letters))
+	restored.targetInstance = reg.InstanceID
+	restored.targetPID = reg.PID
+	restored.targetPIDStart = reg.PIDStart
+	restored.nextAttempt = time.Now().Add(-time.Millisecond)
+	restarted.states["ink"] = restored
+	restarted.maybeRing("ink", lease, reg, letters)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
+		t.Fatalf("restart bypassed old turn gate: got %d frames", got)
+	}
+
+	f.writeTurnStamp("ink", restored.outstandingWritten.Unix())
+	restarted.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
+		t.Fatal("new turn after restart did not allow scheduled re-ring")
 	}
 }
 

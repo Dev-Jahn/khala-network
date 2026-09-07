@@ -426,6 +426,47 @@ stop_pid "$H23_CONDUIT_PID"
 stop_pid "$H23_PID"
 pass H23 "26 changing generations over 25 first intervals stayed within the six-frame ladder bound"
 
+# H24 — an existing turn stamp gates each scheduled re-ring. A parked session
+# keeps only its first queued frame; a fresh turn permits exactly one more.
+H24_HOME=$RIG/h24-home
+init_home "$H24_HOME"
+start_listener h24 h24-session
+H24_PID=$LISTENER_PID; H24_SOCKET=$LISTENER_SOCKET; H24_FRAMES=$LISTENER_OUTPUT
+register_session "$H24_HOME" turnaware h24-session "$H24_PID" "$H24_SOCKET" interactive ready \
+    >/dev/null || fail H24 "registration failed"
+mkdir -p "$H24_HOME/run/turns"
+printf 'turn 1 %s\n' "$(( $(date +%s) - 60 ))" > "$H24_HOME/run/turns/turnaware"
+stage_letter "$H24_HOME" turnaware 1 reel@bw2
+start_conduit "$H24_HOME" env KHALA_CONDUIT_TEST_BACKOFF=10ms \
+    KHALA_CONDUIT_TEST_REWRITE_AFTER=50ms,100ms,200ms,400ms
+H24_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H24_FRAMES" 1 40 || fail H24 "first frame was not immediate"
+h24_seq=2
+while [ "$h24_seq" -le 26 ]; do
+    stage_letter "$H24_HOME" turnaware "$h24_seq" reel@bw2
+    sleep 0.04
+    h24_seq=$((h24_seq + 1))
+done
+sleep 0.25
+[ "$(line_count "$H24_FRAMES")" -eq 1 ] || \
+    fail H24 "parked session received $(line_count "$H24_FRAMES") frames, want 1"
+
+h24_turn=$(date +%s)
+printf 'turn 1 %s\n' "$h24_turn" > "$H24_HOME/tmp/h24-turn"
+while [ "$(date +%s)" -le "$h24_turn" ]; do
+    sleep 0.05
+done
+mv "$H24_HOME/tmp/h24-turn" "$H24_HOME/run/turns/turnaware"
+wait_lines "$H24_FRAMES" 2 40 || fail H24 "new turn did not allow the due re-ring"
+sleep 0.65
+[ "$(line_count "$H24_FRAMES")" -eq 2 ] || \
+    fail H24 "one turn allowed more than one re-ring (got $(line_count "$H24_FRAMES") frames)"
+printf 'turn 1 %s\n' "$(date +%s)" > "$H24_HOME/run/turns/turnaware"
+wait_lines "$H24_FRAMES" 3 40 || fail H24 "second new turn did not allow the next due re-ring"
+stop_pid "$H24_CONDUIT_PID"
+stop_pid "$H24_PID"
+pass H24 "parked sessions keep one frame and each later turn permits one scheduled re-ring"
+
 # H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
 H3_HOME=$RIG/h3-home
 init_home "$H3_HOME"
@@ -1158,4 +1199,4 @@ bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H23 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'
+printf 'Conduit H1-H24 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'

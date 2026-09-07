@@ -288,18 +288,42 @@ HOME=$FAKE_HOME KHALA_HOME=$STOP_HOME CLAUDE_PROJECT_DIR=$STOP_PROJECT KHALA_SES
     > "$RIG/stop-active.out" 2> "$RIG/stop-active.err" || fail 8 "active Stop exited nonzero"
 [ ! -s "$RIG/stop-active.out" ] && [ ! -s "$RIG/stop-active.err" ] || \
     fail 8 "recursive Stop was not silent"
+[ ! -e "$STOP_HOME/run/turns/stop-session" ] || fail 8 "recursive Stop wrote a turn stamp"
 run_stop_without_env "$STOP_HOME" "$NO_ID_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-no-id.out" || \
     fail 8 "no-identity Stop exited nonzero"
 [ ! -s "$RIG/stop-no-id.out" ] && [ ! -s "$RIG/stop-no-id.out.err" ] || \
     fail 8 "basename-only Stop was not silent"
+[ ! -d "$STOP_HOME/run/turns" ] || \
+    [ -z "$(find "$STOP_HOME/run/turns" -type f -print -quit)" ] || fail 8 "no-identity Stop wrote a turn stamp"
 mkdir -p "$STOP_HOME/run/watch.stop-session.lock.d"
 stop_now=$(date +%s) || fail 8 "could not read Stop epoch"
 printf '%s\npid 5252 watch\n30\n' "$stop_now" > "$STOP_HOME/run/watch.stop-session.lock.d/owner"
+stop_started=$(date +%s%N) || fail 8 "could not read Stop start time"
 run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-fresh.out" || \
     fail 8 "fresh-lock Stop exited nonzero"
+stop_finished=$(date +%s%N) || fail 8 "could not read Stop finish time"
 [ ! -s "$RIG/stop-fresh.out" ] && [ ! -s "$RIG/stop-fresh.out.err" ] || \
     fail 8 "fresh-lock Stop was not silent"
-pass 8 "Stop is a silent no-op regardless of recursion, identity, or legacy watch state"
+stop_elapsed_ms=$(((stop_finished - stop_started) / 1000000))
+[ "$stop_elapsed_ms" -lt 1000 ] || fail 8 "Stop took ${stop_elapsed_ms}ms, want <1000ms"
+STOP_STAMP=$STOP_HOME/run/turns/stop-session
+[ -f "$STOP_STAMP" ] && [ ! -L "$STOP_STAMP" ] || fail 8 "valid Stop did not write a regular turn stamp"
+stop_first=$(sed -n 's/^turn 1 \([0-9][0-9]*\)$/\1/p' "$STOP_STAMP")
+[ -n "$stop_first" ] && [ "$(wc -l < "$STOP_STAMP" | tr -d ' ')" -eq 1 ] || \
+    fail 8 "turn stamp grammar differs: $(tr '\n' ' ' < "$STOP_STAMP")"
+[ "$(stat -c %a "$STOP_STAMP")" = 600 ] || fail 8 "turn stamp mode is not 0600"
+[ "$(stat -c %a "$STOP_HOME/run")" = 700 ] || fail 8 "run mode is not 0700"
+[ "$(stat -c %a "$STOP_HOME/run/turns")" = 700 ] || fail 8 "turns mode is not 0700"
+while [ "$(date +%s)" -le "$stop_first" ]; do
+    sleep 0.05
+done
+run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-second.out" || \
+    fail 8 "second Stop exited nonzero"
+[ ! -s "$RIG/stop-second.out" ] && [ ! -s "$RIG/stop-second.out.err" ] || \
+    fail 8 "second Stop was not silent"
+stop_second=$(sed -n 's/^turn 1 \([0-9][0-9]*\)$/\1/p' "$STOP_STAMP")
+[ "$stop_second" -gt "$stop_first" ] || fail 8 "second Stop did not overwrite with a newer epoch"
+pass 8 "Stop stamps the resolved identity in ${stop_elapsed_ms}ms and suppresses recursive/unresolved writes"
 
 END_HOME=$RIG/end-home
 END_PROJECT=$RIG/end-session
