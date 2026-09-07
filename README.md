@@ -304,7 +304,9 @@ local process and Remote Control peers, not just the conduit.
   name), registers the session in the runtime dir, takes the identity lease,
   marks itself ready, drains the inbox into context (capped, owner only,
   bounded), and runs `khala node ensure`.
-- **Stop** does nothing. **SessionEnd** releases the registration.
+- **Stop** records a turn stamp (`run/turns/<identity>`, one line) so the
+  conduit re-rings an unanswered doorbell only after the session actually
+  finished a turn without draining. **SessionEnd** releases the registration.
 - The **khala skill** teaches the session that a conduit doorbell means
   "drain now" and nothing else.
 
@@ -320,6 +322,21 @@ inherits its mail.
 
 Without Claude Code, the CLI works standalone: copy `bin/khala` to
 `~/.local/bin/khala` yourself and use send/sync/inbox directly.
+
+### Other harnesses (Codex)
+
+Since 0.9.7 a registration carries a `harness` field (`claude` when absent).
+`khala-link runtime register --harness codex …` registers a session that has no
+Claude Code inbox socket: the conduit verifies it by its channel socket alone
+(`register-channel --verified`), rings only through that channel, and never
+falls back to a socket. `khala status` shows `codex:<version>` and
+`codex-channel-v1`; the `.ear` snapshot shows `cc=codex:<version>` and
+`route=channel`. Pass `--kind interactive` (or `--receive-opt-in`) explicitly,
+because `auto` looks for a Claude Code ancestor. `khala watch`, `bind --release`
+and `runtime register` read the session id from `KHALA_HARNESS_SESSION_ID`
+first (then the Claude Code variables), so a wrapper can export the Codex thread
+id without impersonating a Claude environment variable. The Codex adapter itself
+lives in a separate repository (`Dev-Jahn/khala-network-codex`).
 
 ## Pull-only mailbox clients
 

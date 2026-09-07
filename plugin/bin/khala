@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.6
+KHALA_VERSION=0.9.7
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -5303,7 +5303,7 @@ cmd_watch() {
     if find_link_binary; then
         watch_ready_error=$("$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
             --instance "${KHALA_SESSION_INSTANCE-}" \
-            --session-id "${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}" \
+            --session-id "${KHALA_HARNESS_SESSION_ID-${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}}" \
             --caller-pid "$$" 2>&1)
         if [ "$?" -eq 0 ]; then
             printf '%s\n' 'conduit has the ear'

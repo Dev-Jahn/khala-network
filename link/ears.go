@@ -514,7 +514,8 @@ func earReason(reason string) (string, bool) {
 		return "pid", true
 	case "Claude session id is empty":
 		return "session", true
-	case "socket is not bound", "socket is missing or not a Unix socket", "socket uid mismatch":
+	case "socket is not bound", "socket is missing or not a Unix socket", "socket uid mismatch",
+		"Codex channel is not verified", "Codex channel socket is invalid":
 		return "socket", true
 	case "Claude registry pid/socket mismatch", "Claude registry session id mismatch":
 		return "registry", true
@@ -777,6 +778,9 @@ func (c *conduit) buildEarIdentityBase(identity string, registrations []sessionR
 	if selected.InstanceID != "" {
 		row.Phase = valueOrDash(selected.Phase)
 		row.CCVersion = valueOrDash(selected.CCVersion)
+		if selected.Harness == "codex" {
+			row.CCVersion = "codex:" + row.CCVersion
+		}
 		switch {
 		case !selectedOwned:
 			row.Reason = "lease"
