@@ -443,6 +443,7 @@ presence/<session>        # heartbeat 파일 (내용 = epoch 한 줄)
 presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (6행; legacy 5행 read)
 presence/conduit@<node>.ear # 노드 conduit의 귀 스냅샷
 run/drained/<identity>     # drain 1: epoch, 전후 generation, ring/info/streams, ok|partial
+run/turns/<identity>       # turn 1 <epoch>; Stop hook이 쓰고 conduit이 읽는 노드 로컬 스탬프(복제 안 됨)
 run/brain.lock.d/          # shared reconcile/drain/ack-read lock
 run/send-request.lock.d/   # serializes retry ledger writes and keyed sends
 log/delivered             # dedup 로그: "<epoch> <msg_id>" 줄
@@ -709,7 +710,11 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
   때 journal에는 `PID`·`PIDStart`가 남지 않으므로 같은 `InstanceID`를 재사용한 새 프로세스는 기존 count를 물려받을 수
   있고 hook 기반 등록은 SessionStart drain stamp로 이를 해소한다. 그 전의 새 편지는 generation과 다음 프레임의 요약만
   갱신하며 즉시 프레임을 더 만들지 않는다. 미소비 재호출 간격은 10→20→40→80→160→320분이고 이후 320분(5시간
-  20분)에 머문다. 소비되면 다음 대기 generation은 즉시 울리고 사다리는 10분부터 다시 시작한다. 0.9.1보다 오래되어
+  20분)에 머문다. 유효한 turn 스탬프가 있는 신원은 사다리 기한이 지난 뒤에도 그 `at`이 outstanding 프레임의 마지막
+  성공 쓰기 초 단위 시각보다 이르지 않아야(같아도 turn 증거) 재호출할 수 있다. 재호출을 쓰면 그 쓰기 시각이 새 기준이
+  되므로 다음 재호출에는 그 뒤의 새 turn 증거가 필요하다. turn 스탬프가 존재하지 않는 신원은 이전과 똑같이 bounded
+  사다리만 따르며, 형식이 잘못되었거나 심링크인 스탬프는 신원별 한 번 로그하고 없는 것으로 취급한다. 소비되면 다음
+  대기 generation은 turn 스탬프와 무관하게 즉시 울리고 사다리는 10분부터 다시 시작한다. 0.9.1보다 오래되어 drain
   스탬프를 쓰지 않는 CLI는 소비 증거가 없으므로 이 bounded 사다리만 계속 따른다.
 
 #### 3.4 예약 이름과 주체 정책

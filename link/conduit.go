@@ -102,6 +102,7 @@ type conduit struct {
 	earLastWrite        time.Time
 	earMailboxes        []string
 	drainedWarned       map[string]bool
+	turnsWarned         map[string]bool
 	earLastSignature    string
 	earRegistrationSig  string
 	earSignatureSet     bool
@@ -182,6 +183,7 @@ func runConduit(args []string) int {
 		watcher:             watcher, watchedDir: make(map[string]struct{}),
 		earInterval:  durationEnv("KHALA_CONDUIT_TEST_EAR_INTERVAL", 60*time.Second),
 		earMailboxes: append([]string(nil), cfg.mailboxes...), drainedWarned: make(map[string]bool),
+		turnsWarned: make(map[string]bool),
 	}
 	if c.earInterval < time.Second {
 		c.earInterval = time.Second
@@ -1068,6 +1070,13 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	if now.Before(state.nextAttempt) {
 		c.statesMu.Unlock()
 		return
+	}
+	if state.outstandingRings > 0 {
+		turn := c.readTurnStamp(identity)
+		if turn.Present && turn.LastTurn < state.outstandingWritten.Unix() {
+			c.statesMu.Unlock()
+			return
+		}
 	}
 	state.attemptIndex++
 	attemptIndex := state.attemptIndex

@@ -94,6 +94,12 @@ type earDrainStamp struct {
 	Token           string
 }
 
+type conduitTurnStamp struct {
+	LastTurn int64
+	Token    string
+	Present  bool
+}
+
 func parseEars(path string) (earsSnapshot, error) {
 	base := filepath.Base(path)
 	node, ok := earSnapshotNode(base)
@@ -926,6 +932,49 @@ func (c *conduit) malformedDrain(identity string, result earDrainStamp) earDrain
 	if !c.drainedWarned[identity] && c.logger != nil {
 		c.logger.Printf("malformed drained stamp ignored: %s", identity)
 		c.drainedWarned[identity] = true
+	}
+	return result
+}
+
+func (c *conduit) readTurnStamp(identity string) conduitTurnStamp {
+	var result conduitTurnStamp
+	f, err := openRegular(filepath.Join(c.home, "run", "turns", identity))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return result
+		}
+		return c.malformedTurn(identity, result)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return c.malformedTurn(identity, result)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
+		return c.malformedTurn(identity, result)
+	}
+	fields := strings.Fields(string(data))
+	if len(data) > 4096 || len(fields) != 3 || fields[0] != "turn" || fields[1] != "1" {
+		return c.malformedTurn(identity, result)
+	}
+	at, err := parseNonnegativeInt64(fields[2])
+	if err != nil {
+		return c.malformedTurn(identity, result)
+	}
+	result.LastTurn = at
+	result.Token = fmt.Sprintf("%d:%x", info.ModTime().UnixNano(), sha256.Sum256(data))
+	result.Present = true
+	return result
+}
+
+func (c *conduit) malformedTurn(identity string, result conduitTurnStamp) conduitTurnStamp {
+	if c.turnsWarned == nil {
+		c.turnsWarned = make(map[string]bool)
+	}
+	if !c.turnsWarned[identity] && c.logger != nil {
+		c.logger.Printf("malformed turn stamp ignored: %s", identity)
+		c.turnsWarned[identity] = true
 	}
 	return result
 }
