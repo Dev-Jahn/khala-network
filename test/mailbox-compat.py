@@ -3,8 +3,11 @@
 import concurrent.futures
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 CLI = Path(__file__).resolve().parents[1] / "bin/khala"
@@ -64,6 +67,56 @@ class MailboxCompatibility(unittest.TestCase):
         (self.home / "requests/send/sender/request1/published").unlink()
         self.assertEqual(first, self.send())
         self.assertTrue((self.home / "requests/send/sender/request1/published").exists())
+
+    def test_request_input_is_text_and_legacy_retries_migrate(self):
+        first = self.send()
+        record = self.home / "requests/send/sender/request1"
+        expected = (b"Khala-Request: 1\nFrom: sender@test\nTo: reader@test\n"
+                    b"Subject: \nTTL: 2592000\nIn-Reply-To: \nLater: 0\n\nhello\n")
+        self.assertEqual((record / "input").read_bytes(), expected)
+        legacy = b"\0".join([b"request-v1", b"sender@test", b"reader@test", b"",
+                              b"2592000", b"", b"0", b"hello\n"])
+        envelope = (record / "message").read_bytes()
+        publication = (record / "published").read_bytes()
+        for pending in (False, True):
+            (record / "input").write_bytes(legacy)
+            if pending:
+                (record / "published").unlink()
+                (self.home / "outbox/new" / first).unlink()
+                (self.home / "spool/for/test" / first).unlink()
+            self.run_cli("send", "reader@test", "--request-id", "request1", "-m", "changed", ok=False)
+            self.assertEqual((record / "input").read_bytes(), legacy)
+            self.assertEqual(first, self.send())
+            self.assertEqual((record / "input").read_bytes(), expected)
+            self.assertEqual((record / "message").read_bytes(), envelope)
+            self.assertEqual((record / "published").read_bytes(), publication)
+
+    def test_retry_ledger_survives_actual_archive_retention(self):
+        first = self.send()
+        self.run_cli("reconcile")
+        self.assertTrue((self.home / "outbox/acked" / first).exists())
+        self.run_cli("inbox", "ack-read", first, session="reader")
+        # Move the CLI's clock forward without sleeping or changing host time.
+        future = int(time.time()) + 31 * 86400
+        real_date = shutil.which("date")
+        self.assertIsNotNone(real_date)
+        # DESIGN requires executable test helpers under HOME: /tmp may be noexec.
+        clock_tmp = tempfile.TemporaryDirectory(prefix="khala-test-clock-", dir=Path.home())
+        self.addCleanup(clock_tmp.cleanup)
+        shim_dir = Path(clock_tmp.name)
+        shim = shim_dir / "date"
+        shim.write_text('#!/bin/sh\nif [ "$#" -eq 1 ] && [ "$1" = +%s ]; then\n'
+                        f"    printf '%s\\n' {future}\nelse\n"
+                        f'    exec {shlex.quote(real_date)} "$@"\nfi\n')
+        shim.chmod(0o755)
+        self.env["PATH"] = str(shim_dir) + os.pathsep + self.env["PATH"]
+        self.run_cli("reconcile")
+        self.assertFalse((self.home / "outbox/acked" / first).exists())
+        self.assertFalse((self.home / "inbox/reader/cur" / first).exists())
+        self.assertTrue((self.home / "requests/send/sender/request1/published").exists())
+        self.assertEqual(first, self.send())
+        self.assertFalse((self.home / "outbox/new" / first).exists())
+        self.assertFalse((self.home / "spool/for/test" / first).exists())
 
     def test_options_identity_and_exact_stdin(self):
         args = ("send", "reader@test", "--as", "explicit", "--request-id", "stdin1",

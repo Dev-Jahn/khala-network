@@ -3656,9 +3656,11 @@ cmd_send_request() {
     else
         cat > "$request_work/body" || { rm -rf -- "$request_work"; return 1; }
     fi
-    # NUL-delimited fixed fields followed by exact body bytes, not a lossy hash.
-    if ! { printf '%s\0' request-v1 "$send_from" "$send_to" "$send_subject" \
-        "$send_ttl" "$send_reply_to" "$send_later"; cat "$request_work/body"; } \
+    # Fixed-order text headers followed by exact body bytes. Header values
+    # cannot contain LF, so the complete input remains unambiguous and greppable.
+    if ! { printf 'Khala-Request: 1\nFrom: %s\nTo: %s\nSubject: %s\nTTL: %s\nIn-Reply-To: %s\nLater: %s\n\n' \
+        "$send_from" "$send_to" "$send_subject" "$send_ttl" "$send_reply_to" "$send_later"; \
+        cat "$request_work/body"; } \
         > "$request_work/input"; then
         rm -rf -- "$request_work"
         return 1
@@ -3678,8 +3680,19 @@ cmd_send_request() {
 cmd_send_request_locked() {
     if [ -d "$request_dir" ]; then
         if ! cmp -s "$request_work/input" "$request_dir/input"; then
-            error "request-id already used with different arguments or body"
-            return 1
+            # The first PR revision used NUL separators. Preserve its retry
+            # keys by checking exact legacy bytes before atomically migrating
+            # only the input representation; Id/envelope/publication stay fixed.
+            if ! { printf '%s\0' request-v1 "$send_from" "$send_to" "$send_subject" \
+                "$send_ttl" "$send_reply_to" "$send_later"; cat "$request_work/body"; } \
+                > "$request_work/input-legacy"; then
+                return 1
+            fi
+            if ! cmp -s "$request_work/input-legacy" "$request_dir/input"; then
+                error "request-id already used with different arguments or body"
+                return 1
+            fi
+            mv "$request_work/input" "$request_dir/input" || return 1
         fi
     else
         # Freeze the exact envelope before any outbox/spool publication.
