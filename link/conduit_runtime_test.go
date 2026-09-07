@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,6 +100,109 @@ func newConduitFixture(t *testing.T) *conduitFixture {
 		}
 	})
 	return f
+}
+
+func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms,80ms")
+	for _, route := range []string{"socket", "channel", "channel+socket"} {
+		t.Run(route, func(t *testing.T) {
+			f := newConduitFixture(t)
+			f.conduit.backoff = []time.Duration{time.Millisecond}
+			reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+			f.writeLease("ink", &reg, "owned", 3)
+			var channelDeliveries *atomic.Int64
+			if route != "socket" {
+				channelDeliveries = f.addChannel(&reg)
+				reg.ChannelVerified = route == "channel"
+			}
+			lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+
+			started := time.Now()
+			lettersStaged := 0
+			for time.Since(started) < 210*time.Millisecond {
+				lettersStaged++
+				id := fmt.Sprintf("1700000000.1.%d.sender@alpha", lettersStaged)
+				f.stageEnvelope("ink", id, "From: sender@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+				f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+				time.Sleep(4 * time.Millisecond)
+			}
+
+			// The upper bound is the property under test: however many letters arrived, only
+			// the schedule may write frames. The lower bound only proves the schedule keeps
+			// going while nothing drains, so keep scanning (as the conduit loop would) until it
+			// has: under host load the 4 ms sleeps stretch and the 210 ms window alone may end
+			// before the fourth ladder step is due (measured 2026-09-07, 1 in 5 runs).
+			count := func() int64 {
+				if route == "socket" {
+					return f.deliveries[reg.InstanceID].Load()
+				}
+				return channelDeliveries.Load()
+			}
+			var written int64
+			if !waitForTest(2*time.Second, func() bool {
+				f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+				written = count()
+				return written >= 5
+			}) {
+				t.Fatalf("only %d scheduled frames were written", written)
+			}
+			time.Sleep(20 * time.Millisecond)
+			written = count()
+			if written > 6 {
+				t.Fatalf("%d letters over 20 first-intervals wrote %d %s frames; want at most 6 from the schedule", lettersStaged, written, route)
+			}
+			if route == "channel" {
+				if socket := f.deliveries[reg.InstanceID].Load(); socket != 0 {
+					t.Fatalf("verified channel echoed %d socket frames", socket)
+				}
+			} else if route == "channel+socket" {
+				if socket := f.deliveries[reg.InstanceID].Load(); socket != written {
+					t.Fatalf("channel frames=%d socket echoes=%d", written, socket)
+				}
+			}
+			entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
+			if err != nil || int64(len(entries)) != written {
+				t.Fatalf("journal entries=%d written frames=%d err=%v", len(entries), written, err)
+			}
+		})
+	}
+}
+
+func TestConduitScanHotPathCost(t *testing.T) {
+	f := newConduitFixture(t)
+	for i := 0; i < 40; i++ {
+		identity := fmt.Sprintf("scan%02d", i)
+		instance := fmt.Sprintf("instance%02d", i)
+		reg := f.addRegistration(identity, instance, "interactive", false, time.Now().Add(-time.Hour), 3)
+		f.writeLease(identity, &reg, "owned", 3)
+		if i < 10 {
+			f.stageEnvelope(identity, fmt.Sprintf("1700000000.1.%d.sender@alpha", i+1), "From: sender@alpha\nType: message\nSubject: scan\n\nbody\n")
+		}
+	}
+	journalDir := filepath.Join(f.runtime, "deliveries", "scan00", "instance00")
+	if err := os.MkdirAll(journalDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		journal := deliveryJournal{
+			BootID: f.bootID, Identity: "scan00", InstanceID: "instance00",
+			Generation: strings.Repeat("a", 64), AttemptID: fmt.Sprintf("attempt-%03d", i),
+			AttemptIndex: i + 1, AttemptedAt: time.Unix(1700000000+int64(i), 0).UTC().Format(time.RFC3339Nano),
+			Status: "written",
+		}
+		if err := writeAtomicJSON(filepath.Join(journalDir, fmt.Sprintf("%03d.json", i)), journal, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.conduit.scan()
+	durations := make([]time.Duration, 101)
+	for i := range durations {
+		started := time.Now()
+		f.conduit.scan()
+		durations[i] = time.Since(started)
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+	t.Logf("median scan: %s (40 identities, 10 pending, one with 200 journals)", durations[len(durations)/2])
 }
 
 func (f *conduitFixture) addRegistration(identity, instance, kind string, receiveOptIn bool, startedAt time.Time, epoch uint64) sessionRegistration {
@@ -234,6 +338,210 @@ func waitForTest(timeout time.Duration, condition func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return condition()
+}
+
+func (f *conduitFixture) writeDrainStamp(identity string, at int64) {
+	f.writeDrainStampWithGenerations(identity, at, "-", "-")
+}
+
+func (f *conduitFixture) writeDrainStampWithGenerations(identity string, at int64, before, after string) {
+	f.t.Helper()
+	dir := filepath.Join(f.home, "run", "drained")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		f.t.Fatal(err)
+	}
+	stamp := fmt.Sprintf("drain 1 %d %s %s 0 0 0 ok\n", at, before, after)
+	if err := os.WriteFile(filepath.Join(dir, identity), []byte(stamp), 0600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestConduitRewriteSchedule(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "")
+	for ring, want := range []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 320 * time.Minute} {
+		if got := conduitRewrittenAfter(ring + 1); got != want {
+			t.Fatalf("production ring %d delay=%s want %s", ring+1, got, want)
+		}
+	}
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "7ms")
+	for _, ring := range []int{1, 2, 20} {
+		if got := conduitRewrittenAfter(ring); got != 7*time.Millisecond {
+			t.Fatalf("single override ring %d delay=%s", ring, got)
+		}
+	}
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "5ms, 10ms, 20ms")
+	for ring, want := range []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond} {
+		if got := conduitRewrittenAfter(ring + 1); got != want {
+			t.Fatalf("list override ring %d delay=%s want %s", ring+1, got, want)
+		}
+	}
+}
+
+func TestConduitDrainResetsOutstandingLadder(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	drainAt := time.Now().Unix() + 60
+	f.writeDrainStamp("ink", drainAt)
+	f.stageEnvelope("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame was not immediate")
+	}
+	f.conduit.statesMu.Lock()
+	firstDelay := f.conduit.states["ink"].nextAttempt.Sub(f.conduit.states["ink"].lastWritten)
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.conduit.statesMu.Unlock()
+	if firstDelay != 10*time.Millisecond {
+		t.Fatalf("first outstanding delay=%s want 10ms", firstDelay)
+	}
+
+	f.stageEnvelope("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
+		t.Fatal("scheduled coalesced frame was not written")
+	}
+	f.conduit.statesMu.Lock()
+	secondDelay := f.conduit.states["ink"].nextAttempt.Sub(f.conduit.states["ink"].lastWritten)
+	f.conduit.statesMu.Unlock()
+	if secondDelay != 20*time.Millisecond {
+		t.Fatalf("second outstanding delay=%s want 20ms", secondDelay)
+	}
+
+	newDir := filepath.Join(f.home, "inbox", "ink", "new")
+	curDir := filepath.Join(f.home, "inbox", "ink", "cur")
+	if err := os.MkdirAll(curDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(newDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if err := os.Rename(filepath.Join(newDir, entry.Name()), filepath.Join(curDir, entry.Name())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	generationBeforeDrain := letterGeneration(f.conduit.pending("ink"))
+	f.writeDrainStampWithGenerations("ink", drainAt, generationBeforeDrain, "-")
+	f.stageEnvelope("ink", "1700000000.1.3.sender@alpha", "From: carol@alpha\nType: message\nSubject: after-drain\n\nbody\n")
+	if !waitForTest(time.Second, func() bool {
+		f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+		return f.deliveries[reg.InstanceID].Load() == 3
+	}) {
+		t.Fatal("generation after drain did not ring within the failure-backoff spacing")
+	}
+	f.conduit.statesMu.Lock()
+	reset := *f.conduit.states["ink"]
+	f.conduit.statesMu.Unlock()
+	if reset.outstandingRings != 1 || reset.nextAttempt.Sub(reset.lastWritten) != 10*time.Millisecond {
+		t.Fatalf("drain did not reset ladder: state=%+v", reset)
+	}
+}
+
+func TestConduitRestartPreservesOutstandingLadder(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "100ms,200ms,400ms")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageLetter("ink")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame missing")
+	}
+	f.conduit.statesMu.Lock()
+	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.conduit.statesMu.Unlock()
+	f.conduit.maybeRing("ink", lease, reg, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
+		t.Fatal("second frame missing")
+	}
+
+	restarted := &conduit{
+		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.conduit.self,
+		logger: f.conduit.logger, backoff: f.conduit.backoff, degradeAt: 3,
+		states: make(map[string]*conduitState), drainedWarned: make(map[string]bool),
+	}
+	restored := restarted.restoreState("ink", reg.InstanceID, letterGeneration(letters))
+	if restored.outstandingRings != 2 || restored.nextAttempt.Sub(restored.lastWritten) != 200*time.Millisecond {
+		t.Fatalf("restart state=%+v; want two outstanding writes and 200ms deadline", restored)
+	}
+	restarted.states["ink"] = restored
+	restarted.maybeRing("ink", lease, reg, letters)
+	time.Sleep(5 * time.Millisecond)
+	if got := f.deliveries[reg.InstanceID].Load(); got != 2 {
+		t.Fatalf("restart duplicated outstanding frame immediately: got %d frames", got)
+	}
+}
+
+func TestConduitOutstandingStateDoesNotCrossProcesses(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "30s,60s")
+	f := newConduitFixture(t)
+	f.conduit.backoff = []time.Duration{time.Millisecond}
+	owner := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-2*time.Hour), 3)
+	claimant := f.addRegistration("ink", "claimant", "interactive", false, time.Now().Add(-time.Hour), 4)
+	claimant.PID = owner.PID + 100000
+	claimant.PIDStart = f.bootID + ":claimant-process"
+	f.writeLease("ink", &owner, "owned", 3)
+	f.stageLetter("ink")
+	ownerLease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	letters := f.conduit.pending("ink")
+	f.conduit.maybeRing("ink", ownerLease, owner, letters)
+	if !waitForTest(time.Second, func() bool { return f.deliveries[owner.InstanceID].Load() == 1 }) {
+		t.Fatal("owner frame missing")
+	}
+
+	time.Sleep(2 * time.Millisecond)
+	f.writeLease("ink", &claimant, "owned", 4)
+	claimantLease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	f.conduit.maybeRing("ink", claimantLease, claimant, letters)
+	if !waitForTest(100*time.Millisecond, func() bool { return f.deliveries[claimant.InstanceID].Load() == 1 }) {
+		t.Fatalf("new process received %d frames; want its first frame immediately", f.deliveries[claimant.InstanceID].Load())
+	}
+	f.conduit.statesMu.Lock()
+	state := *f.conduit.states["ink"]
+	f.conduit.statesMu.Unlock()
+	if state.outstandingRings != 1 || state.nextAttempt.Sub(state.lastWritten) != 30*time.Second {
+		t.Fatalf("new process inherited the owner's ladder: state=%+v", state)
+	}
+	if got := f.deliveries[owner.InstanceID].Load(); got != 1 {
+		t.Fatalf("old process received %d frames after lease moved, want 1", got)
+	}
+	restored := f.conduit.restoreState("ink", claimant.InstanceID, letterGeneration(letters))
+	if restored.outstandingRings != 1 || restored.nextAttempt.Sub(restored.outstandingWritten) != 30*time.Second {
+		t.Fatalf("restore included another instance's journals: state=%+v", restored)
+	}
+}
+
+func TestConduitCoalescingKeepsEarAlarmSignature(t *testing.T) {
+	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "30s")
+	f := newConduitFixture(t)
+	if err := os.MkdirAll(filepath.Join(f.runtime, "ears"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	f.writeLease("ink", &reg, "owned", 3)
+	f.stageEnvelope("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
+	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+		t.Fatal("first frame missing")
+	}
+	f.stageEnvelope("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	row, err := f.conduit.buildEarIdentity("ink", []sessionRegistration{reg}, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Generation != letterGeneration(f.conduit.pending("ink")) || row.WrittenRings != 0 || row.LastWritten == 0 || row.LastDrain != 0 {
+		t.Fatalf("coalescing ear signature=%+v", row)
+	}
 }
 
 func TestNoticeClassificationShapesSocketAndChannelDoorbells(t *testing.T) {

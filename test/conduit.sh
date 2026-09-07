@@ -229,6 +229,10 @@ runtime_env KHALA_HOME="$H20_HOME" "$BIN" runtime status > "$RIG/h20-status.out"
 grep -q $'SOCKET\tCHANNEL\tCC_VERSION' "$RIG/h20-status.out" || fail H20 "status omitted CHANNEL column"
 grep -q $'channelled\t.*\tyes\tyes\t2.1.233' "$RIG/h20-status.out" || fail H20 "status did not show the registered channel"
 
+mkdir -p "$H20_HOME/run/drained"
+mkdir -p "$H20_HOME/inbox/channelled/cur"
+mv "$H20_HOME/inbox/channelled/new/1700000000.1.20.sender@alpha" "$H20_HOME/inbox/channelled/cur/"
+printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H20_HOME/run/drained/channelled"
 stop_pid "$H20_CHANNEL_PID"
 stage_letter "$H20_HOME" channelled 21 clawd@mini
 wait_lines "$H20_CC_FRAMES" 1 40 || fail H20 "dead channel did not fall back to CC socket"
@@ -260,7 +264,7 @@ H1_FRAMES=$LISTENER_OUTPUT
 H1_REGISTER=$(register_session "$H1_HOME" eddy h1-session "$H1_LISTENER_PID" \
     "$H1_SOCKET" interactive ready) || fail H1 "ready registration failed"
 stage_letter "$H1_HOME" eddy 1 reel@bw2
-start_conduit "$H1_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
+start_conduit "$H1_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms KHALA_CONDUIT_TEST_REWRITE_AFTER=500ms
 H1_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H1_FRAMES" 1 40 || fail H1 "no frame within 2s"
 sleep 0.15
@@ -278,12 +282,14 @@ PY
 pass H1 "one valid doorbell arrived (priority next) and the letter remained in new/"
 
 stage_letter "$H1_HOME" eddy 2 clawd@mini
-wait_lines "$H1_FRAMES" 2 40 || fail H2 "second generation did not ring"
+sleep 0.15
+[ "$(line_count "$H1_FRAMES")" -eq 1 ] || fail H2 "second generation bypassed the outstanding schedule"
+wait_lines "$H1_FRAMES" 2 20 || fail H2 "second generation did not ring on schedule"
 stage_letter "$H1_HOME" eddy 3 pen@b200
 sleep 0.15
-[ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed outstanding backoff"
-wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not ring after backoff"
-pass H2 "generation changes ring once and a burst remains coalesced until backoff"
+[ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed the outstanding schedule"
+wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not ring on schedule"
+pass H2 "generation changes refresh the next scheduled frame without minting one immediately"
 
 stop_pid "$H1_CONDUIT_PID"
 stop_pid "$H1_LISTENER_PID"
@@ -309,6 +315,10 @@ lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 frame = json.loads(lines[int(sys.argv[2]) - 1])
 assert frame["priority"] == sys.argv[3], frame["priority"]
 PY
+mkdir -p "$H19_HOME/run/drained"
+mkdir -p "$H19_HOME/inbox/quiet/cur"
+mv "$H19_HOME/inbox/quiet/new/1700000000.1.1.sender@alpha" "$H19_HOME/inbox/quiet/cur/"
+printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H19_HOME/run/drained/quiet"
 stage_letter "$H19_HOME" quiet 2 clawd@mini
 wait_lines "$H19_FRAMES" 2 40 || fail H19 "mixed generation did not ring"
 uv run --no-project python - "$H19_FRAMES" 2 next <<'PY' || fail H19 "one ordinary letter did not lift the batch to next"
@@ -342,9 +352,9 @@ stop_pid "$H19B_CONDUIT_PID"
 stop_pid "$H19B_LISTENER_PID"
 pass H19 "doorbell is next by default, later only when every letter asks, and only via the envelope"
 
-# H13 — a written doorbell is the one outstanding wake: the same generation is
-# not rung again on the fast backoff (measured 2026-08-16: 6 attempts / 4
-# visible duplicates in a 23-second turn). Only a generation change re-rings.
+# H13 — a written doorbell stays outstanding until a later drain. An unchanged
+# generation does not use the fast backoff; after a drain, a changed generation
+# rings immediately.
 H13_HOME=$RIG/h13-home
 init_home "$H13_HOME"
 start_listener h13 h13-session
@@ -359,13 +369,62 @@ H13_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H13_FRAMES" 1 40 || fail H13 "no frame within 2s"
 sleep 3
 [ "$(line_count "$H13_FRAMES")" -eq 1 ] || fail H13 "written generation was re-rung within 3s (got $(line_count "$H13_FRAMES") frames)"
+mkdir -p "$H13_HOME/run/drained"
+mkdir -p "$H13_HOME/inbox/h13id/cur"
+mv "$H13_HOME/inbox/h13id/new/1700000000.1.1.sender@alpha" "$H13_HOME/inbox/h13id/cur/"
+printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H13_HOME/run/drained/h13id"
 stage_letter "$H13_HOME" h13id 2 clawd@mini
-wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change did not ring"
+wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change after drain did not ring"
 sleep 1
 [ "$(line_count "$H13_FRAMES")" -eq 2 ] || fail H13 "second written generation was re-rung"
 stop_pid "$H13_CONDUIT_PID"
 stop_pid "$H13_LISTENER_PID"
-pass H13 "a written doorbell is not re-rung on the fast backoff; only a generation change rings again"
+pass H13 "an outstanding frame is held; drain consumption makes the next generation ring immediately"
+
+# H23 — frequent generation changes cannot outrun the bounded re-ring ladder
+# while the accepting session never drains. The 1.25s observation window is 25
+# first intervals; the final frame must summarize all coalesced letters.
+H23_HOME=$RIG/h23-home
+init_home "$H23_HOME"
+start_listener h23 h23-session
+H23_PID=$LISTENER_PID; H23_SOCKET=$LISTENER_SOCKET; H23_FRAMES=$LISTENER_OUTPUT
+register_session "$H23_HOME" bounded h23-session "$H23_PID" "$H23_SOCKET" interactive ready \
+    >/dev/null || fail H23 "registration failed"
+stage_letter "$H23_HOME" bounded 1 reel@bw2
+start_conduit "$H23_HOME" env KHALA_CONDUIT_TEST_BACKOFF=10ms \
+    KHALA_CONDUIT_TEST_REWRITE_AFTER=50ms,100ms,200ms,400ms
+H23_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H23_FRAMES" 1 40 || fail H23 "first frame was not immediate"
+h23_seq=2
+while [ "$h23_seq" -le 26 ]; do
+    stage_letter "$H23_HOME" bounded "$h23_seq" reel@bw2
+    sleep 0.04
+    h23_seq=$((h23_seq + 1))
+done
+sleep 0.25
+h23_count=$(line_count "$H23_FRAMES")
+[ "$h23_count" -le 6 ] || fail H23 "26 letters wrote $h23_count frames; schedule permits at most 6"
+[ "$h23_count" -ge 5 ] || fail H23 "ladder wrote only $h23_count frames; want at least 5"
+h23_journals=$(find "$RUNTIME_BASE/deliveries/bounded" -type f -name '*.json' | wc -l | tr -d ' ')
+[ "$h23_journals" -eq "$h23_count" ] || fail H23 "$h23_journals journals for $h23_count frames"
+H23_PENDING=$(runtime_env KHALA_HOME="$H23_HOME" "$BIN" runtime pending-generation --identity bounded) || \
+    fail H23 "pending-generation failed"
+H23_GENERATION=${H23_PENDING%% *}
+uv run --no-project python - "$H23_FRAMES" "$H23_GENERATION" <<'PY' || fail H23 "last frame did not carry the fresh coalesced summary"
+import json, sys
+frame = json.loads(open(sys.argv[1], encoding="utf-8").read().splitlines()[-1])
+lines = dict(line.split(": ", 1) for line in frame["message"]["content"].splitlines()[1:] if ": " in line)
+assert lines["pending"] == "26", lines
+assert lines["notices"] == "0", lines
+assert lines["urgent"] == "0", lines
+assert lines["from"] == "reel@bw2", lines
+assert "conduit-1" in lines["subjects"], lines
+assert lines["generation"] == sys.argv[2], lines
+assert lines["retry"] == "0", lines
+PY
+stop_pid "$H23_CONDUIT_PID"
+stop_pid "$H23_PID"
+pass H23 "26 changing generations over 25 first intervals stayed within the six-frame ladder bound"
 
 # H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
 H3_HOME=$RIG/h3-home
@@ -445,7 +504,7 @@ CLAIM_INSTANCE=$(printf '%s\n' "$CLAIM_REG" | sed -n 's/^instance //p')
 printf '%s\n' "$OWNER_REG" | grep -q '^owner yes$' || fail H4 "first claimant did not own lease"
 printf '%s\n' "$CLAIM_REG" | grep -q '^owner no$' || fail H4 "second claimant became owner"
 stage_letter "$H4_HOME" shared 5
-start_conduit "$H4_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+start_conduit "$H4_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s KHALA_CONDUIT_TEST_REWRITE_AFTER=30s
 H4_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$OWNER_FRAMES" 1 40 || fail H4 "lease owner was not rung"
 [ "$(line_count "$CLAIM_FRAMES")" -eq 0 ] || fail H4 "non-owner was rung"
@@ -910,6 +969,12 @@ start_conduit "$H21_HOME" env KHALA_CONDUIT_TEST_EAR_INTERVAL=30s \
 H21_CONDUIT_PID=$CONDUIT_PID
 H21_EAR=$H21_HOME/presence/conduit@alpha.ear
 wait_file "$H21_EAR" 100 || fail H21 "initial snapshot was not written"
+h21_wait=0
+while ! grep -q '^identity name=earsafe ' "$H21_EAR" 2>/dev/null && [ "$h21_wait" -lt 100 ]; do
+    sleep 0.05
+    h21_wait=$((h21_wait + 1))
+done
+[ "$h21_wait" -lt 100 ] || fail H21 "identity did not enter the snapshot"
 uv run --no-project python - "$H21_EAR" <<'PY' || fail H21 "snapshot shape/caps failed"
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -918,11 +983,12 @@ lines = data.decode().splitlines()
 assert len(data) <= 16 * 1024, len(data)
 assert lines[:10] == [
     "ears 1", "node alpha", lines[2], lines[3], "interval 30", "state running",
-    "complete yes", "component conduit release=0.9.1 adapter=1 ears=1",
+    "complete yes", lines[7],
     "mailbox -", "link -",
 ], lines[:10]
 assert lines[2].startswith("generation ")
 assert lines[3].startswith("written-at ")
+assert lines[7].startswith("component conduit release=") and lines[7].endswith(" adapter=1 ears=1"), lines[7]
 rows = [line for line in lines if line.startswith("identity name=earsafe ")]
 assert len(rows) == 1, rows
 fields = rows[0].split()
@@ -1092,4 +1158,4 @@ bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H22 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'
+printf 'Conduit H1-H23 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'
