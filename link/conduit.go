@@ -51,15 +51,21 @@ type deliveryJournalAt struct {
 }
 
 type conduitState struct {
-	generation   string
-	firstSeen    time.Time
-	attemptIndex int
-	writtenRings int
-	lastAttempt  time.Time
-	lastWritten  time.Time
-	nextAttempt  time.Time
-	failures     int
-	echoLogged   bool
+	generation         string
+	firstSeen          time.Time
+	attemptIndex       int
+	writtenRings       int
+	outstandingRings   int
+	outstandingWritten time.Time
+	targetInstance     string
+	targetPID          int
+	targetPIDStart     string
+	lastAttempt        time.Time
+	lastWritten        time.Time
+	nextAttempt        time.Time
+	lastDrainToken     string
+	failures           int
+	echoLogged         bool
 }
 
 type pendingLetter struct {
@@ -237,20 +243,40 @@ func newConduitLogger(home string) (*log.Logger, error) {
 		"khala-conduit: ", log.LstdFlags|log.Lmicroseconds), nil
 }
 
-// conduitRewrittenAfter is how long a generation whose doorbell was already
-// written waits before it may be rung again. A written frame is queued in the
-// session's Claude Code inbox and is read at the head of its next turn, so
-// re-ringing on the fast failure backoff only stacks duplicates behind a long
-// turn (measured 2026-08-16: 6 attempts / 4 visible duplicates in a 23-second
-// turn). Invariant 5: at most one outstanding wake per session — a written
-// doorbell IS the outstanding wake until the generation changes.
-func conduitRewrittenAfter() time.Duration {
-	if value := os.Getenv("KHALA_CONDUIT_TEST_REWRITE_AFTER"); value != "" {
-		if d, err := time.ParseDuration(value); err == nil && d > 0 {
-			return d
-		}
+// conduitRewrittenAfter is the bounded ladder for an outstanding doorbell.
+// A successful frame remains the target registration process's one outstanding
+// wake until a drain stamp proves consumption. A different process starts a
+// new ladder; generation changes only refresh the next scheduled frame's
+// summary. Each unconsumed write advances the ladder, while consumption resets
+// it. Invariant 5: letter arrival cannot mint frames faster than this schedule
+// merely by changing the generation.
+func conduitRewrittenAfter(outstandingRings int) time.Duration {
+	defaults := []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute}
+	value := os.Getenv("KHALA_CONDUIT_TEST_REWRITE_AFTER")
+	if value == "" {
+		return defaults[rewriteDelayIndex(outstandingRings, len(defaults))]
 	}
-	return 10 * time.Minute
+	parts := strings.Split(value, ",")
+	parsed := make([]time.Duration, 0, len(parts))
+	for _, part := range parts {
+		duration, err := time.ParseDuration(strings.TrimSpace(part))
+		if err != nil || duration <= 0 {
+			return defaults[rewriteDelayIndex(outstandingRings, len(defaults))]
+		}
+		parsed = append(parsed, duration)
+	}
+	return parsed[rewriteDelayIndex(outstandingRings, len(parsed))]
+}
+
+func rewriteDelayIndex(outstandingRings, scheduleLength int) int {
+	index := outstandingRings - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= scheduleLength {
+		index = scheduleLength - 1
+	}
+	return index
 }
 
 func conduitBackoff() []time.Duration {
@@ -992,18 +1018,48 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	state := c.states[identity]
 	if state == nil {
 		state = c.restoreState(identity, reg.InstanceID, generation)
+		state.targetInstance = reg.InstanceID
+		state.targetPID = reg.PID
+		state.targetPIDStart = reg.PIDStart
 		c.states[identity] = state
+	} else if state.targetInstance == "" && state.targetPID == 0 && state.targetPIDStart == "" {
+		state.targetInstance = reg.InstanceID
+		state.targetPID = reg.PID
+		state.targetPIDStart = reg.PIDStart
+	} else if state.targetInstance != reg.InstanceID || state.targetPID != reg.PID || state.targetPIDStart != reg.PIDStart {
+		state.targetInstance = reg.InstanceID
+		state.targetPID = reg.PID
+		state.targetPIDStart = reg.PIDStart
+		state.attemptIndex = 0
+		state.outstandingRings = 0
+		state.outstandingWritten = time.Time{}
+		state.failures = 0
+		state.echoLogged = false
+		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
+			state.nextAttempt = now
+		} else {
+			state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
+		}
 	}
+	drain := c.readDrainStamp(identity)
+	if state.outstandingRings > 0 && drain.Token != state.lastDrainToken && drain.LastDrain >= state.outstandingWritten.Unix() {
+		state.outstandingRings = 0
+		state.outstandingWritten = time.Time{}
+		state.nextAttempt = now
+	}
+	state.lastDrainToken = drain.Token
 	if state.generation != generation {
 		state.generation = generation
 		state.firstSeen = now
 		state.attemptIndex = 0
 		state.writtenRings = 0
 		state.echoLogged = false
-		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
-			state.nextAttempt = now
-		} else {
-			state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
+		if state.outstandingRings == 0 {
+			if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
+				state.nextAttempt = now
+			} else {
+				state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
+			}
 		}
 		if err := c.writeEarSidecar(identity, *state); err != nil {
 			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
@@ -1015,6 +1071,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	}
 	state.attemptIndex++
 	attemptIndex := state.attemptIndex
+	retry := state.writtenRings
 	c.statesMu.Unlock()
 
 	attemptID, err := newUUID()
@@ -1040,7 +1097,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		journal.Error = "registration is not ready and conduit-verified"
 		deliveryErr = errors.New(journal.Error)
 	} else {
-		frame := c.frame(identity, generation, attemptID, attemptIndex-1, letters)
+		frame := c.frame(identity, generation, attemptID, retry, letters)
 		if conduitBeforeDoorbellWrite != nil {
 			conduitBeforeDoorbellWrite(identity)
 		}
@@ -1057,7 +1114,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		if reg.ChannelSocket != "" {
 			deliveryErr = c.verifyChannelSocket(reg)
 			if deliveryErr == nil {
-				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, attemptIndex-1, letters))
+				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, retry, letters))
 			}
 			if deliveryErr == nil {
 				journal.Via = "channel"
@@ -1110,12 +1167,12 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	c.statesMu.Lock()
 	state.lastAttempt = now
 	if journal.Status == "written" {
-		// The doorbell is queued in the session; it is the one outstanding
-		// wake for this generation. Re-ring only much later (missed/dropped).
-		state.nextAttempt = now.Add(conduitRewrittenAfter())
 		state.failures = 0
 		state.lastWritten = now
+		state.outstandingWritten = now
 		state.writtenRings++
+		state.outstandingRings++
+		state.nextAttempt = now.Add(conduitRewrittenAfter(state.outstandingRings))
 	} else {
 		delayIndex := attemptIndex - 1
 		if delayIndex >= len(c.backoff) {
@@ -1148,6 +1205,8 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			state.writtenRings = sidecar.WrittenRings
 		}
 	}
+	drain := c.readDrainStamp(identity)
+	state.lastDrainToken = drain.Token
 	dir := filepath.Join(c.runtime, "deliveries", identity, instance)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1165,11 +1224,11 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			continue
 		}
 		var journal deliveryJournal
-		if readJSON(filepath.Join(dir, entry.Name()), &journal) != nil || journal.BootID != c.bootID {
+		if readJSON(filepath.Join(dir, entry.Name()), &journal) != nil || journal.BootID != c.bootID || journal.Identity != identity || journal.InstanceID != instance {
 			continue
 		}
-		attempted, err := time.Parse(time.RFC3339Nano, journal.AttemptedAt)
-		if err == nil {
+		attempted, parseErr := time.Parse(time.RFC3339Nano, journal.AttemptedAt)
+		if parseErr == nil {
 			journals = append(journals, deliveryJournalAt{journal: journal, at: attempted})
 		}
 	}
@@ -1180,13 +1239,20 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		return state
 	}
 	sort.Slice(journals, func(i, j int) bool { return journals[i].at.Before(journals[j].at) })
-	var latest deliveryJournalAt
+	var latest, latestCurrent deliveryJournalAt
 	for _, item := range journals {
+		latest = item
 		if item.journal.Status == "failed" {
 			state.failures++
 		} else if item.journal.Status == "written" {
 			state.failures = 0
-			state.lastWritten = item.at
+			if state.lastWritten.IsZero() || item.at.After(state.lastWritten) {
+				state.lastWritten = item.at
+			}
+			if drain.LastDrain < item.at.Unix() {
+				state.outstandingRings++
+				state.outstandingWritten = item.at
+			}
 			if !sidecarCurrent && item.journal.Generation == generation {
 				state.writtenRings++
 			}
@@ -1199,13 +1265,13 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			if state.firstSeen.IsZero() || firstSeen.Before(state.firstSeen) {
 				state.firstSeen = firstSeen
 			}
-			latest = item
+			latestCurrent = item
 			if item.journal.Via == "channel+socket" {
 				state.echoLogged = true
 			}
 		}
 	}
-	if latest.at.IsZero() {
+	if latestCurrent.at.IsZero() {
 		if generation != "" {
 			if state.firstSeen.IsZero() {
 				state.firstSeen = time.Now()
@@ -1214,25 +1280,22 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 				c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
 			}
 		}
-		return state
+	} else {
+		state.attemptIndex = latestCurrent.journal.AttemptIndex
 	}
-	state.attemptIndex = latest.journal.AttemptIndex
 	state.lastAttempt = latest.at
-	if latest.journal.Status == "written" {
-		state.nextAttempt = latest.at.Add(conduitRewrittenAfter())
-		if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
-			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+	if latest.journal.Status == "failed" && (state.lastWritten.IsZero() || latest.at.After(state.lastWritten)) {
+		index := latest.journal.AttemptIndex - 1
+		if index < 0 {
+			index = 0
 		}
-		return state
+		if index >= len(c.backoff) {
+			index = len(c.backoff) - 1
+		}
+		state.nextAttempt = latest.at.Add(c.backoff[index])
+	} else if state.outstandingRings > 0 {
+		state.nextAttempt = state.outstandingWritten.Add(conduitRewrittenAfter(state.outstandingRings))
 	}
-	index := state.attemptIndex - 1
-	if index < 0 {
-		index = 0
-	}
-	if index >= len(c.backoff) {
-		index = len(c.backoff) - 1
-	}
-	state.nextAttempt = latest.at.Add(c.backoff[index])
 	if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
 		c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
 	}
