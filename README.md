@@ -288,7 +288,11 @@ there instead of the CC inbox socket, rendering a short `← khala · sender: �
 without the socket protocol header and exposing `khala_drain` / `khala_reply`.
 The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes and trusting the parent's registry over a stale environment session id.
 A failed channel attempt is logged and journaled before that attempt falls back
-to the socket. Channel events are always `next`, so `--later` is represented as
+to the socket. On macOS the conduit and the channel child must agree on a
+process start string; since 0.9.8 the link reads it under the C locale, so a
+launchd conduit and a session running in another locale no longer disagree
+(the symptom was every doorbell logging "channel pid/start mismatch" and
+arriving as a socket peer message instead of the short channel line). Channel events are always `next`, so `--later` is represented as
 `later="1"` metadata for the model to defer rather than changing the channel
 queue priority.
 

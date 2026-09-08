@@ -329,7 +329,7 @@ func processStart(pid int, bootID string) (string, error) {
 		}
 		return bootID + ":" + fields[19], nil
 	}
-	data, err := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid)).Output()
+	data, err := processStartCommand(pid).Output()
 	if err != nil {
 		return "", err
 	}
@@ -338,6 +338,17 @@ func processStart(pid int, bootID string) (string, error) {
 		return "", errors.New("empty process start time")
 	}
 	return bootID + ":" + value, nil
+}
+
+// processStartCommand reads a process start time on darwin. `ps -o lstart=`
+// renders the timestamp in the caller's locale, so a channel child spawned
+// under a Korean-locale session and a conduit under launchd (no LANG) would
+// record two different strings for one process and never match. The locale
+// is pinned so every writer and reader produces the same bytes.
+func processStartCommand(pid int) *exec.Cmd {
+	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C", "LC_TIME=C")
+	return cmd
 }
 
 func processParent(pid int) (int, error) {
