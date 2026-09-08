@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -488,6 +490,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	}
 	digest := sha256.Sum256(data)
 	id := transferID(c.class, c.stream, c.node, c.session, c.basename, digest)
+	removeOriginAfterStored := p.role == "dial" && c.class == "spool" && fireAndForgetEnvelope(data)
 	if p.origins.has(c.key(), id) {
 		return nil
 	}
@@ -495,7 +498,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 		return nil
 	}
 	if p.isKnown(c.key(), id) {
-		if p.role == "serve" && c.deleteAfterStored {
+		if (p.role == "serve" && c.deleteAfterStored) || removeOriginAfterStored {
 			if err := removeTransit(c.path, digest); err != nil && !os.IsNotExist(err) {
 				p.logger.Printf("refused reappeared transit unlink %s: %v", c.path, err)
 			} else {
@@ -555,17 +558,34 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 			p.logger.Printf("touch link.fresh after received STORED failed: %v", err)
 		}
 	}
-	if c.deleteAfterStored {
-		if p.role != "serve" {
+	if c.deleteAfterStored || removeOriginAfterStored {
+		if p.role != "serve" && !removeOriginAfterStored {
 			return errors.New("internal ownership error: dial reached transit unlink")
 		}
 		if err := removeTransit(c.path, digest); err != nil && !os.IsNotExist(err) {
 			p.logger.Printf("refused transit unlink %s after STORED: %v", c.path, err)
+		} else if p.role == "dial" {
+			p.logger.Printf("removed origin infrastructure %s after hub STORED", c.path)
 		} else {
 			p.logger.Printf("removed hub transit %s after peer STORED (C1 depends on C3)", c.path)
 		}
 	}
 	return nil
+}
+
+func fireAndForgetEnvelope(data []byte) bool {
+	typeValue := ""
+	scanner := bufio.NewScanner(io.LimitReader(bytes.NewReader(data), 64<<10))
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(line, "Type: ") {
+			typeValue = strings.TrimSpace(strings.TrimPrefix(line, "Type: "))
+		}
+	}
+	return typeValue == "ack" || typeValue == "bounce"
 }
 
 func (p *pump) waitResponse(ctx context.Context, id string) (frame, error) {

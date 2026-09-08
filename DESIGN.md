@@ -615,6 +615,9 @@ identity name=ink principal=session listening=no route=none phase=ready cc=2.1.2
 - `listening=yes|no` — **yes의 정의 = ring 게이트 통과**(link/conduit.go:830-832: `conduitVerified ∧ phase
   ready ∧ lease.instance==reg.instance ∧ lease.epoch>0 ∧ lease.epoch==reg.leaseEpoch ∧ pid·pidStart·
   claudeSessionId 일치`). 그 외 전부 `no`.
+- **프로세스 시작 문자열**(pidStart·channelPIDStart)은 linux는 `/proc/<pid>/stat` 22번째 필드, darwin은 `ps -o lstart=`를
+  **C 로케일로 고정해** 읽는다(0.9.8). darwin에서 호출자 로케일대로 읽으면 launchd 아래 conduit과 세션 로케일(ko_KR)의
+  채널 자식이 같은 pid에 다른 문자열을 남겨 채널 검증이 영구 실패하고 소켓으로 후퇴했다(mini clawd, 2026-09-07).
 - `route=socket|channel|channel+socket|none` — 참고용: `maybeRing`이 지금 택할 경로(link/conduit.go:853-886의
   선택 그대로: 채널 소켓이 있고 검증됐으면 `channel`, 있지만 미검증이면 `channel+socket`(에코), 없으면
   `socket`); `listening=no`면 `none`.
@@ -858,7 +861,8 @@ spool 사본의 수명 (타입별):
 
 - **message 사본 = 재전송 원천** — ack가 원본을 소비할 때 함께 삭제된다 (위).
 - **ack/bounce 사본 = fire-and-forget** — (b) push 성공 시 삭제. 유실은 원문
-  재전송 → dedup → ack 재생성이 치유한다 (§5.2).
+  재전송 → dedup → ack 재생성이 치유한다 (§5.2). native link도 hub의 `STORED` 뒤
+  발신(origin) 사본을 삭제해 rsync 경로와 같은 수명을 적용한다.
 - **notice 사본 = 발신 노드가 `Expires`까지 보관** (0.8.0, GPT-Pro P0-1) — 우체통이
   바이트를 받은 것은 배달이 아니다(R4). 수신 노드는 Id로 중복을 흡수하고, 만료된
   사본은 `prune_expired_notices`가 지운다.

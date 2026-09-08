@@ -591,8 +591,8 @@ func recoverStaleTemps(home string, logger loggerLike) error {
 	return syncDir(quarantineDir)
 }
 
-// removeTransit is the only unlink call in the program. Its caller proves role
-// serve and invokes it only after the destination spoke's STORED frame.
+// removeTransit is the only unlink call in the program. Its caller invokes it
+// only for a disposable transit/origin copy after the destination's STORED frame.
 func removeTransit(path string, offered [sha256.Size]byte) error {
 	current, err := digestFile(path)
 	if err != nil {
