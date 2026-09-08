@@ -93,6 +93,139 @@ func TestMindOfferRequiresMinorTwo(t *testing.T) {
 	}
 }
 
+func TestDialSpoolCopyLifetimeAfterStored(t *testing.T) {
+	tests := []struct {
+		name             string
+		data             []byte
+		rewriteAfterData []byte
+		wantGone         bool
+	}{
+		{
+			name:     "ack",
+			data:     []byte("Khala: 0.1\nType: ack\n\nack body\n"),
+			wantGone: true,
+		},
+		{
+			name:     "bounce",
+			data:     []byte("Khala: 0.1\nType: bounce\n\nbounce body\n"),
+			wantGone: true,
+		},
+		{
+			name: "message",
+			data: []byte("Khala: 0.1\nType: message\n\nmessage body\n"),
+		},
+		{
+			name: "notice",
+			data: []byte("Khala: 0.1\nType: notice\n\nnotice body\n"),
+		},
+		{
+			name:             "changed ack",
+			data:             []byte("Khala: 0.1\nType: ack\n\noriginal\n"),
+			rewriteAfterData: []byte("Khala: 0.1\nType: ack\n\nchanged\n"),
+		},
+		{
+			name: "body type is not a header",
+			data: []byte("Khala: 0.1\n\nType: ack\n"),
+		},
+		{
+			name: "type beyond header read limit",
+			data: []byte(strings.Repeat("X: padding\n", (64<<10)/len("X: padding\n")+1) + "Type: ack\n\nbody\n"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			home := testKhalaHome(t)
+			path := filepath.Join(home, "spool", "for", "b200", "1700000000.1.1.sender@alpha")
+			if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, tc.data, 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			local, remote := net.Pipe()
+			defer local.Close()
+			defer remote.Close()
+			p := &pump{
+				home: home, role: "dial", maxObject: 1 << 20,
+				writer: newFrameWriter(local), logger: log.New(io.Discard, "", 0),
+				responses: make(chan frame, 2), origins: newOriginSet(),
+				known: make(map[string]string), rejected: make(map[string]string),
+			}
+			type peerResult struct {
+				data []byte
+				err  error
+			}
+			peerDone := make(chan peerResult, 1)
+			go func() {
+				r := bufio.NewReader(remote)
+				f, err := readFrame(r, 1<<20)
+				if err != nil {
+					peerDone <- peerResult{err: err}
+					return
+				}
+				o, err := decodeOffer(f)
+				if err != nil {
+					peerDone <- peerResult{err: err}
+					return
+				}
+				p.responses <- idFrame(frameNeed, o.ID)
+				f, err = readFrame(r, 1<<20)
+				if err != nil {
+					peerDone <- peerResult{err: err}
+					return
+				}
+				id, data, err := decodeData(f)
+				if err != nil || id != o.ID {
+					peerDone <- peerResult{err: fmt.Errorf("DATA id=%q want=%q: %v", id, o.ID, err)}
+					return
+				}
+				if tc.rewriteAfterData != nil {
+					if err := os.WriteFile(path, tc.rewriteAfterData, 0600); err != nil {
+						peerDone <- peerResult{err: err}
+						return
+					}
+				}
+				p.responses <- idFrame(frameStored, o.ID)
+				peerDone <- peerResult{data: data}
+			}()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c := candidate{class: "spool", node: "b200", basename: filepath.Base(path), path: path}
+			if err := p.sendCandidate(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			peer := <-peerDone
+			if peer.err != nil {
+				t.Fatal(peer.err)
+			}
+			if !bytes.Equal(peer.data, tc.data) {
+				t.Fatalf("hub received %q, want %q", peer.data, tc.data)
+			}
+			_, err := os.Stat(path)
+			if tc.wantGone {
+				if !os.IsNotExist(err) {
+					t.Fatalf("dial %s copy remains after STORED: %v", tc.name, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("dial %s copy missing after STORED: %v", tc.name, err)
+			}
+			if tc.rewriteAfterData != nil {
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, tc.rewriteAfterData) {
+					t.Fatalf("changed copy=%q want=%q", got, tc.rewriteAfterData)
+				}
+			}
+		})
+	}
+}
+
 func TestMindInstallTriggersBrainWithoutTouchingFreshMarker(t *testing.T) {
 	home := testKhalaHome(t)
 	fresh := filepath.Join(home, "run", "link.fresh")
