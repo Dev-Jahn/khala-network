@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.9
+KHALA_VERSION=0.9.10
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -359,6 +359,123 @@ header_value() {
             "$key: "*) printf '%s\n' "${header_line#"$key: "}" ;;
         esac
     done < "$file"
+}
+
+# Jev triage (review/jev-triage-r1.md, DESIGN §9.6): the conduit writes one
+# advisory tag line per message letter to run/triage/<identity>/<id>.tag; the
+# CLI only displays it. triage_dir_ready succeeds when the identity's tag
+# directory is a real directory (no symlink anywhere below run/), and only then
+# do list views grow a Triage column, so a node without triage prints exactly
+# what it printed before.
+triage_dir_ready() {
+    triage_dir=$KHALA_ROOT/run/triage/$1
+    [ ! -L "$KHALA_ROOT/run" ] && [ ! -L "$KHALA_ROOT/run/triage" ] && \
+        [ ! -L "$triage_dir" ] && [ -d "$triage_dir" ]
+}
+
+# Prints the tag of letter $2 in $triage_dir (set by triage_dir_ready) when the
+# tag file is a regular non-symlink file holding exactly one newline-terminated
+# line that is "fyi" or an ordered subset of action,reply,urgent. Anything else
+# is "no triage": return 1 without output or error.
+triage_tag() {
+    triage_file=$triage_dir/$1.tag
+    [ ! -L "$triage_file" ] && [ -f "$triage_file" ] || return 1
+    triage_line=
+    triage_extra=
+    {
+        IFS= read -r triage_line || return 1
+        if IFS= read -r triage_extra || [ -n "$triage_extra" ]; then
+            return 1
+        fi
+    } < "$triage_file" 2>/dev/null || return 1
+    case "$triage_line" in
+        fyi|action|reply|urgent|action,reply|action,urgent|reply,urgent|action,reply,urgent)
+            printf '%s\n' "$triage_line"
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# The Triage column value for a letter file of type $2 with basename $1:
+# the tag for message letters, "-" otherwise or when there is none.
+triage_column() {
+    if [ "$2" = message ] && triage_tag "$1"; then
+        return 0
+    fi
+    printf '%s\n' -
+}
+
+file_mode_octal() {
+    mode_path=$1
+    mode_value=$(stat -c %a "$mode_path" 2>/dev/null) || mode_value=
+    case "$mode_value" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s\n' "$mode_value"; return 0 ;;
+    esac
+    mode_value=$(stat -f %Lp "$mode_path" 2>/dev/null) || mode_value=
+    case "$mode_value" in
+        [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s\n' "$mode_value"; return 0 ;;
+    esac
+    return 1
+}
+
+# One status line for $KHALA_ROOT/triage.conf. Only model and threshold are
+# read; key/key-file lines are skipped unread and never printed.
+triage_status_line() {
+    triage_conf=$KHALA_ROOT/triage.conf
+    if [ ! -e "$triage_conf" ] && [ ! -L "$triage_conf" ]; then
+        printf '%s\n' 'triage: off'
+        return 0
+    fi
+    triage_conf_mode=
+    if [ ! -L "$triage_conf" ] && [ -f "$triage_conf" ]; then
+        triage_conf_mode=$(file_mode_octal "$triage_conf") || triage_conf_mode=
+    fi
+    case "$triage_conf_mode" in
+        600|0600) ;;
+        *)
+            printf '%s\n' 'triage: off (triage.conf must be a regular 0600 file)'
+            return 0
+            ;;
+    esac
+    triage_model=jev-latest
+    triage_threshold=0.7
+    triage_bad=
+    while IFS=' 	' read -r triage_key triage_value || [ -n "$triage_key" ]; do
+        case "$triage_key" in
+            model|threshold) ;;
+            *) continue ;;
+        esac
+        triage_value=${triage_value%%#*}
+        while :; do
+            case "$triage_value" in
+                *' '|*"$TAB") triage_value=${triage_value%?} ;;
+                *) break ;;
+            esac
+        done
+        if [ "$triage_key" = model ]; then
+            case "$triage_value" in
+                ''|*[!A-Za-z0-9._-]*) triage_bad=${triage_bad:-model} ;;
+                *)
+                    if [ "${#triage_value}" -le 64 ]; then
+                        triage_model=$triage_value
+                    else
+                        triage_bad=${triage_bad:-model}
+                    fi
+                    ;;
+            esac
+        else
+            case "$triage_value" in
+                ''|.|*.*.*|*[!0-9.]*) triage_bad=${triage_bad:-threshold} ;;
+                *) triage_threshold=$triage_value ;;
+            esac
+        fi
+    done < "$triage_conf"
+    if [ -n "$triage_bad" ]; then
+        printf 'triage: invalid (triage.conf %s)\n' "$triage_bad"
+        return 0
+    fi
+    printf 'triage: on (%s, threshold %s)\n' "$triage_model" "$triage_threshold"
 }
 
 # Number of lines anywhere in the file (header and body) starting with the
@@ -5154,7 +5271,22 @@ cmd_status() {
         error "khala status의 conduit 상태에는 khala-link 바이너리가 필요합니다"
         return 1
     }
-    "$LINK_BINARY" runtime status
+    status_out=$(mktemp "$TMP_DIR/status.XXXXXX") || return 1
+    "$LINK_BINARY" runtime status > "$status_out"
+    status_rc=$?
+    status_triage=$(triage_status_line)
+    status_seen=0
+    while IFS= read -r status_line || [ -n "$status_line" ]; do
+        printf '%s\n' "$status_line"
+        case "$status_seen:$status_line" in
+            "0:runtime: "*)
+                printf '%s\n' "$status_triage"
+                status_seen=1
+                ;;
+        esac
+    done < "$status_out"
+    rm -f "$status_out"
+    return "$status_rc"
 }
 
 cmd_dashboard() {
@@ -5673,13 +5805,22 @@ cmd_inbox() {
         error "inbox 디렉터리를 만들지 못했습니다"
         return 1
     fi
+    inbox_triage=0
+    if triage_dir_ready "$inbox_session"; then
+        inbox_triage=1
+    fi
     if [ "$inbox_mode" = summary ]; then
         for inbox_file in "$inbox_dir"/new/*; do
             [ -f "$inbox_file" ] || continue
             list_id=$(header_value Id "$inbox_file")
             list_from=$(header_value From "$inbox_file")
             list_type=$(header_value Type "$inbox_file")
-            printf '%s\t%s\t%s\n' "$list_id" "$list_from" "$list_type"
+            if [ "$inbox_triage" -eq 1 ]; then
+                printf '%s\t%s\t%s\t%s\n' "$list_id" "$list_from" "$list_type" \
+                    "$(triage_column "$(basename "$inbox_file")" "$list_type")"
+            else
+                printf '%s\t%s\t%s\n' "$list_id" "$list_from" "$list_type"
+            fi
         done
         return 0
     fi
@@ -5702,8 +5843,15 @@ cmd_inbox() {
                     list_from=$(header_value From "$inbox_file")
                     list_subject=$(header_value Subject "$inbox_file")
                     list_date=$(header_value Date "$inbox_file")
-                    printf '%s\t%s\t%s\t%s\n' "$list_id" "$list_from" \
-                        "$list_subject" "$list_date"
+                    if [ "$inbox_triage" -eq 1 ]; then
+                        printf '%s\t%s\t%s\t%s\t%s\n' "$list_id" "$list_from" \
+                            "$list_subject" "$list_date" \
+                            "$(triage_column "$(basename "$inbox_file")" \
+                                "$(header_value Type "$inbox_file")")"
+                    else
+                        printf '%s\t%s\t%s\t%s\n' "$list_id" "$list_from" \
+                            "$list_subject" "$list_date"
+                    fi
                 done || { rm -f "$inbox_list_tmp"; return 1; }
         done
         rm -f "$inbox_list_tmp"
@@ -5770,8 +5918,17 @@ cmd_inbox() {
                 drained_letters=$((drained_letters + 1))
                 drained_ring=$((drained_ring + 1))
                 drained_bytes=$((drained_bytes + file_bytes))
-                printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
-                if [ "$(header_value Type "$inbox_cur_file")" = operator ]; then
+                inbox_letter_type=$(header_value Type "$inbox_cur_file")
+                inbox_letter_tag=
+                if [ "$inbox_triage" -eq 1 ] && [ "$inbox_letter_type" = message ]; then
+                    inbox_letter_tag=$(triage_tag "$inbox_basename") || inbox_letter_tag=
+                fi
+                if [ -n "$inbox_letter_tag" ]; then
+                    printf '%s\n' "--- letter $inbox_basename --- · $inbox_letter_tag" 2>/dev/null || :
+                else
+                    printf '%s\n' "--- letter $inbox_basename ---" 2>/dev/null || :
+                fi
+                if [ "$inbox_letter_type" = operator ]; then
                     print_letter_with_auth "$inbox_cur_file" unverified 2>/dev/null || :
                 else
                     cat "$inbox_cur_file" 2>/dev/null || :

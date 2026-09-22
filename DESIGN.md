@@ -446,11 +446,37 @@ presence/<name>@<node>.watcher # watcher 선언/last-notify/dead-man 상태 (6�
 presence/conduit@<node>.ear # 노드 conduit의 귀 스냅샷
 run/drained/<identity>     # drain 1: epoch, 전후 generation, ring/info/streams, ok|partial
 run/turns/<identity>       # turn 1 <epoch>; Stop hook이 쓰고 conduit이 읽는 노드 로컬 스탬프(복제 안 됨)
+run/triage/<identity>/<id>.{json,tag} # Jev 판정 캐시; conduit이 쓰고 drain·list가 .tag만 읽는 노드 로컬 파일(복제 안 됨)
 run/brain.lock.d/          # shared reconcile/drain/ack-read lock
 run/send-request.lock.d/   # serializes retry ledger writes and keyed sends
 log/delivered             # dedup 로그: "<epoch> <msg_id>" 줄
 tmp/
 ```
+
+#### Jev 판정 캐시(triage)
+
+편지 분류는 **자문(advisory)** 이다(설계: `review/jev-triage-r1.md`). conduit이 새 `Type: message` 편지를 외부
+판정 모델(TypeSafe Jev)에 한 번 묻고 결과를 `run/triage/<identity>/<id>.json`(확률·모델·digest)과 한 줄
+`<id>.tag`로 남긴다. 임계값 적용은 conduit 한 곳이며, CLI는 `.tag`를 **표시만** 한다.
+
+- 태그 세 개: `action`(수신 세션이 무언가 하거나 답해야 함) · `reply`(발신자가 답장 편지를 기대함) ·
+  `urgent`(막혀 있거나 즉시 처리를 요구함). 해당하는 것을 이 순서로 쉼표로 잇고(`action,urgent`), 셋 다 아니면
+  `fyi`. `.tag`는 심링크가 아닌 일반 파일에 LF로 끝나는 64바이트 이하 한 줄이며, 이 문법에 맞지 않는 파일(빈 파일,
+  모르는 단어, 순서 뒤바뀜, 여러 줄, 심링크, 디렉터리)과 심링크인 `run/triage/<identity>`는 **판정 없음**으로
+  조용히 취급한다.
+- 표시: drain의 편지 줄이 `--- letter <id> --- · action,urgent`가 되고, `khala inbox`·`khala inbox list`
+  행 끝에 Triage 열(태그, 없으면 `-`)이 붙는다. 열은 `run/triage/<identity>`가 실제 디렉터리일 때만 생기므로
+  판정이 꺼진 노드의 출력은 0.9.9와 바이트 동일하다. `Type: operator`·`notice` 편지는 태그 파일이 있어도 표시하지
+  않는다.
+- **판정은 힌트일 뿐이다**: 초인종을 억제하거나 미루지 않고, 편지를 숨기거나 접거나 지우지 않으며, operator
+  Auth·R13 경계·권한 판단에 절대 쓰지 않는다(state 안 적대적 문장에 취약). 본문을 읽는 것은 세션의 의무로 남는다.
+- 설정 `$KHALA_HOME/triage.conf`(`key value` 줄; 파일이 없으면 off): `provider`, `key` 또는 `key-file`,
+  `model`(기본 `jev-latest`), `endpoint`, `max-per-hour`, `threshold`(기본 0.7), `threshold-action` ·
+  `threshold-reply` · `threshold-urgent`(개별). **심링크가 아닌 0600 일반 파일이어야 한다**. 키는 conduit만
+  읽는다 — CLI는 `key`/`key-file` 줄을 해석하지도 출력하지도 않는다. `khala status`는 `runtime:` 줄 바로 뒤에
+  `triage: off` / `triage: on (<model>, threshold <t>)` / `triage: off (triage.conf must be a regular 0600
+  file)`를 찍고, `model`(64자 이하 `[A-Za-z0-9._-]`)·`threshold`(숫자) 값이 형식에 맞지 않으면
+  `triage: invalid (triage.conf <key>)`를 찍는다. `.ear` 스냅샷에는 on/off도 싣지 않는다.
 
 #### Pull-only mailbox clients
 
