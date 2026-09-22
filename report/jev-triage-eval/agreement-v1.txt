@@ -1,0 +1,50 @@
+n=48
+
+needs_action: yes=23
+  thr 0.3: acc 0.85 prec 0.77 rec 1.00  (tp23 fp7 fn0 tn18)
+  thr 0.4: acc 0.85 prec 0.77 rec 1.00  (tp23 fp7 fn0 tn18)
+  thr 0.5: acc 0.85 prec 0.77 rec 1.00  (tp23 fp7 fn0 tn18)
+  thr 0.6: acc 0.88 prec 0.81 rec 0.96  (tp22 fp5 fn1 tn20)
+  thr 0.7: acc 0.90 prec 0.91 rec 0.87  (tp20 fp2 fn3 tn23)
+
+awaits_reply: yes=9
+  thr 0.3: acc 0.83 prec 0.53 rec 1.00  (tp9 fp8 fn0 tn31)
+  thr 0.4: acc 0.90 prec 0.64 rec 1.00  (tp9 fp5 fn0 tn34)
+  thr 0.5: acc 0.90 prec 0.67 rec 0.89  (tp8 fp4 fn1 tn35)
+  thr 0.6: acc 0.92 prec 0.73 rec 0.89  (tp8 fp3 fn1 tn36)
+  thr 0.7: acc 0.94 prec 0.88 rec 0.78  (tp7 fp1 fn2 tn38)
+
+time_sensitive: yes=6
+  thr 0.3: acc 0.75 prec 0.33 rec 1.00  (tp6 fp12 fn0 tn30)
+  thr 0.4: acc 0.79 prec 0.38 rec 1.00  (tp6 fp10 fn0 tn32)
+  thr 0.5: acc 0.88 prec 0.50 rec 1.00  (tp6 fp6 fn0 tn36)
+  thr 0.6: acc 0.88 prec 0.50 rec 1.00  (tp6 fp6 fn0 tn36)
+  thr 0.7: acc 0.98 prec 1.00 rec 0.83  (tp5 fp0 fn1 tn42)
+
+kind:
+  accuracy 0.77
+  gold\jev question  request   report     info      ack
+  question         2        0        4        0        0
+  request          0        8        4        1        0
+  report           0        0       16        0        0
+  info             0        0        2       11        0
+
+kind accuracy by confidence:
+  conf [0,0.5): n=4 acc=0.25
+  conf [0.5,0.8): n=13 acc=0.77
+  conf [0.8,1.01): n=31 acc=0.84
+
+actionable-vs-not (kind collapsed): acc 0.81
+
+disagreements (kind):
+  01 gold=question jev=report   conf=0.99 action=0.96 | Bring-up done; five open items await main's decision
+  02 gold=request  jev=report   conf=0.91 action=0.59 | GO verdict; three text fixes before launch; no reply
+  03 gold=question jev=report   conf=1.00 action=0.93 | Progress report; asks rulings on gate fails, CUTLASS version
+  06 gold=info     jev=report   conf=0.51 action=0.26 | 0.8.1 release notice; reply not needed
+  15 gold=request  jev=report   conf=0.90 action=0.90 | GO-rider; fixes before LINK launch; no reply
+  22 gold=info     jev=report   conf=0.46 action=0.69 | Acknowledges, adds decision criteria for later measurement
+  26 gold=question jev=report   conf=0.33 action=0.97 | Blocker OOM; asks choose control recipe option
+  31 gold=request  jev=report   conf=0.40 action=0.95 | Send test letter before listener expires ~16:11
+  33 gold=request  jev=report   conf=0.73 action=0.64 | Queue batch: one failure needs fixing
+  34 gold=question jev=report   conf=1.00 action=0.91 | Results reported; asks whether to create paths.env
+  41 gold=request  jev=info     conf=0.57 action=0.81 | Update cc-self when convenient; reply not required

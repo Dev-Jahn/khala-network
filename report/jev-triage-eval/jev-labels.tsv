@@ -1,0 +1,49 @@
+id	needs_action	awaits_reply	time_sensitive	kind	note
+01	yes	yes	yes	question	Bring-up done; five open items await main's decision
+02	yes	no	no	request	GO verdict; three text fixes before launch; no reply
+03	yes	yes	no	question	Progress report; asks rulings on gate fails, CUTLASS version
+04	no	no	no	report	Install verification complete, conduit and link up
+05	yes	no	no	report	UTF-8 fix applied; asks carry upstream or check b200
+06	no	no	no	info	0.8.1 release notice; reply not needed
+07	no	no	no	report	Post-merge rebuild and gate recheck results
+08	yes	yes	yes	question	Pin choice and VRAM probe pending before launch
+09	yes	no	yes	request	Automated anomaly alert; diagnosis needed
+10	yes	no	no	request	Queue job failed; investigate, fix, requeue
+11	yes	no	no	report	Fixes applied and verified; recommends guard on b200 copy
+12	yes	no	no	report	Tests pass; asks ensure commit lands on main
+13	no	no	no	report	Forwarded evidence and hypothesis for doorbell bug
+14	no	no	no	report	Answers watcher cleanup inquiry
+15	yes	no	no	request	GO-rider; fixes before LINK launch; no reply
+16	no	no	no	info	cc-self 1.5.2 pinned; reply not required
+17	no	no	no	info	Queue job start notice
+18	no	no	no	report	Incident closed; root cause identified
+19	no	no	no	info	Doorbell path test message
+20	yes	no	no	request	Asks restart b200 conduit on 0.9.7 after release
+21	yes	yes	no	request	Assigns next tasks; report results via khala
+22	no	no	no	info	Acknowledges, adds decision criteria for later measurement
+23	no	no	no	info	Doorbell path test message
+24	yes	no	no	request	Asks review r3 diff; no reply if no objection
+25	yes	yes	no	question	Asks three status questions on D16; not urgent
+26	yes	yes	yes	question	Blocker OOM; asks choose control recipe option
+27	no	no	no	info	Helper test message, priority later
+28	no	no	no	report	Correction: watch workaround does not work
+29	yes	yes	no	request	Asks 0.9.7 accept neutral session env var
+30	no	no	no	info	Post-stage sanity test notice
+31	yes	no	yes	request	Send test letter before listener expires ~16:11
+32	no	no	no	report	Confirms proposal adopted; release progress
+33	yes	no	no	request	Queue batch: one failure needs fixing
+34	yes	yes	no	question	Results reported; asks whether to create paths.env
+35	no	no	no	report	NFS lock-loss root cause findings shared
+36	yes	yes	no	request	Agrees; specifies patch hand-off format and conditions
+37	no	no	no	info	Test message from ChatGPT session
+38	no	no	no	report	NFS incident resolved; residual is user's call
+39	no	no	no	info	Post-stage sanity test notice
+40	yes	no	no	report	Answers defects; instructs update and restart; no reply
+41	yes	no	no	request	Update cc-self when convenient; reply not required
+42	no	no	no	report	Requested changes implemented, unreleased; reply not required
+43	no	no	no	report	Answers five questions about watcher pattern
+44	yes	no	yes	request	Automated anomaly alert; diagnosis needed
+45	no	no	no	info	Explicitly informational Jev ideas; decision is recipient's
+46	no	no	no	report	Answers CUTLASS version; explains alignment unnecessary
+47	no	no	no	info	Hub behavior flagged; explicitly no action needed
+48	no	no	no	info	Helper test message, priority later

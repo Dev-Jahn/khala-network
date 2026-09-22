@@ -1,0 +1,55 @@
+n=48
+
+needs_action: yes=23
+  thr 0.3: acc 0.85 prec 0.77 rec 1.00  (tp23 fp7 fn0 tn18)
+  thr 0.4: acc 0.85 prec 0.77 rec 1.00  (tp23 fp7 fn0 tn18)
+  thr 0.5: acc 0.88 prec 0.79 rec 1.00  (tp23 fp6 fn0 tn19)
+  thr 0.6: acc 0.90 prec 0.85 rec 0.96  (tp22 fp4 fn1 tn21)
+  thr 0.7: acc 0.88 prec 0.87 rec 0.87  (tp20 fp3 fn3 tn22)
+
+awaits_reply: yes=9
+  thr 0.3: acc 0.83 prec 0.53 rec 1.00  (tp9 fp8 fn0 tn31)
+  thr 0.4: acc 0.90 prec 0.64 rec 1.00  (tp9 fp5 fn0 tn34)
+  thr 0.5: acc 0.90 prec 0.67 rec 0.89  (tp8 fp4 fn1 tn35)
+  thr 0.6: acc 0.92 prec 0.73 rec 0.89  (tp8 fp3 fn1 tn36)
+  thr 0.7: acc 0.90 prec 0.75 rec 0.67  (tp6 fp2 fn3 tn37)
+
+time_sensitive: yes=6
+  thr 0.3: acc 0.75 prec 0.33 rec 1.00  (tp6 fp12 fn0 tn30)
+  thr 0.4: acc 0.83 prec 0.43 rec 1.00  (tp6 fp8 fn0 tn34)
+  thr 0.5: acc 0.85 prec 0.46 rec 1.00  (tp6 fp7 fn0 tn35)
+  thr 0.6: acc 0.90 prec 0.55 rec 1.00  (tp6 fp5 fn0 tn37)
+  thr 0.7: acc 0.98 prec 1.00 rec 0.83  (tp5 fp0 fn1 tn42)
+
+kind:
+  accuracy 0.67
+  gold\jev question  request   report     info      ack
+  question         5        1        0        0        0
+  request          1       12        0        0        0
+  report           2        7        6        1        0
+  info             0        2        2        9        0
+
+kind accuracy by confidence:
+  conf [0,0.5): n=4 acc=0.50
+  conf [0.5,0.8): n=14 acc=0.64
+  conf [0.8,1.01): n=30 acc=0.70
+
+actionable-vs-not (kind collapsed): acc 0.77
+
+disagreements (kind):
+  05 gold=report   jev=request  conf=0.99 action=0.88 | UTF-8 fix applied; asks carry upstream or check b200
+  07 gold=report   jev=question conf=0.66 action=0.81 | Post-merge rebuild and gate recheck results
+  11 gold=report   jev=request  conf=0.99 action=0.86 | Fixes applied and verified; recommends guard on b200 copy
+  12 gold=report   jev=request  conf=1.00 action=0.96 | Tests pass; asks ensure commit lands on main
+  13 gold=report   jev=request  conf=0.36 action=0.69 | Forwarded evidence and hypothesis for doorbell bug
+  16 gold=info     jev=request  conf=0.99 action=0.84 | cc-self 1.5.2 pinned; reply not required
+  22 gold=info     jev=request  conf=0.74 action=0.77 | Acknowledges, adds decision criteria for later measurement
+  29 gold=request  jev=question conf=0.95 action=0.98 | Asks 0.9.7 accept neutral session env var
+  30 gold=info     jev=report   conf=0.50 action=0.06 | Post-stage sanity test notice
+  34 gold=question jev=request  conf=0.99 action=0.92 | Results reported; asks whether to create paths.env
+  38 gold=report   jev=question conf=0.82 action=0.58 | NFS incident resolved; residual is user's call
+  39 gold=info     jev=report   conf=0.51 action=0.07 | Post-stage sanity test notice
+  40 gold=report   jev=request  conf=0.90 action=0.64 | Answers defects; instructs update and restart; no reply
+  42 gold=report   jev=info     conf=0.59 action=0.07 | Requested changes implemented, unreleased; reply not required
+  43 gold=report   jev=request  conf=0.83 action=0.54 | Answers five questions about watcher pattern
+  46 gold=report   jev=request  conf=0.43 action=0.47 | Answers CUTLASS version; explains alignment unnecessary
