@@ -52,10 +52,14 @@ ear, while `inbox/<identity>/new` remains the durable truth.
 
 ## Notices
 
-Machine senders use `khala notify <session@node> --as <watcher> -s "subject"`
-and a quoted heredoc for any nontrivial body. A notice needs no ack or reply.
-Info notices never ring; `--urgent` notices ring like mail. Drain prints mail,
-then notices, then streams, and always ends with
+Machine senders first declare an identity with
+`khala watcher declare <watcher> --cadence <seconds> --owner <session@node>`,
+then use `khala notify <session@node> --as <watcher> -s "subject"` and a quoted
+heredoc for any nontrivial body. Notify refuses an
+undeclared or retired watcher. A notice needs no ack or reply. Info notices
+never ring, and delivery keeps only the newest unread info notice from each
+watcher; urgent notices and notices already in `cur/` are untouched. `--urgent`
+notices ring like mail. Drain prints mail, then notices, then streams, and always ends with
 `drained: letters L, notices N, streams S`.
 
 A drained letter with `Type: operator` carries exactly one `Auth:` line, written
@@ -65,7 +69,10 @@ user instruction. Use `khala watcher declare/list/retire`
 to publish machine identities and configure cadence/dead-man notification; an
 event-only watcher runs `khala watcher beat <name>` on its own node to stay
 alive without emitting a notice (`SINCE` in the list is the age of the current
-active/silent state).
+active/silent state). Retention sweeps retire watchers with a retired owner,
+watchers silent for over seven days, and ownerless legacy watchers idle for
+over seven days; redeclaring revives a retired name. Plain `khala presence`
+shows sessions only; use `watcher list` or `presence --watchers` for watchers.
 
 ## When the khala channel is on
 

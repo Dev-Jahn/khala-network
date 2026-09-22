@@ -68,11 +68,11 @@ Machine senders must name themselves explicitly; their watcher marker is
 separate from session heartbeat presence:
 
 ```sh
+khala watcher declare gpu-guard --cadence 600 --owner operator@hub
 khala notify operator@hub --as gpu-guard -s "GPU 2 recovered" <<'NOTICE'
 Utilization and memory returned to normal.
 NOTICE
 khala notify operator@hub --as gpu-guard --urgent -s "GPU 2 stalled" </dev/null
-khala watcher declare gpu-guard --cadence 600 --owner operator@hub
 khala watcher beat gpu-guard
 khala watcher list
 khala watcher retire gpu-guard
@@ -81,15 +81,22 @@ khala watcher retire gpu-guard
 Info notices are deliberately quiet: an info notice alone never rings or
 wakes a session. Urgent notices ring exactly like mail. `notify` defaults to
 info and a two-day expiry; `--urgent` changes the doorbell policy and `-e`
-changes the expiry. A declared watcher with a cadence sends its owner one
+changes the expiry. The watcher must already be declared on the sending node;
+an undeclared or retired name is refused with the required `watcher declare`
+command. At most one unread info notice per watcher is kept for each session:
+the newest replaces older unread info, while urgent notices and notices already
+in `cur/` are untouched. A declared watcher with a cadence sends its owner one
 urgent notice when it misses twice that cadence, and one quiet info notice
 when notifications resume. Before the first notice or beat, the declaration
 time is the dead-man baseline. Event-only watchers should call `watcher beat`
 to refresh liveness without creating a notice, inbox/outbox/spool entry,
-presence heartbeat, or reconcile trigger. `watcher list` and `khala presence`
-show `SINCE`, the age of the current active/silent state. `khala presence`
-shows active watchers below the session table; `khala presence --watchers`
-shows only that section.
+presence heartbeat, or reconcile trigger. A retention sweep retires watchers
+whose owner was retired, watchers silent for over seven days (with one info
+notice to the owner), and ownerless legacy watchers idle for over seven days.
+An owned cadence-0 watcher remains until its owner is retired; declaring a
+retired name revives it. `watcher list` shows all watcher rows and their
+`SINCE` age; `khala presence --watchers` shows active watchers only. Plain
+`khala presence` shows sessions and points to `khala watcher list` in its legend.
 
 ```sh
 khala say -m "build green on hub"          # the commons stream, "khala"
@@ -203,10 +210,11 @@ Daily use:
 
 ```sh
 khala send executor@hub -m "build finished" # body via -m or stdin
+khala watcher declare ci --cadence 0 --owner executor@hub # once, or to revive
 khala notify executor@hub --as ci -s "build green" </dev/null
 khala sync                                  # one exchange cycle (idempotent)
 khala inbox --drain                         # letters, notices, then streams
-khala presence                              # sessions, then machine watchers
+khala presence                              # sessions; watcher list is separate
 ```
 
 `WATCHING=yes` means either the session's direct `.watching` marker is fresh or
