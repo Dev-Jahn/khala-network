@@ -127,13 +127,16 @@ KHALA_HOME=$home KHALA_SESSION=guard "$KHALA" mind -m monitoring >/dev/null ||
 KHALA_HOME=$home "$KHALA" presence >"$RIG/presence.out" || die "presence failed"
 grep -q '^guard@alpha' "$RIG/presence.out" && die "watcher leaked into main presence table"
 grep -q '^human@alpha' "$RIG/presence.out" || die "human missing from presence"
-grep -qx 'watchers:' "$RIG/presence.out" || die "presence watcher section missing"
-grep -q $'^guard\talpha\towner@alpha\t0\t-\tactive\t[0-9smhd-]*$' "$RIG/presence.out" ||
-    die "presence watcher row differs"
+grep -qx 'watchers:' "$RIG/presence.out" && die "default presence printed watcher section"
+grep -q $'^guard\talpha\t' "$RIG/presence.out" && die "default presence printed watcher row"
+grep -Fq 'khala watcher list' "$RIG/presence.out" ||
+    die "presence legend does not point to watcher list"
 KHALA_HOME=$home "$KHALA" presence --watchers >"$RIG/only-watchers.out" ||
     die "presence --watchers failed"
 head -n 1 "$RIG/only-watchers.out" | grep -qx 'watchers:' ||
     die "watchers-only section heading differs"
+grep -q $'^guard\talpha\towner@alpha\t0\t-\tactive\t[0-9smhd-]*$' \
+    "$RIG/only-watchers.out" || die "watchers-only row differs"
 grep -q '^ADDRESS' "$RIG/only-watchers.out" && die "watchers-only printed session table"
 grep -q 'asleep = ' "$RIG/only-watchers.out" && die "watchers-only printed session legend"
 KHALA_HOME=$home "$KHALA" minds >"$RIG/minds.out" || die "minds failed"
@@ -149,7 +152,7 @@ write_marker "$home/presence/recent-declare@alpha.watcher" "$now" 0 owner "$old"
 KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/prune.err" ||
     die "watcher prune reconcile failed: $(tr '\n' ' ' < "$RIG/prune.err")"
 [ ! -e "$home/presence/retired-old@alpha.watcher" ] || die "old retired watcher survived"
-[ ! -e "$home/presence/stale@alpha.watcher" ] || die "fully stale watcher survived"
+[ -f "$home/presence/stale@alpha.watcher" ] || die "local non-retired watcher was deleted"
 [ -f "$home/presence/recent-notify@alpha.watcher" ] || die "recent notify watcher was pruned"
 [ -f "$home/presence/recent-declare@alpha.watcher" ] || die "recent declaration watcher was pruned"
 printf 'ok P6 — presence/minds split and watcher retention\n'

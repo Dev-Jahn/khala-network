@@ -87,11 +87,12 @@ if printf '' | KHALA_HOME=$home "$KHALA" notify reader@beta --as sentinel \
     -s $'bad\nsubject' >"$RIG/newline.out" 2>"$RIG/newline.err"; then
     die "multiline notice subject succeeded"
 fi
+KHALA_HOME=$home "$KHALA" watcher declare sentinel --cadence 0 --owner reader >/dev/null ||
+    die "sentinel watcher declaration failed"
 printf 'temperature high\n' | KHALA_HOME=$home "$KHALA" notify reader@beta \
     --as sentinel -s 'thermal alarm' --urgent >"$RIG/notify.out" 2>"$RIG/notify.err" ||
     die "urgent notify failed: $(tr '\n' ' ' < "$RIG/notify.err")"
-[ "$(wc -l < "$RIG/notify.err" | tr -d ' ')" -eq 1 ] ||
-    die "auto-declare did not emit exactly one hint"
+[ ! -s "$RIG/notify.err" ] || die "declared notify wrote stderr"
 [ "$(count_files "$home/outbox/new")" -eq 0 ] || die "notice entered outbox/new"
 [ "$(count_files "$home/outbox/acked")" -eq 0 ] || die "notice entered outbox/acked"
 notice=$(first_file "$home/spool/for/beta") || die "notice did not enter remote spool"
@@ -114,23 +115,25 @@ now=$(date +%s)
 [ "$expires" -gt "$((now + 172700))" ] && [ "$expires" -lt "$((now + 172900))" ] ||
     die "notice default expiry is not about 172800 seconds"
 marker=$home/presence/sentinel@alpha.watcher
-[ -f "$marker" ] || die "notify did not auto-declare watcher"
-[ "$(sed -n '2p' "$marker")" = 0 ] || die "auto-declared cadence is not zero"
-[ "$(sed -n '3p' "$marker")" = - ] || die "auto-declared owner is not dash"
-[ "$(sed -n '5p' "$marker")" = active ] || die "auto-declared state is not active"
+[ -f "$marker" ] || die "declared watcher marker disappeared"
+[ "$(sed -n '2p' "$marker")" = 0 ] || die "declared cadence changed"
+[ "$(sed -n '3p' "$marker")" = reader@alpha ] || die "declared owner changed"
+[ "$(sed -n '5p' "$marker")" = active ] || die "declared state changed"
 [ "$(sed -n '4p' "$marker")" -gt 0 ] || die "notify did not update L4"
 [ ! -e "$home/presence/sentinel@alpha" ] || die "notify wrote a plain heartbeat"
 marker_declared=$(sed -n '1p' "$marker")
-printf '%s\n%s\n%s\n%s\n%s\n' "$marker_declared" 000 - 1 active > "$marker"
+printf '%s\n%s\n%s\n%s\n%s\n' "$marker_declared" 000 reader@alpha 1 active > "$marker"
 printf '' | KHALA_HOME=$home "$KHALA" notify reader@beta --as sentinel \
     >"$RIG/notify-again.out" 2>"$RIG/notify-again.err" || die "repeat notify failed"
-[ ! -s "$RIG/notify-again.err" ] || die "declared watcher emitted another auto-declare hint"
+[ ! -s "$RIG/notify-again.err" ] || die "declared watcher notify wrote stderr"
 [ "$(sed -n '1p' "$marker")" = "$marker_declared" ] || die "notify changed watcher L1"
 [ "$(sed -n '2p' "$marker")" = 000 ] || die "notify changed watcher L2"
-[ "$(sed -n '3p' "$marker")" = - ] || die "notify changed watcher L3"
+[ "$(sed -n '3p' "$marker")" = reader@alpha ] || die "notify changed watcher L3"
 [ "$(sed -n '5p' "$marker")" = active ] || die "notify changed watcher L5"
 [ "$(sed -n '4p' "$marker")" -gt 1 ] || die "repeat notify did not replace watcher L4"
 
+KHALA_HOME=$home "$KHALA" watcher declare local --cadence 0 --owner reader >/dev/null ||
+    die "local watcher declaration failed"
 printf '' | KHALA_HOME=$home "$KHALA" notify reader@alpha --as local \
     >"$RIG/local.out" 2>"$RIG/local.err" || die "local notify failed"
 local_id=$(tr -d '\n' < "$RIG/local.out")
@@ -387,6 +390,8 @@ printf 'ok P4c — oversized numbers are refused; future epochs and unparseable 
 # P1b — a same-node notice leaves the brain trigger so the link's 200 ms poll delivers it now.
 home=$RIG/trigger
 init_home "$home"
+KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 0 --owner reader >/dev/null ||
+    die "trigger watcher declaration failed"
 rm -f "$home/run/reconcile.trigger"
 printf '' | KHALA_HOME=$home "$KHALA" notify reader@alpha --as guard -s local >/dev/null 2>&1 || die "same-node notify failed"
 [ -f "$home/run/reconcile.trigger" ] || die "same-node notify left no reconcile trigger"
@@ -401,6 +406,8 @@ printf 'ok P1b — same-node notify triggers reconcile; remote notify does not\n
 # (GPT-Pro P0-1, 2026-09-02). The mailbox accepting bytes is not delivery.
 home=$RIG/custody
 init_home "$home"
+KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 0 --owner reader >/dev/null ||
+    die "custody watcher declaration failed"
 printf '' | KHALA_HOME=$home "$KHALA" notify reader@beta --as guard -s custody >/dev/null 2>&1 || die "custody notify failed"
 notice_copy=$(first_file "$home/spool/for/beta") || die "custody notice missing from spool"
 KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>&1 || die "custody reconcile failed"
