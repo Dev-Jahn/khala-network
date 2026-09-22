@@ -149,6 +149,8 @@ mailbox에 남고, 그것이 정상 동작이다(R4).
   명령 실행 시에만 갱신되므로, 칼라를 부르지 않는 살아 있는 세션은 asleep으로 보인다 —
   v0.1의 정직한 절충. (스톱갭의 "목록에 없음 = 죽음" 오독을 반복하지 않기 위한 명문.)
 - 구현 스케치: 노드별 heartbeat + TTL. 신선하면 alive, 만료면 asleep, 없으면 unknown.
+- CLI의 기본 `khala presence`는 세션 표와 범례만 보인다. machine watcher는
+  `khala watcher list`로 보고, active watcher만 필요하면 `khala presence --watchers`로 본다.
 - 계보: "신호가 닿지 않는 것과 죽은 것은 다르다 — 지도를 그리며 기다려라." (soul-jar
   열다섯째의 유언; 이 지도가 그 문장의 상속이다.)
 
@@ -837,10 +839,20 @@ sync_error를 남기고 그 row를 숨긴다. 5행 fallback을 쓰지 않으므�
 순차 갱신해 이 짧은 mixed-fleet 구간을 끝낸다.
 
 `notify --as`와 `khala watcher beat <name>`은 plain heartbeat를 쓰지 않고 marker의
-4행만 갱신한다. `beat`는 notice/inbox/outbox/spool/reconcile trigger를 만들지 않으며,
-선언되지 않았거나 retired인 watcher를 거부한다. `notify`는 marker가 없으면 cadence 0,
-owner `-`, active로 한 번 안내하고 자동 선언한다. last-notify가 0이면 dead-man의 기준은
-선언 시각(L1)이다. 삭제는 복제되지 않으므로 retire는 1행을 다시 쓴다.
+4행만 갱신한다. `beat`는 notice/inbox/outbox/spool/reconcile trigger를 만들지 않는다.
+둘 다 선언되지 않았거나 retired인 watcher를 거부하며, `notify` 오류는 필요한
+`khala watcher declare <name> --cadence <초> --owner <session@node>` 명령을 가리킨다.
+cadence 0 event-only watcher도 먼저 명시적으로 선언한다. retired 이름을 다시 declare하면
+기존처럼 되살아난다. last-notify가 0이면 dead-man의 기준은 선언 시각(L1)이다.
+
+retention-gated pass는 자기 노드의 non-retired marker만 다음 순서로 자동 retire한다.
+owner session의 presence marker가 retired이면 즉시, cadence > 0이고 `silent`의
+state-since(L6)가 7일을 넘었으면 owner에게 info notice
+`[watcher] <name> retired after <age> silent`를 한 번 보낸 뒤, legacy ownerless(`-`)이면
+last-notify(0이면 선언 시각)가 7일을 넘었을 때 알림 없이 retire한다. owner가 retired가
+아닌 cadence 0 watcher는 자동 retire하지 않는다. 다른 노드 marker는 판정하지 않는다.
+모든 retire는 1행만 `retired <epoch>`로 바꾸고 나머지 다섯 행을 보존한다 — 삭제는
+복제되지 않으므로 local non-retired marker를 age만으로 직접 지우지 않는다.
 
 타입별 취급:
 
@@ -855,7 +867,9 @@ owner `-`, active로 한 번 안내하고 자동 선언한다. last-notify가 0�
   만료 판정은 발신자의 최종 판정이고, bounce 이후 도착한 ack는 상태를 되돌리지 않는다
   (r10, soul-jar 리뷰 비준).
 - **bounce / notice** → 해당 세션 inbox로 fire-and-forget 배달 (bounce는 1회성,
-  재반송 없음 — §5.2). notice는 ack를 만들지 않는다.
+  재반송 없음 — §5.2). notice는 ack를 만들지 않는다. info notice를 배달할 때는 같은
+  `From`의 unread(`inbox/<session>/new/`) info notice를 먼저 접어 최신 한 건만 남긴다.
+  urgent notice와 이미 `cur/`로 옮긴 notice는 건드리지 않고, `log/delivered`도 지우지 않는다.
 
 spool 사본의 수명 (타입별):
 
@@ -919,8 +933,9 @@ sync 한 사이클 (멱등, 호출자 무관 — 한 사이클 = 각 단계 한 
   잠금이 아니라 즉시 정리). 같은 이유로 reconcile 루프가 값 하나마다 sed/grep을 fork하던
   헬퍼(header_value·normalize_integer·valid_*·validate_mind_file)는 순수 셸로 바꿨다 —
   pass 비용은 fork 수가 지배한다(트리 사본 실측, 0.7.3 → 0.8.1 게이트 pass: b200 3.3 s → 0.2-0.3 s, mini 허브 3.0 s → 0.6-0.8 s; 5분마다의 정리 pass는 2.2 s / 5.1 s).
-  `.watcher`는 retired 선언 시각이 retention보다 오래됐거나, declared와
-  last-notify가 모두 오래됐을 때만 삭제한다.
+  local `.watcher`는 위 규칙으로 먼저 retire하며 non-retired 상태에서 직접 삭제하지 않는다.
+  retired 시각이 retention보다 오래되면 삭제한다. 다른 노드의 non-retired replica는
+  declared와 last-notify가 모두 retention보다 오래됐을 때 정리할 수 있다.
   The local `requests/send/` ledger is excluded from these age-out sweeps;
   its explicit retention decision is specified in **Pull-only mailbox clients** above.
 
@@ -938,10 +953,12 @@ CLI 인터페이스 (한 머신 마일스톤 범위):
 - `khala send <session@node> [-s 제목] [-e 만료초]` — 본문은 stdin 또는 `-m`.
   발신 세션명: `--as` > `$KHALA_SESSION` > `$PWD` basename (D5). 안착 = 성공(§5.2).
 - `khala notify <session@node> --as <watcher> [-s 제목] [--urgent] [-e 만료초]` —
-  본문은 stdin, outbox/ack 없음. 기본 info/2일.
+  본문은 stdin, outbox/ack 없음. 기본 info/2일. 자기 노드에 declare된 non-retired
+  watcher만 발신할 수 있다.
 - `khala watcher declare <name> --cadence <초> --owner <session@node> | beat <name> | list |
   retire <name>` — machine identity, event 없는 생존 신호, dead-man 상태 관리. list의
   `SINCE`는 현재 active/silent 상태에 들어간 뒤 지난 시간을 `LAST`와 같은 형식으로 보인다.
+  cadence 0도 유효하며 retired 이름의 재선언은 그 identity를 되살린다.
 - `khala sync` — 위 한 사이클. 실패는 파일 단위로 소리 내고 계속(R10) — 전체 abort 금지.
 - `khala reconcile` — (a)+(c)만 한 패스 실행하며 네트워크 I/O는 하지 않는다.
 - `khala inbox [--drain [--max-n N] [--max-bytes B] [--max-notices N]
@@ -949,5 +966,7 @@ CLI 인터페이스 (한 머신 마일스톤 범위):
   상한 초과분은 "N건 더 (발신자 목록)" 요약만 (§5.5). 기본 상한 = 20건 / 65536바이트
   (r7에서 비준).
 - `khala presence` — 4상태 표. send/inbox는 자기 heartbeat를 갱신하고 presence는 순수
-  조회다. 출력에 §5.4의 절충 명시: "asleep = 칼라 활동 없음 (세션 죽음 아님)".
+  조회다. 기본 출력은 세션 표와 범례뿐이고 범례는 `khala watcher list`를 가리킨다.
+  `--watchers`는 active watcher만 보인다. 출력에 §5.4의 절충 명시:
+  "asleep = 칼라 활동 없음 (세션 죽음 아님)".
 - 오류는 크게: config 없으면 "khala init 먼저" 안내 후 비0 종료. silent fallback 금지.

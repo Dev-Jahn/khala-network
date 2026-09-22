@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.8
+KHALA_VERSION=0.9.9
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -2688,16 +2688,39 @@ deliver_regular_message() {
     fi
 }
 
+fold_unread_info_notices() {
+    fold_notice_dir=$1
+    fold_notice_from=$2
+    for fold_notice_file in "$fold_notice_dir"/*; do
+        [ -f "$fold_notice_file" ] || continue
+        [ -L "$fold_notice_file" ] && continue
+        [ "$(header_value Type "$fold_notice_file")" = notice ] || continue
+        [ "$(header_value Urgency "$fold_notice_file")" = info ] || continue
+        [ "$(header_value From "$fold_notice_file")" = "$fold_notice_from" ] || continue
+        if ! rm -f "$fold_notice_file"; then
+            sync_error "$fold_notice_file: 이전 unread info notice를 접지 못했습니다"
+            return 1
+        fi
+    done
+    return 0
+}
+
 deliver_fire_and_forget() {
     incoming_file=$1
     incoming_id=$(header_value Id "$incoming_file")
     incoming_to=$(header_value To "$incoming_file")
     incoming_type=$(header_value Type "$incoming_file")
+    incoming_fold_info=0
     if ! valid_address "$incoming_to"; then
         sync_error "$incoming_file: 잘못된 To 헤더"
         return
     fi
     if [ "$incoming_type" = notice ]; then
+        incoming_urgency=$(header_value Urgency "$incoming_file")
+        if [ "$incoming_urgency" = info ]; then
+            incoming_from=$(header_value From "$incoming_file")
+            incoming_fold_info=1
+        fi
         incoming_expires=$(header_value Expires "$incoming_file")
         if ! bounded_integer "$incoming_expires"; then
             sync_error "$incoming_file: 잘못된 notice Expires 헤더"
@@ -2726,6 +2749,10 @@ deliver_fire_and_forget() {
     else
         delivered_status=$?
         [ "$delivered_status" -ne 2 ] || return
+        if [ "$incoming_fold_info" -eq 1 ] && \
+            ! fold_unread_info_notices "$incoming_dir/new" "$incoming_from"; then
+            return
+        fi
         if ! atomic_copy "$incoming_file" "$incoming_dir/new/$incoming_id"; then
             sync_error "$incoming_file: inbox 배달에 실패했습니다"
             return
@@ -3047,6 +3074,97 @@ watcher_deadman() {
     done
 }
 
+retire_dead_watchers() {
+    retire_dead_node=$1
+    retire_dead_now=$(date +%s) || {
+        sync_error "현재 시각을 읽지 못했습니다"
+        return
+    }
+    retire_dead_after=$((7 * 86400))
+    for retire_dead_marker in "$KHALA_ROOT"/presence/*@"$retire_dead_node".watcher; do
+        [ -f "$retire_dead_marker" ] || continue
+        [ -L "$retire_dead_marker" ] && continue
+        retire_dead_address=$(basename "$retire_dead_marker" .watcher)
+        if ! valid_address "$retire_dead_address"; then
+            sync_error "$retire_dead_marker: 잘못된 watcher marker 파일명"
+            continue
+        fi
+        if ! read_watcher_marker "$retire_dead_marker"; then
+            sync_error "$retire_dead_marker: 잘못된 watcher marker"
+            continue
+        fi
+        [ "$WATCHER_RETIRED" -eq 0 ] || continue
+
+        retire_dead_reason=
+        retire_dead_notice=0
+        if [ "$WATCHER_L3" != - ]; then
+            case "$WATCHER_L3" in
+                *@*) retire_dead_owner=$WATCHER_L3 ;;
+                *) retire_dead_owner=$WATCHER_L3@$retire_dead_node ;;
+            esac
+            retire_dead_owner_marker=$KHALA_ROOT/presence/$retire_dead_owner
+            if [ -f "$retire_dead_owner_marker" ]; then
+                IFS=' ' read -r retire_dead_owner_state retire_dead_owner_epoch \
+                    retire_dead_owner_extra < "$retire_dead_owner_marker"
+                if [ "$retire_dead_owner_state" = retired ] && \
+                    bounded_integer "${retire_dead_owner_epoch-}" && \
+                    [ -z "${retire_dead_owner_extra-}" ]; then
+                    retire_dead_reason=owner
+                fi
+            fi
+        fi
+        if [ -z "$retire_dead_reason" ] && [ "$WATCHER_CADENCE" -gt 0 ] && \
+            [ "${WATCHER_L5%% *}" = silent ] && \
+            [ "$retire_dead_now" -ge "$WATCHER_STATE_SINCE" ] && \
+            [ "$((retire_dead_now - WATCHER_STATE_SINCE))" -gt "$retire_dead_after" ]; then
+            retire_dead_reason=silent
+            retire_dead_notice=1
+        fi
+        if [ -z "$retire_dead_reason" ] && [ "$WATCHER_L3" = - ]; then
+            if [ "$WATCHER_LAST_NOTIFY" -gt 0 ]; then
+                retire_dead_anchor=$WATCHER_LAST_NOTIFY
+            else
+                retire_dead_anchor=$WATCHER_DECLARED
+            fi
+            if [ "$retire_dead_now" -ge "$retire_dead_anchor" ] && \
+                [ "$((retire_dead_now - retire_dead_anchor))" -gt "$retire_dead_after" ]; then
+                retire_dead_reason=ownerless
+            fi
+        fi
+        [ -n "$retire_dead_reason" ] || continue
+
+        if [ "$retire_dead_notice" -eq 1 ]; then
+            retire_dead_name=${retire_dead_address%@*}
+            retire_dead_age=$(relative_age "$WATCHER_STATE_SINCE" "$retire_dead_now")
+            retire_dead_subject="[watcher] $retire_dead_name retired after $retire_dead_age silent"
+            retire_dead_body=$(mktemp "$TMP_DIR/retire-watcher-body.XXXXXX") || {
+                sync_error "$retire_dead_marker: retire 알림 본문 임시 파일을 만들지 못했습니다"
+                continue
+            }
+            if ! printf 'watcher marker: %s\n' "$retire_dead_marker" > "$retire_dead_body"; then
+                rm -f "$retire_dead_body"
+                sync_error "$retire_dead_marker: retire 알림 본문을 쓰지 못했습니다"
+                continue
+            fi
+            retire_dead_expires=$((retire_dead_now + 172800))
+            if ! queue_notice "$retire_dead_address" "$retire_dead_owner" info \
+                "$retire_dead_subject" "$retire_dead_expires" "$retire_dead_body"; then
+                rm -f "$retire_dead_body"
+                sync_error "$retire_dead_marker: retire 알림을 만들지 못했습니다"
+                continue
+            fi
+            rm -f "$retire_dead_body"
+        fi
+        if ! write_watcher_marker "$retire_dead_marker" "retired $retire_dead_now" \
+            "$WATCHER_L2" "$WATCHER_L3" "$WATCHER_L4" "$WATCHER_L5" "$WATCHER_L6"; then
+            if [ "$retire_dead_notice" -eq 1 ]; then
+                rm -f "$KHALA_ROOT/spool/for/${retire_dead_owner#*@}/$NOTICE_ID"
+            fi
+            sync_error "$retire_dead_marker: watcher 자동 retire를 기록하지 못했습니다"
+        fi
+    done
+}
+
 # Every pass: validate, quarantine garbage and future epochs. The retention
 # deletion (and its preserve capture) waits for the retention interval
 # ($1 = 1 when that sweep is due).
@@ -3197,6 +3315,7 @@ presence_record_epoch() {
 }
 
 prune_presence() {
+    prune_presence_node=$1
     prune_presence_now=$(date +%s) || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
@@ -3229,6 +3348,10 @@ prune_presence() {
                 fi
                 prune_presence_declared_old=0
                 prune_presence_notify_old=0
+                prune_presence_local_watcher=0
+                case "$prune_presence_file" in
+                    *@"$prune_presence_node".watcher) prune_presence_local_watcher=1 ;;
+                esac
                 if [ "$((WATCHER_DECLARED + prune_presence_seconds))" -lt \
                     "$prune_presence_now" ]; then
                     prune_presence_declared_old=1
@@ -3239,7 +3362,8 @@ prune_presence() {
                 fi
                 if { [ "$WATCHER_RETIRED" -eq 1 ] && \
                     [ "$prune_presence_declared_old" -eq 1 ]; } || \
-                    { [ "$prune_presence_declared_old" -eq 1 ] && \
+                    { [ "$prune_presence_local_watcher" -eq 0 ] && \
+                    [ "$prune_presence_declared_old" -eq 1 ] && \
                     [ "$prune_presence_notify_old" -eq 1 ]; }; then
                     if ! rm -f "$prune_presence_file"; then
                         sync_error "$prune_presence_file: retention 지난 watcher marker를 지우지 못했습니다"
@@ -3317,6 +3441,7 @@ reconcile_cycle() {
             sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
         else
             watcher_deadman "$reconcile_self"
+            [ "$reconcile_retention" -eq 0 ] || retire_dead_watchers "$reconcile_self"
             deliver_messages "$reconcile_spool"
             deliver_infrastructure "$reconcile_spool"
             settle_acks "$reconcile_spool"
@@ -3333,7 +3458,7 @@ reconcile_cycle() {
         fi
         prune_stream_entries "$reconcile_retention"
         prune_mind_generations "$reconcile_retention"
-        [ "$reconcile_retention" -eq 0 ] || prune_presence
+        [ "$reconcile_retention" -eq 0 ] || prune_presence "$reconcile_self"
         prune_session_stream_state "$reconcile_self"
     fi
     if ! release_lock "$reconcile_lock"; then
@@ -3992,21 +4117,16 @@ cmd_notify() {
         error "notify용 brain lock을 얻지 못했습니다"
         return 1
     fi
-    notify_auto_declared=0
     notify_status=0
-    if [ -f "$notify_marker" ]; then
-        if ! read_watcher_marker "$notify_marker"; then
-            error "$notify_marker: 잘못된 watcher marker"
-            notify_status=1
-        fi
-    else
-        WATCHER_L1=$notify_now
-        WATCHER_L2=0
-        WATCHER_L3=-
-        WATCHER_L4=0
-        WATCHER_L5=active
-        WATCHER_L6=$notify_now
-        notify_auto_declared=1
+    if [ ! -f "$notify_marker" ]; then
+        error "$notify_from: 선언된 watcher가 아닙니다; khala watcher declare $notify_as --cadence <초> --owner <session@node>"
+        notify_status=1
+    elif ! read_watcher_marker "$notify_marker"; then
+        error "$notify_marker: 잘못된 watcher marker"
+        notify_status=1
+    elif [ "$WATCHER_RETIRED" -eq 1 ]; then
+        error "$notify_from: 선언된 watcher가 아닙니다; khala watcher declare $notify_as --cadence <초> --owner <session@node>"
+        notify_status=1
     fi
     if [ "$notify_status" -eq 0 ] && ! queue_notice "$notify_from" "$notify_to" \
         "$notify_urgency" "$notify_subject" "$notify_expires" "$notify_body"; then
@@ -4026,9 +4146,6 @@ cmd_notify() {
         return 1
     fi
     [ "$notify_status" -eq 0 ] || return 1
-    if [ "$notify_auto_declared" -eq 1 ]; then
-        printf 'khala notify: %s watcher를 cadence 0으로 자동 선언했습니다\n' "$notify_from" >&2
-    fi
     # A notice for this node sits in spool/for/<self> where the link watcher
     # never looks (it only offers other nodes' spools), so nothing would run
     # reconcile until an unrelated event. Leave the brain's trigger file so its
@@ -5932,8 +6049,7 @@ cmd_presence() {
             "$presence_now" "$presence_ttl" "$presence_address")
         printf '%s\tunknown\t-\t%s\n' "$presence_address" "$presence_watching"
     done
-    printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch); .ear = 노드 conduit이 듣는 중'
-    print_watcher_section
+    printf '%s\n' 'asleep = 칼라 활동 없음 (세션 죽음 아님); watching = 귀 열림 (armed watch); .ear = 노드 conduit이 듣는 중; watcher = khala watcher list'
     return 0
 }
 
@@ -5992,4 +6108,3 @@ case "$command_name" in
     presence) cmd_presence "$@" ;;
     *) usage; exit 1 ;;
 esac
-
