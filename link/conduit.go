@@ -71,10 +71,12 @@ type conduitState struct {
 type pendingLetter struct {
 	id          string
 	installedAt int64
-	from        string
-	subject     string
-	notice      bool
-	urgent      bool
+	// kind is the envelope Type header value ("" when absent).
+	kind    string
+	from    string
+	subject string
+	notice  bool
+	urgent  bool
 	// later is set when the envelope carries "Priority: later" — the sender
 	// asked for the doorbell to wait until the session is idle.
 	later bool
@@ -113,6 +115,8 @@ type conduit struct {
 	earReady            bool
 	watcher             *fsnotify.Watcher
 	watchedDir          map[string]struct{}
+	// triage is nil in tests that do not exercise it; nil means off.
+	triage *triageEngine
 }
 
 func runConduit(args []string) int {
@@ -184,7 +188,9 @@ func runConduit(args []string) int {
 		earInterval:  durationEnv("KHALA_CONDUIT_TEST_EAR_INTERVAL", 60*time.Second),
 		earMailboxes: append([]string(nil), cfg.mailboxes...), drainedWarned: make(map[string]bool),
 		turnsWarned: make(map[string]bool),
+		triage:      newTriageEngine(home, logger),
 	}
+	defer c.triage.close()
 	if c.earInterval < time.Second {
 		c.earInterval = time.Second
 	}
@@ -460,6 +466,10 @@ func (c *conduit) scan() bool {
 		return false
 	}
 	c.pruneVerificationReasons(regs)
+	if c.triage != nil {
+		// Only enqueues judgments and reads/cleans the cache; never waits on the API.
+		c.triage.scan()
+	}
 	registries, err := loadClaudeRegistries()
 	if err != nil {
 		c.logger.Printf("load Claude registry failed: %v", err)
@@ -941,6 +951,7 @@ func (c *conduit) readPending(identity string, includeMtime bool) []pendingLette
 			}
 			_ = f.Close()
 		}
+		letter.kind = typeValue
 		if typeValue == "notice" {
 			letter.notice = true
 			letter.urgent = urgencyValue != "info"
@@ -1353,8 +1364,14 @@ func (c *conduit) frame(identity, generation, attempt string, retry int, letters
 	from, subjects := doorbellDisplay(letters)
 	mail, notices, urgent := letterCounts(letters)
 	streamPending := c.pendingStreams(identity)
-	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nnotices: %d\nurgent: %d\nstreams: %d\nfrom: %s\nsubjects: %s\ngeneration: %s\nattempt: %s\nretry: %d\nread: khala inbox --drain",
-		identity, c.self, mail, notices, urgent, streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), generation, attempt, retry)
+	triageLine := ""
+	if c.triage != nil {
+		if line := c.triage.frameLine(identity, letters); line != "" {
+			triageLine = line + "\n"
+		}
+	}
+	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nnotices: %d\nurgent: %d\nstreams: %d\nfrom: %s\nsubjects: %s\n%sgeneration: %s\nattempt: %s\nretry: %d\nread: khala inbox --drain",
+		identity, c.self, mail, notices, urgent, streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), triageLine, generation, attempt, retry)
 	if len(content) > 8192 {
 		content = content[:8192]
 		for !utf8.ValidString(content) {

@@ -98,6 +98,19 @@ retired name revives it. `watcher list` shows all watcher rows and their
 `SINCE` age; `khala presence --watchers` shows active watchers only. Plain
 `khala presence` shows sessions and points to `khala watcher list` in its legend.
 
+Optional letter triage gives each incoming letter a machine hint. When
+`~/.khala/triage.conf` (a regular 0600 file holding the API key) exists, the
+node's conduit asks an external judgment model (TypeSafe Jev) about each new
+letter and records up to three tags: `action` (the recipient should do or
+answer something), `reply` (the sender expects a reply letter) and `urgent`
+(something is blocked or due now), or `fyi` when none apply. `khala inbox
+--drain` appends the tags to the letter line (`--- letter <id> --- · action,urgent`),
+and `khala inbox` / `khala inbox list` gain a trailing Triage column (`-` when a
+letter has no tag). The tags only help decide what to read first. They never
+suppress a doorbell, hide a letter, or authorize anything, and notices and
+operator letters are never tagged. Without the file nothing is asked, output is
+unchanged, and `khala status` says `triage: off`.
+
 ```sh
 khala say -m "build green on hub"          # the commons stream, "khala"
 khala say deploys -s "v0.3.0" <<'ENTRY'    # a named stream
@@ -215,6 +228,7 @@ khala notify executor@hub --as ci -s "build green" </dev/null
 khala sync                                  # one exchange cycle (idempotent)
 khala inbox --drain                         # letters, notices, then streams
 khala presence                              # sessions; watcher list is separate
+khala status                                # conduit routes; "triage: on (jev-latest, threshold 0.7)"
 ```
 
 `WATCHING=yes` means either the session's direct `.watching` marker is fresh or
