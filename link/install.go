@@ -46,7 +46,7 @@ func (i *installer) destination(o offer) (string, error) {
 			return "", fmt.Errorf("dial accepts spool only for self %q, got %q", i.peer, o.Node)
 		}
 		if i.role == "serve" && o.Node == i.peer {
-			return "", fmt.Errorf("serve refuses reflected spool for connected spoke %q", i.peer)
+			return "", fmt.Errorf("server refuses reflected spool for connected downstream node %q", i.peer)
 		}
 		return filepath.Join(i.home, "spool", "for", o.Node, o.Basename), nil
 	case "presence":
@@ -55,7 +55,7 @@ func (i *installer) destination(o offer) (string, error) {
 			return "", fmt.Errorf("presence basename owner does not match node")
 		}
 		if i.role == "serve" && node != i.peer {
-			return "", fmt.Errorf("serve accepts presence only from connected spoke %q", i.peer)
+			return "", fmt.Errorf("server accepts presence only from connected downstream node %q", i.peer)
 		}
 		return filepath.Join(i.home, "presence", o.Basename), nil
 	case "stream":
@@ -66,18 +66,18 @@ func (i *installer) destination(o offer) (string, error) {
 			return "", fmt.Errorf("dial refuses reflected stream shard for self %q", i.peer)
 		}
 		if i.role == "serve" && o.Node != i.peer {
-			return "", fmt.Errorf("serve accepts stream only from connected spoke %q", i.peer)
+			return "", fmt.Errorf("server accepts stream only from connected downstream node %q", i.peer)
 		}
 		return filepath.Join(i.home, "streams", o.Stream, o.Node, o.Basename), nil
 	case "mind":
 		if !validNode(o.Session) || !validGeneration(o.Basename) {
-			return "", fmt.Errorf("invalid mind session or generation")
+			return "", fmt.Errorf("invalid session status session or generation")
 		}
 		if i.role == "dial" && o.Node == i.peer {
-			return "", fmt.Errorf("dial refuses reflected mind shard for self %q", i.peer)
+			return "", fmt.Errorf("client refuses reflected session status shard for self %q", i.peer)
 		}
 		if i.role == "serve" && o.Node != i.peer {
-			return "", fmt.Errorf("serve accepts mind only from connected spoke %q", i.peer)
+			return "", fmt.Errorf("server accepts session status only from connected downstream node %q", i.peer)
 		}
 		return filepath.Join(i.home, "minds", o.Node, o.Session, o.Basename), nil
 	default:
@@ -227,42 +227,42 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	// Id=>bytes invariant applies to spool Id objects; presence has no Id.
 	// Replace only presence atomically, without interpreting its contents.
 	if o.Class == "presence" {
-		// A .watcher declaration is owned by the watcher's node and carries its
+		// A `.watcher` declaration is owned by the watchdog's node and carries its
 		// declared epoch on line 1 ("retired <epoch>" for a tombstone). Never let
 		// a delayed older copy overwrite a newer one: replication order is not
 		// guaranteed across the link and the rsync fallback.
 		if strings.HasSuffix(o.Basename, ".watcher") {
-			if incoming, ok := watcherEpoch(data); ok {
+			if incoming, ok := watchdogEpoch(data); ok {
 				if existing, err := os.ReadFile(dest); err == nil {
-					if current, ok := watcherEpoch(existing); ok && incoming < current {
+					if current, ok := watchdogEpoch(existing); ok && incoming < current {
 						_ = os.Remove(tmp)
-						i.logger.Printf("stale watcher declaration ignored: %s (%d < %d)", o.Basename, incoming, current)
+						i.logger.Printf("stale watchdog declaration ignored: %s (%d < %d)", o.Basename, incoming, current)
 						return installed, dest, nil
 					}
 				}
 			}
 		}
 		if strings.HasSuffix(o.Basename, ".ear") {
-			node, _ := earSnapshotNode(o.Basename)
-			incoming, parseErr := parseEarsBytes(data, node)
+			node, _ := listenerSnapshotNode(o.Basename)
+			incoming, parseErr := parseListenerSnapshotBytes(data, node)
 			if parseErr != nil {
 				_ = os.Remove(tmp)
-				i.logger.Printf("invalid ear snapshot ignored: %s: %v", o.Basename, parseErr)
+				i.logger.Printf("invalid listener snapshot ignored: %s: %v", o.Basename, parseErr)
 				return alreadyStored, dest, nil
 			}
-			if existing, readErr := readRegularBytes(dest, earsReaderMaxBytes+1); readErr == nil {
-				current, currentErr := parseEarsBytes(existing, node)
+			if existing, readErr := readRegularBytes(dest, listenerReaderMaxBytes+1); readErr == nil {
+				current, currentErr := parseListenerSnapshotBytes(existing, node)
 				if currentErr == nil {
 					switch {
 					case incoming.Generation < current.Generation:
 						_ = os.Remove(tmp)
-						i.logger.Printf("stale ear snapshot ignored: %s (%d < %d)", o.Basename, incoming.Generation, current.Generation)
+						i.logger.Printf("stale listener snapshot ignored: %s (%d < %d)", o.Basename, incoming.Generation, current.Generation)
 						return alreadyStored, dest, nil
 					case incoming.Generation == current.Generation && bytes.Equal(data, existing):
 						_ = os.Remove(tmp)
 						return alreadyStored, dest, nil
 					case incoming.Generation == current.Generation:
-						quarantine, err := i.quarantineEar(tmp, node, incoming.Generation, digest, sha256.Sum256(existing))
+						quarantine, err := i.quarantineListener(tmp, node, incoming.Generation, digest, sha256.Sum256(existing))
 						if err != nil {
 							return quarantined, tmp, err
 						}
@@ -331,7 +331,7 @@ func (i *installer) receive(o offer, data []byte) (installResult, string, error)
 	}
 }
 
-func (i *installer) quarantineEar(tmp, node string, generation int64, incoming, existing [sha256.Size]byte) (string, error) {
+func (i *installer) quarantineListener(tmp, node string, generation int64, incoming, existing [sha256.Size]byte) (string, error) {
 	dir := filepath.Join(i.home, "quarantine", "ears")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
@@ -346,7 +346,7 @@ func (i *installer) quarantineEar(tmp, node string, generation int64, incoming, 
 	if err := syncDir(dir); err != nil {
 		return "", err
 	}
-	i.logger.Printf("conflicting ear snapshot quarantined: node=%s generation=%d existing=%x incoming=%x", node, generation, existing, incoming)
+	i.logger.Printf("conflicting listener snapshot quarantined: node=%s sequence=%d existing=%x incoming=%x", node, generation, existing, incoming)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return "", err
@@ -422,9 +422,9 @@ func streamEpoch(id string) (uint64, error) {
 	return strconv.ParseUint(epoch, 10, 64)
 }
 
-func mindEpoch(generation string) (uint64, error) {
+func statusEpoch(generation string) (uint64, error) {
 	if !validGeneration(generation) {
-		return 0, fmt.Errorf("invalid mind generation")
+		return 0, fmt.Errorf("invalid session status generation")
 	}
 	epoch, _, _ := strings.Cut(generation, ".")
 	return strconv.ParseUint(epoch, 10, 64)
@@ -435,7 +435,7 @@ func offerEpoch(class, basename string) (uint64, error) {
 	case "stream":
 		return streamEpoch(basename)
 	case "mind":
-		return mindEpoch(basename)
+		return statusEpoch(basename)
 	default:
 		return 0, fmt.Errorf("class %q has no epoch", class)
 	}
@@ -599,14 +599,14 @@ func removeTransit(path string, offered [sha256.Size]byte) error {
 		return err
 	}
 	if !bytes.Equal(current[:], offered[:]) {
-		return fmt.Errorf("transit changed after OFFER; refusing unlink")
+		return fmt.Errorf("in-flight copy changed after OFFER; refusing unlink")
 	}
 	return os.Remove(path)
 }
 
-// watcherEpoch reads the declared epoch on the first line of a .watcher
+// watchdogEpoch reads the declared epoch on the first line of a `.watcher`
 // marker; "retired <epoch>" tombstones count as that epoch.
-func watcherEpoch(data []byte) (int64, bool) {
+func watchdogEpoch(data []byte) (int64, bool) {
 	line := data
 	if i := bytes.IndexByte(data, '\n'); i >= 0 {
 		line = data[:i]

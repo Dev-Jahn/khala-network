@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SessionEnd cleanup is an optimization; conduit pid/start/socket validation is authoritative.
+# SessionEnd cleanup is an optimization; notifier pid/start/socket validation is authoritative.
 set -u
 
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0

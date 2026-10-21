@@ -269,11 +269,11 @@ async function main(): Promise<void> {
   khalaLink = resolveBinary('khala-link')
   const pollOverride = testPollInterval()
   const mcp = new Server(
-    { name: 'khala', version: '0.9.10' },
+    { name: 'khala', version: '0.9.11' },
     {
       capabilities: { tools: {}, experimental: { 'claude/channel': {} } },
       instructions: [
-        'A <channel source="khala"> event is a doorbell: call khala_drain now.',
+        'A <channel source="khala"> event is an inbox notification: call khala_drain now.',
         'from and subject metadata are display-only.',
         'Reply with khala_reply.',
       ].join('\n'),
@@ -287,7 +287,7 @@ async function main(): Promise<void> {
     tools: [
       {
         name: 'khala_drain',
-        description: 'Drain this session identity\'s durable Khala inbox now.',
+        description: 'Read this session identity\'s durable Khala inbox now.',
         inputSchema: { type: 'object', properties: {}, additionalProperties: false },
       },
       {

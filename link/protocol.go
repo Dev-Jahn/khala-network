@@ -28,7 +28,7 @@ const (
 	protocolMajor  = uint64(1)
 	protocolMinor  = uint64(2)
 	streamMinor    = uint64(1)
-	mindMinor      = uint64(2)
+	statusMinor    = uint64(2)
 	maxControlSize = 64 << 10
 )
 
@@ -365,7 +365,7 @@ func transferID(class, stream, node, session, basename string, digest [sha256.Si
 	}
 	_, _ = io.WriteString(h, node)
 	_, _ = io.WriteString(h, "\x00")
-	// Session is part of a mind generation's path identity. Binding it makes
+	// Session is part of a session status generation's path identity. Binding it makes
 	// transfer ID imply both the installed bytes and their quarantine/path
 	// judgment, while omitting it for legacy classes preserves every 1.1 byte.
 	if class == "mind" {

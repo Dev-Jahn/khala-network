@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Record only that the resolved session completed a turn. The node conduit owns
-# delivery; this hook never drains mail, calls the CLI, or signals a process.
+# Record only that the resolved session completed a turn. The node notifier owns
+# delivery; this hook never reads the inbox, calls the CLI, or signals a process.
 set -u
 
 HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
@@ -8,7 +8,7 @@ HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 0
 
 khala_stop_input=$(cat 2>/dev/null) || khala_stop_input=
 khala_stop_active=$(printf '%s\n' "$khala_stop_input" | tr '\n' ' ' | \
-    sed -n 's/.*"stop_hook_active"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')
+    sed -n 's/.*"stop_hook_active"[[:space:]]*:[[:space:]]*\([a-z][a-z]*\).*/\1/p')
 [ "$khala_stop_active" != true ] || exit 0
 
 khala_discover || exit 0

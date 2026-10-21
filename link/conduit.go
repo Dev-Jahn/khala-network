@@ -25,7 +25,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-const conduitAdapterVersion = "1"
+const notifierAdapterVersion = "1"
 
 type deliveryJournal struct {
 	BootID       string   `json:"bootId"`
@@ -50,113 +50,119 @@ type deliveryJournalAt struct {
 	at      time.Time
 }
 
-type conduitState struct {
-	generation         string
-	firstSeen          time.Time
-	attemptIndex       int
-	writtenRings       int
-	outstandingRings   int
-	outstandingWritten time.Time
-	targetInstance     string
-	targetPID          int
-	targetPIDStart     string
-	lastAttempt        time.Time
-	lastWritten        time.Time
-	nextAttempt        time.Time
-	lastDrainToken     string
-	failures           int
-	echoLogged         bool
+type notifierState struct {
+	pendingDigest            string
+	firstSeen                time.Time
+	attemptIndex             int
+	notificationsSent        int
+	outstandingNotifications int
+	outstandingWritten       time.Time
+	targetInstance           string
+	targetPID                int
+	targetPIDStart           string
+	lastAttempt              time.Time
+	lastWritten              time.Time
+	nextAttempt              time.Time
+	lastInboxReadToken       string
+	failures                 int
+	echoLogged               bool
 }
 
-type pendingLetter struct {
+type pendingMessage struct {
 	id          string
 	installedAt int64
-	// kind is the envelope Type header value ("" when absent).
+	// kind is the message Type header value ("" when absent).
 	kind    string
 	from    string
 	subject string
-	notice  bool
+	alert   bool
 	urgent  bool
-	// later is set when the envelope carries "Priority: later" — the sender
-	// asked for the doorbell to wait until the session is idle.
+	// later is set when the message headers carry "Priority: later" — the sender
+	// asked for the inbox notification to wait until the session is idle.
 	later bool
 }
 
-// conduitBeforeDoorbellWrite is nil in production. Tests use it to change the
+// notifierBeforeNotificationWrite is nil in production. Tests use it to change the
 // inbox deterministically after a frame is built and before its final re-check.
-var conduitBeforeDoorbellWrite func(identity string)
+var notifierBeforeNotificationWrite func(identity string)
 
-type conduit struct {
-	home                string
-	runtime             string
-	bootID              string
-	self                string
-	logger              *log.Logger
-	scanEvery           time.Duration
-	backoff             []time.Duration
-	degradeAt           int
-	statesMu            sync.Mutex
-	states              map[string]*conduitState
-	verificationReasons map[string]string
-	earMu               sync.Mutex
-	earInterval         time.Duration
-	earGeneration       int64
-	earLastWrite        time.Time
-	earMailboxes        []string
-	drainedWarned       map[string]bool
-	turnsWarned         map[string]bool
-	earLastSignature    string
-	earRegistrationSig  string
-	earSignatureSet     bool
-	earInstances        map[string]bool
-	earForceWrite       bool
-	earSuppressed       bool
-	scanComplete        bool
-	earReady            bool
-	watcher             *fsnotify.Watcher
-	watchedDir          map[string]struct{}
+type notifier struct {
+	home                    string
+	runtime                 string
+	bootID                  string
+	self                    string
+	logger                  *log.Logger
+	scanEvery               time.Duration
+	backoff                 []time.Duration
+	degradeAt               int
+	statesMu                sync.Mutex
+	states                  map[string]*notifierState
+	verificationReasons     map[string]string
+	listenerMu              sync.Mutex
+	listenerInterval        time.Duration
+	snapshotSequence        int64
+	listenerLastWrite       time.Time
+	listenerUpstreams       []string
+	inboxReadWarned         map[string]bool
+	turnsWarned             map[string]bool
+	listenerLastSignature   string
+	listenerRegistrationSig string
+	listenerSignatureSet    bool
+	listenerInstances       map[string]bool
+	listenerForceWrite      bool
+	listenerSuppressed      bool
+	scanComplete            bool
+	listenerReady           bool
+	watcher                 *fsnotify.Watcher
+	watchedDir              map[string]struct{}
 	// triage is nil in tests that do not exercise it; nil means off.
 	triage *triageEngine
+	// Parent notices (parent.go). parentGrace 0 means parentNoticeGrace;
+	// the maps are created on first use.
+	parentGrace     time.Duration
+	parentWaiting   map[string]time.Time
+	parentNoticed   map[string]map[string]bool
+	parentNoticeErr map[string]string
 }
 
-func runConduit(args []string) int {
+func runNotifier(args []string) int {
 	if len(args) != 0 {
 		fmt.Fprintln(os.Stderr, "khala-conduit: conduit takes no arguments")
 		return 1
 	}
 	home, err := khalaHome()
 	if err != nil {
-		return conduitFatalf("%v", err)
+		return notifierFatalf("%v", err)
 	}
 	cfg, err := loadConfig(home)
 	if err != nil {
-		return conduitFatalf("%v", err)
+		return notifierFatalf("%v", err)
 	}
 	runtimePath, err := runtimeRoot()
 	if err != nil {
-		return conduitFatalf("%v", err)
+		return notifierFatalf("%v", err)
 	}
 	bootID, err := currentBootID()
 	if err != nil {
-		return conduitFatalf("%v", err)
+		return notifierFatalf("%v", err)
 	}
-	lock, acquired, err := acquireConduitSingleton(runtimePath, bootID)
+	lock, acquired, err := acquireNotifierSingleton(runtimePath, bootID)
 	if err != nil {
-		return conduitFatalf("singleton: %v", err)
+		return notifierFatalf("singleton: %v", err)
 	}
 	if !acquired {
 		return 0
 	}
 	defer lock.Close()
-	logger, err := newConduitLogger(home)
+	logger, err := newNotifierLogger(home)
 	if err != nil {
-		return conduitFatalf("open log/conduit.log: %v", err)
+		return notifierFatalf("open log/conduit.log: %v", err)
 	}
 	statusPath := filepath.Join(runtimePath, "conduit.status.json")
-	var previous conduitStatus
+	var previous notifierStatus
 	statusErr := readJSON(statusPath, &previous)
 	if statusErr != nil && !os.IsNotExist(statusErr) {
-		return conduitFatalf("read conduit status: %v", statusErr)
+		return notifierFatalf("read notifier status: %v", statusErr)
 	}
 	if statusErr == nil && previous.PID != os.Getpid() && previous.BootID == bootID &&
 		processAliveWithStart(previous.PID, previous.PIDStart, bootID) {
@@ -165,53 +171,54 @@ func runConduit(args []string) int {
 	}
 	pidStart, err := processStart(os.Getpid(), bootID)
 	if err != nil {
-		return conduitFatalf("read own process start: %v", err)
+		return notifierFatalf("read own process start: %v", err)
 	}
-	status := conduitStatus{
+	status := notifierStatus{
 		BootID: bootID, PID: os.Getpid(), PIDStart: pidStart, Runtime: runtimePath,
-		Adapter: conduitAdapterVersion, StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Adapter: notifierAdapterVersion, StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if err := writeAtomicJSON(statusPath, status, 0600); err != nil {
-		return conduitFatalf("write conduit status: %v", err)
+		return notifierFatalf("write notifier status: %v", err)
 	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		return conduitFatalf("create watcher: %v", err)
+		return notifierFatalf("create watcher: %v", err)
 	}
 	defer watcher.Close()
-	c := &conduit{
+	c := &notifier{
 		home: home, runtime: runtimePath, bootID: bootID, self: cfg.self, logger: logger,
 		scanEvery: durationEnv("KHALA_CONDUIT_TEST_SCAN_INTERVAL", time.Second),
-		backoff:   conduitBackoff(), degradeAt: 3, states: make(map[string]*conduitState),
+		backoff:   notifierBackoff(), degradeAt: 3, states: make(map[string]*notifierState),
 		verificationReasons: make(map[string]string),
 		watcher:             watcher, watchedDir: make(map[string]struct{}),
-		earInterval:  durationEnv("KHALA_CONDUIT_TEST_EAR_INTERVAL", 60*time.Second),
-		earMailboxes: append([]string(nil), cfg.mailboxes...), drainedWarned: make(map[string]bool),
+		listenerInterval:  durationEnv("KHALA_CONDUIT_TEST_EAR_INTERVAL", 60*time.Second),
+		listenerUpstreams: append([]string(nil), cfg.upstreamNodes...), inboxReadWarned: make(map[string]bool),
 		turnsWarned: make(map[string]bool),
 		triage:      newTriageEngine(home, logger),
+		parentGrace: durationEnv("KHALA_CONDUIT_TEST_PARENT_GRACE", parentNoticeGrace),
 	}
 	defer c.triage.close()
-	if c.earInterval < time.Second {
-		c.earInterval = time.Second
+	if c.listenerInterval < time.Second {
+		c.listenerInterval = time.Second
 	}
-	c.earGeneration = readEarGeneration(filepath.Join(home, "presence", "conduit@"+cfg.self+".ear"))
+	c.snapshotSequence = readSnapshotSequence(filepath.Join(home, "presence", "conduit@"+cfg.self+".ear"))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	logger.Printf("started pid=%d runtime=%s", os.Getpid(), runtimePath)
 	if err := c.run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		logger.Printf("stopped with error: %v", err)
-		return conduitFatalf("%v", err)
+		return notifierFatalf("%v", err)
 	}
 	logger.Printf("stopped")
 	return 0
 }
 
-func conduitFatalf(format string, args ...any) int {
+func notifierFatalf(format string, args ...any) int {
 	fmt.Fprintf(os.Stderr, "khala-conduit: "+format+"\n", args...)
 	return 1
 }
 
-func acquireConduitSingleton(root, bootID string) (*os.File, bool, error) {
+func acquireNotifierSingleton(root, bootID string) (*os.File, bool, error) {
 	path := filepath.Join(root, "conduit.lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -242,7 +249,7 @@ func acquireConduitSingleton(root, bootID string) (*os.File, bool, error) {
 	return f, true, nil
 }
 
-func newConduitLogger(home string) (*log.Logger, error) {
+func newNotifierLogger(home string) (*log.Logger, error) {
 	dir := filepath.Join(home, "log")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
@@ -251,33 +258,33 @@ func newConduitLogger(home string) (*log.Logger, error) {
 		"khala-conduit: ", log.LstdFlags|log.Lmicroseconds), nil
 }
 
-// conduitRewrittenAfter is the bounded ladder for an outstanding doorbell.
+// notificationRetryAfter is the bounded backoff schedule for an outstanding inbox notification.
 // A successful frame remains the target registration process's one outstanding
-// wake until a drain stamp proves consumption. A different process starts a
-// new ladder; generation changes only refresh the next scheduled frame's
-// summary. Each unconsumed write advances the ladder, while consumption resets
-// it. Invariant 5: letter arrival cannot mint frames faster than this schedule
-// merely by changing the generation.
-func conduitRewrittenAfter(outstandingRings int) time.Duration {
+// notification until an inbox-read marker proves consumption. A different process starts a
+// new backoff schedule; queue digest changes only refresh the next scheduled frame's
+// summary. Each unconsumed write advances the backoff schedule, while consumption resets
+// it. Invariant 5: message arrival cannot produce frames faster than this schedule
+// merely by changing the queue digest.
+func notificationRetryAfter(outstandingNotifications int) time.Duration {
 	defaults := []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute}
 	value := os.Getenv("KHALA_CONDUIT_TEST_REWRITE_AFTER")
 	if value == "" {
-		return defaults[rewriteDelayIndex(outstandingRings, len(defaults))]
+		return defaults[rewriteDelayIndex(outstandingNotifications, len(defaults))]
 	}
 	parts := strings.Split(value, ",")
 	parsed := make([]time.Duration, 0, len(parts))
 	for _, part := range parts {
 		duration, err := time.ParseDuration(strings.TrimSpace(part))
 		if err != nil || duration <= 0 {
-			return defaults[rewriteDelayIndex(outstandingRings, len(defaults))]
+			return defaults[rewriteDelayIndex(outstandingNotifications, len(defaults))]
 		}
 		parsed = append(parsed, duration)
 	}
-	return parsed[rewriteDelayIndex(outstandingRings, len(parsed))]
+	return parsed[rewriteDelayIndex(outstandingNotifications, len(parsed))]
 }
 
-func rewriteDelayIndex(outstandingRings, scheduleLength int) int {
-	index := outstandingRings - 1
+func rewriteDelayIndex(outstandingNotifications, scheduleLength int) int {
+	index := outstandingNotifications - 1
 	if index < 0 {
 		index = 0
 	}
@@ -287,7 +294,7 @@ func rewriteDelayIndex(outstandingRings, scheduleLength int) int {
 	return index
 }
 
-func conduitBackoff() []time.Duration {
+func notifierBackoff() []time.Duration {
 	defaults := []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, time.Second, 3 * time.Second, 10 * time.Second, 30 * time.Second}
 	value := os.Getenv("KHALA_CONDUIT_TEST_BACKOFF")
 	if value == "" {
@@ -310,43 +317,43 @@ func conduitBackoff() []time.Duration {
 	return parsed
 }
 
-func (c *conduit) run(ctx context.Context) error {
+func (c *notifier) run(ctx context.Context) error {
 	if err := c.refreshWatches(); err != nil {
 		return err
 	}
 	c.scan()
 	if c.scanComplete {
-		if model, err := c.captureEarsModel("running"); err != nil {
-			c.logger.Printf("build initial ear snapshot failed: %v", err)
-		} else if err := c.writeEars(model); err != nil {
-			c.logger.Printf("write initial ear snapshot failed: %v", err)
+		if model, err := c.captureListenerModel("running"); err != nil {
+			c.logger.Printf("build initial listener snapshot failed: %v", err)
+		} else if err := c.writeListenerSnapshot(model); err != nil {
+			c.logger.Printf("write initial listener snapshot failed: %v", err)
 		}
 	}
 	defer func() {
-		if !c.earReady {
+		if !c.listenerReady {
 			return
 		}
-		c.waitEarWriteSlot()
-		if err := c.writeEars(earsModel{Now: time.Now(), State: "stopping", LinkAge: linkFreshAge(c.home, time.Now())}); err != nil {
-			c.logger.Printf("write final ear snapshot failed: %v", err)
+		c.waitListenerWriteSlot()
+		if err := c.writeListenerSnapshot(listenerModel{Now: time.Now(), State: "stopping", LinkAge: linkFreshAge(c.home, time.Now())}); err != nil {
+			c.logger.Printf("write final listener snapshot failed: %v", err)
 		}
 	}()
 	ticker := time.NewTicker(c.scanEvery)
 	defer ticker.Stop()
-	earTicker := time.NewTicker(c.earInterval)
-	defer earTicker.Stop()
+	listenerTicker := time.NewTicker(c.listenerInterval)
+	defer listenerTicker.Stop()
 	debounce := time.NewTimer(time.Hour)
 	if !debounce.Stop() {
 		<-debounce.C
 	}
 	defer debounce.Stop()
 	var debounceC <-chan time.Time
-	earDebounce := time.NewTimer(time.Hour)
-	if !earDebounce.Stop() {
-		<-earDebounce.C
+	listenerDebounce := time.NewTimer(time.Hour)
+	if !listenerDebounce.Stop() {
+		<-listenerDebounce.C
 	}
-	defer earDebounce.Stop()
-	var earDebounceC <-chan time.Time
+	defer listenerDebounce.Stop()
+	var listenerDebounceC <-chan time.Time
 	cancelDebounce := func() {
 		if !debounce.Stop() {
 			select {
@@ -361,15 +368,15 @@ func (c *conduit) run(ctx context.Context) error {
 		debounce.Reset(200 * time.Millisecond)
 		debounceC = debounce.C
 	}
-	scheduleEar := func(delay time.Duration) {
-		if !earDebounce.Stop() {
+	scheduleListener := func(delay time.Duration) {
+		if !listenerDebounce.Stop() {
 			select {
-			case <-earDebounce.C:
+			case <-listenerDebounce.C:
 			default:
 			}
 		}
-		earDebounce.Reset(delay)
-		earDebounceC = earDebounce.C
+		listenerDebounce.Reset(delay)
+		listenerDebounceC = listenerDebounce.C
 	}
 	for {
 		select {
@@ -378,30 +385,30 @@ func (c *conduit) run(ctx context.Context) error {
 		case <-ticker.C:
 			cancelDebounce()
 			if c.scan() {
-				scheduleEar(2 * time.Second)
+				scheduleListener(2 * time.Second)
 			}
-		case <-earTicker.C:
-			if wait := c.earWriteDelay(); wait > 0 {
-				scheduleEar(wait)
-			} else if model, err := c.captureEarsModel("running"); err != nil {
-				c.logger.Printf("build periodic ear snapshot failed: %v", err)
-			} else if err := c.writeEars(model); err != nil {
-				c.logger.Printf("write periodic ear snapshot failed: %v", err)
+		case <-listenerTicker.C:
+			if wait := c.listenerWriteDelay(); wait > 0 {
+				scheduleListener(wait)
+			} else if model, err := c.captureListenerModel("running"); err != nil {
+				c.logger.Printf("build periodic listener snapshot failed: %v", err)
+			} else if err := c.writeListenerSnapshot(model); err != nil {
+				c.logger.Printf("write periodic listener snapshot failed: %v", err)
 			}
 		case <-debounceC:
 			debounceC = nil
 			if c.scan() {
-				scheduleEar(2 * time.Second)
+				scheduleListener(2 * time.Second)
 			}
-		case <-earDebounceC:
-			earDebounceC = nil
-			if wait := c.earWriteDelay(); wait > 0 {
-				scheduleEar(wait)
-			} else if model, err := c.captureEarsModel("running"); err != nil {
-				c.logger.Printf("build transition ear snapshot failed: %v", err)
-			} else if earsListeningSignature(model.Identities) != c.earLastSignature || c.earForceWrite {
-				if err := c.writeEars(model); err != nil {
-					c.logger.Printf("write transition ear snapshot failed: %v", err)
+		case <-listenerDebounceC:
+			listenerDebounceC = nil
+			if wait := c.listenerWriteDelay(); wait > 0 {
+				scheduleListener(wait)
+			} else if model, err := c.captureListenerModel("running"); err != nil {
+				c.logger.Printf("build transition listener snapshot failed: %v", err)
+			} else if listenerReachabilitySignature(model.Identities) != c.listenerLastSignature || c.listenerForceWrite {
+				if err := c.writeListenerSnapshot(model); err != nil {
+					c.logger.Printf("write transition listener snapshot failed: %v", err)
 				}
 			}
 		case err, ok := <-c.watcher.Errors:
@@ -411,7 +418,7 @@ func (c *conduit) run(ctx context.Context) error {
 			c.logger.Printf("fsnotify error; full rescan: %v", err)
 			cancelDebounce()
 			if c.scan() {
-				scheduleEar(2 * time.Second)
+				scheduleListener(2 * time.Second)
 			}
 		case event, ok := <-c.watcher.Events:
 			if !ok {
@@ -423,13 +430,13 @@ func (c *conduit) run(ctx context.Context) error {
 			scheduleScan()
 			parent := filepath.Dir(event.Name)
 			if parent == filepath.Join(c.runtime, "sessions") || parent == filepath.Join(c.runtime, "identities") {
-				scheduleEar(2 * time.Second)
+				scheduleListener(2 * time.Second)
 			}
 		}
 	}
 }
 
-func (c *conduit) refreshWatches() error {
+func (c *notifier) refreshWatches() error {
 	paths := []string{filepath.Join(c.home, "inbox"), filepath.Join(c.runtime, "sessions"), filepath.Join(c.runtime, "identities")}
 	if err := os.MkdirAll(paths[0], 0700); err != nil {
 		return err
@@ -455,7 +462,7 @@ func (c *conduit) refreshWatches() error {
 	return nil
 }
 
-func (c *conduit) scan() bool {
+func (c *notifier) scan() bool {
 	c.scanComplete = false
 	if err := c.refreshWatches(); err != nil {
 		c.logger.Printf("refresh watches failed: %v", err)
@@ -502,24 +509,24 @@ func (c *conduit) scan() bool {
 			verifiedRegs[instance] = true
 			c.healLease(regs[instance])
 		}
-		c.logVerification(instance, verified, reason)
+		c.logVerification(instance, verified, loggedReason(regs[instance], reason))
 	}
 	c.reclaimLeases(regs, verifiedRegs)
 	c.reapDeadRegistrations(regs)
-	leases, err := loadEarLeases(c.runtime, c.bootID)
+	leases, err := loadListenerLeases(c.runtime, c.bootID)
 	if err != nil {
 		c.logger.Printf("load leases failed: %v", err)
 		return false
 	}
-	transition := c.registrationEarTransition(regs, leases)
+	transition := c.registrationListenerTransition(regs, leases)
 	identities := make([]string, 0, len(leases))
 	for identity := range leases {
 		identities = append(identities, identity)
 	}
 	sort.Strings(identities)
 	for _, identity := range identities {
-		letters := c.pending(identity)
-		if len(ringLetters(letters)) == 0 {
+		messages := c.pending(identity)
+		if len(notifiableMessages(messages)) == 0 {
 			c.statesMu.Lock()
 			delete(c.states, identity)
 			c.statesMu.Unlock()
@@ -528,22 +535,23 @@ func (c *conduit) scan() bool {
 		lease := leases[identity]
 		if lease.State != "owned" ||
 			!validInstanceID(lease.InstanceID) {
-			c.observeGeneration(identity, "", letters)
+			c.observeQueueDigest(identity, "", messages)
 			continue
 		}
 		reg, ok := regs[lease.InstanceID]
 		if !ok || reg.Identity != identity {
-			c.observeGeneration(identity, "", letters)
+			c.observeQueueDigest(identity, "", messages)
 			continue
 		}
-		c.maybeRing(identity, lease, reg, letters)
+		c.maybeNotify(identity, lease, reg, messages)
 	}
+	c.noticeParents(regs)
 	c.scanComplete = true
-	c.earReady = true
+	c.listenerReady = true
 	return transition
 }
 
-func (c *conduit) registrationEarTransition(registrations map[string]sessionRegistration, leases map[string]identityLease) bool {
+func (c *notifier) registrationListenerTransition(registrations map[string]sessionRegistration, leases map[string]identityLease) bool {
 	byIdentity := make(map[string][]sessionRegistration)
 	identitySet := make(map[string]bool)
 	currentInstances := make(map[string]bool, len(registrations))
@@ -560,50 +568,50 @@ func (c *conduit) registrationEarTransition(registrations map[string]sessionRegi
 		names = append(names, identity)
 	}
 	sort.Strings(names)
-	rows := make([]earsIdentity, 0, len(names))
+	rows := make([]listenerIdentity, 0, len(names))
 	for _, identity := range names {
-		row, err := c.buildEarIdentityBase(identity, byIdentity[identity], leases[identity])
+		row, err := c.buildListenerIdentityBase(identity, byIdentity[identity], leases[identity])
 		if err != nil {
-			c.logger.Printf("build ear transition state failed: %v", err)
+			c.logger.Printf("build listener snapshot transition state failed: %v", err)
 			return false
 		}
 		rows = append(rows, row)
 	}
-	current := earsListeningSignature(rows)
-	if !c.earSignatureSet {
-		c.earRegistrationSig = current
-		c.earInstances = currentInstances
-		c.earSignatureSet = true
+	current := listenerReachabilitySignature(rows)
+	if !c.listenerSignatureSet {
+		c.listenerRegistrationSig = current
+		c.listenerInstances = currentInstances
+		c.listenerSignatureSet = true
 		return false
 	}
-	changed := current != c.earRegistrationSig
-	for instance := range c.earInstances {
+	changed := current != c.listenerRegistrationSig
+	for instance := range c.listenerInstances {
 		if !currentInstances[instance] {
-			c.earMu.Lock()
-			c.earForceWrite = true
-			c.earMu.Unlock()
+			c.listenerMu.Lock()
+			c.listenerForceWrite = true
+			c.listenerMu.Unlock()
 			break
 		}
 	}
-	c.earRegistrationSig = current
-	c.earInstances = currentInstances
+	c.listenerRegistrationSig = current
+	c.listenerInstances = currentInstances
 	return changed
 }
 
-func (c *conduit) observeGeneration(identity, instance string, letters []pendingLetter) {
-	if len(ringLetters(letters)) == 0 {
+func (c *notifier) observeQueueDigest(identity, instance string, messages []pendingMessage) {
+	if len(notifiableMessages(messages)) == 0 {
 		return
 	}
-	generation := letterGeneration(letters)
+	pendingDigest := queueDigest(messages)
 	c.statesMu.Lock()
 	state := c.states[identity]
 	c.statesMu.Unlock()
 	changed := false
 	if state == nil {
 		if instance == "" {
-			state = &conduitState{generation: generation, firstSeen: time.Now()}
+			state = &notifierState{pendingDigest: pendingDigest, firstSeen: time.Now()}
 		} else {
-			state = c.restoreState(identity, instance, generation)
+			state = c.restoreState(identity, instance, pendingDigest)
 		}
 		c.statesMu.Lock()
 		if existing := c.states[identity]; existing != nil {
@@ -615,24 +623,24 @@ func (c *conduit) observeGeneration(identity, instance string, letters []pending
 		changed = true
 	}
 	c.statesMu.Lock()
-	if state.generation != generation {
-		state.generation = generation
+	if state.pendingDigest != pendingDigest {
+		state.pendingDigest = pendingDigest
 		state.firstSeen = time.Now()
 		state.attemptIndex = 0
-		state.writtenRings = 0
+		state.notificationsSent = 0
 		state.echoLogged = false
 		changed = true
 	}
 	snapshot := *state
 	c.statesMu.Unlock()
 	if changed {
-		if err := c.writeEarSidecar(identity, snapshot); err != nil {
-			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		if err := c.writeListenerSidecar(identity, snapshot); err != nil {
+			c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 		}
 	}
 }
 
-func (c *conduit) pruneVerificationReasons(regs map[string]sessionRegistration) {
+func (c *notifier) pruneVerificationReasons(regs map[string]sessionRegistration) {
 	for instance := range c.verificationReasons {
 		if _, exists := regs[instance]; !exists {
 			delete(c.verificationReasons, instance)
@@ -640,7 +648,17 @@ func (c *conduit) pruneVerificationReasons(regs map[string]sessionRegistration) 
 	}
 }
 
-func (c *conduit) logVerification(instance string, verified bool, reason string) {
+// loggedReason is the verification failure worth a log line. A Codex worker (an
+// exec lane) is never rung — its mail enters the turn through hooks (D18) — so
+// registering without a receive opt-in is how it is meant to be, not a fault.
+func loggedReason(reg sessionRegistration, reason string) string {
+	if reg.Harness == "codex" && reg.Kind == "worker" && reason == "non-interactive registration lacks opt-in" {
+		return ""
+	}
+	return reason
+}
+
+func (c *notifier) logVerification(instance string, verified bool, reason string) {
 	if c.verificationReasons == nil {
 		c.verificationReasons = make(map[string]string)
 	}
@@ -658,7 +676,7 @@ func (c *conduit) logVerification(instance string, verified bool, reason string)
 	}
 }
 
-func (c *conduit) verifyRegistration(reg sessionRegistration, registries []claudeRegistry) (sessionRegistration, bool, string) {
+func (c *notifier) verifyRegistration(reg sessionRegistration, registries []claudeRegistry) (sessionRegistration, bool, string) {
 	resolved := reg
 	if registry, ok := matchingRegistry(resolved, registries); ok {
 		resolved.PID = registry.PID
@@ -721,9 +739,9 @@ func (c *conduit) verifyRegistration(reg sessionRegistration, registries []claud
 // healLease copies a verified registration's pid/pidStart into the identity
 // lease it owns when the lease recorded none. On `claude --resume` the Claude
 // registry file can land after the hook's binds, so the lease captured pid 0;
-// the ring gate then never matches (measured 2026-08-16, ink resume). Only the
+// the notification gate then never matches (measured 2026-08-16, ink resume). Only the
 // same instance/epoch/session is healed; nothing else about the lease changes.
-func (c *conduit) healLease(reg sessionRegistration) {
+func (c *notifier) healLease(reg sessionRegistration) {
 	if reg.PID <= 1 || reg.PIDStart == "" || reg.LeaseEpoch == 0 {
 		return
 	}
@@ -765,7 +783,7 @@ func leaseNeedsHeal(lease identityLease, reg sessionRegistration) bool {
 	return lease.PID <= 1 || lease.PID == reg.PID
 }
 
-func (c *conduit) reclaimLeases(regs map[string]sessionRegistration, verified map[string]bool) {
+func (c *notifier) reclaimLeases(regs map[string]sessionRegistration, verified map[string]bool) {
 	byIdentity := make(map[string][]sessionRegistration)
 	for instance, reg := range regs {
 		if verified[instance] && (reg.Kind == "interactive" || reg.ReceiveOptIn) {
@@ -849,7 +867,7 @@ func registrationOwnsLease(root, bootID string, reg sessionRegistration) (bool, 
 	return lease.BootID == bootID && lease.State == "owned" && lease.InstanceID == reg.InstanceID, nil
 }
 
-func (c *conduit) reapDeadRegistrations(regs map[string]sessionRegistration) {
+func (c *notifier) reapDeadRegistrations(regs map[string]sessionRegistration) {
 	now := time.Now()
 	instances := make([]string, 0, len(regs))
 	for instance, reg := range regs {
@@ -897,26 +915,26 @@ func (c *conduit) reapDeadRegistrations(regs map[string]sessionRegistration) {
 	}
 }
 
-func (c *conduit) pending(identity string) []pendingLetter {
+func (c *notifier) pending(identity string) []pendingMessage {
 	return c.readPending(identity, false)
 }
 
-func (c *conduit) pendingForSnapshot(identity string) []pendingLetter {
+func (c *notifier) pendingForSnapshot(identity string) []pendingMessage {
 	return c.readPending(identity, true)
 }
 
-func (c *conduit) readPending(identity string, includeMtime bool) []pendingLetter {
+func (c *notifier) readPending(identity string, includeMtime bool) []pendingMessage {
 	dir := filepath.Join(c.home, "inbox", identity, "new")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	letters := make([]pendingLetter, 0, len(entries))
+	messages := make([]pendingMessage, 0, len(entries))
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() || !validBasename(entry.Name()) {
 			continue
 		}
-		letter := pendingLetter{id: entry.Name()}
+		messageItem := pendingMessage{id: entry.Name()}
 		typeValue := ""
 		urgencyValue := ""
 		f, err := openRegular(filepath.Join(dir, entry.Name()))
@@ -924,7 +942,7 @@ func (c *conduit) readPending(identity string, includeMtime bool) []pendingLette
 			if includeMtime {
 				info, statErr := f.Stat()
 				if statErr == nil {
-					letter.installedAt = info.ModTime().Unix()
+					messageItem.installedAt = info.ModTime().Unix()
 				}
 			}
 			scanner := bufio.NewScanner(io.LimitReader(f, 64<<10))
@@ -934,13 +952,13 @@ func (c *conduit) readPending(identity string, includeMtime bool) []pendingLette
 					break
 				}
 				if strings.HasPrefix(line, "From: ") {
-					letter.from = sanitizePreview(strings.TrimPrefix(line, "From: "), 128)
+					messageItem.from = sanitizePreview(strings.TrimPrefix(line, "From: "), 128)
 				}
 				if strings.HasPrefix(line, "Subject: ") {
-					letter.subject = sanitizePreview(strings.TrimPrefix(line, "Subject: "), 256)
+					messageItem.subject = sanitizePreview(strings.TrimPrefix(line, "Subject: "), 256)
 				}
 				if strings.HasPrefix(line, "Priority: ") && strings.TrimSpace(strings.TrimPrefix(line, "Priority: ")) == "later" {
-					letter.later = true
+					messageItem.later = true
 				}
 				if strings.HasPrefix(line, "Type: ") {
 					typeValue = strings.TrimSpace(strings.TrimPrefix(line, "Type: "))
@@ -951,15 +969,15 @@ func (c *conduit) readPending(identity string, includeMtime bool) []pendingLette
 			}
 			_ = f.Close()
 		}
-		letter.kind = typeValue
+		messageItem.kind = typeValue
 		if typeValue == "notice" {
-			letter.notice = true
-			letter.urgent = urgencyValue != "info"
+			messageItem.alert = true
+			messageItem.urgent = urgencyValue != "info"
 		}
-		letters = append(letters, letter)
+		messages = append(messages, messageItem)
 	}
-	sort.Slice(letters, func(i, j int) bool { return letters[i].id < letters[j].id })
-	return letters
+	sort.Slice(messages, func(i, j int) bool { return messages[i].id < messages[j].id })
+	return messages
 }
 
 func sanitizePreview(value string, limit int) string {
@@ -981,11 +999,11 @@ func sanitizePreview(value string, limit int) string {
 	return value
 }
 
-func letterGeneration(letters []pendingLetter) string {
-	ids := make([]string, 0, len(letters))
-	for _, letter := range letters {
-		if !letter.notice || letter.urgent {
-			ids = append(ids, letter.id)
+func queueDigest(messages []pendingMessage) string {
+	ids := make([]string, 0, len(messages))
+	for _, messageItem := range messages {
+		if !messageItem.alert || messageItem.urgent {
+			ids = append(ids, messageItem.id)
 		}
 	}
 	sort.Strings(ids)
@@ -1000,43 +1018,43 @@ func letterGeneration(letters []pendingLetter) string {
 	return hex.EncodeToString(hash.Sum(nil))
 }
 
-func ringLetters(letters []pendingLetter) []pendingLetter {
-	ring := make([]pendingLetter, 0, len(letters))
-	for _, letter := range letters {
-		if !letter.notice || letter.urgent {
-			ring = append(ring, letter)
+func notifiableMessages(messages []pendingMessage) []pendingMessage {
+	notifiable := make([]pendingMessage, 0, len(messages))
+	for _, messageItem := range messages {
+		if !messageItem.alert || messageItem.urgent {
+			notifiable = append(notifiable, messageItem)
 		}
 	}
-	return ring
+	return notifiable
 }
 
-func letterCounts(letters []pendingLetter) (mail, notices, urgent int) {
-	for _, letter := range letters {
-		if !letter.notice {
+func messageCounts(messages []pendingMessage) (mail, alerts, urgent int) {
+	for _, messageItem := range messages {
+		if !messageItem.alert {
 			mail++
 			continue
 		}
-		notices++
-		if letter.urgent {
+		alerts++
+		if messageItem.urgent {
 			urgent++
 		}
 	}
-	return mail, notices, urgent
+	return mail, alerts, urgent
 }
 
-func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionRegistration, letters []pendingLetter) {
-	if len(ringLetters(letters)) == 0 {
+func (c *notifier) maybeNotify(identity string, lease identityLease, reg sessionRegistration, messages []pendingMessage) {
+	if len(notifiableMessages(messages)) == 0 {
 		c.statesMu.Lock()
 		delete(c.states, identity)
 		c.statesMu.Unlock()
 		return
 	}
 	now := time.Now()
-	generation := letterGeneration(letters)
+	pendingDigest := queueDigest(messages)
 	c.statesMu.Lock()
 	state := c.states[identity]
 	if state == nil {
-		state = c.restoreState(identity, reg.InstanceID, generation)
+		state = c.restoreState(identity, reg.InstanceID, pendingDigest)
 		state.targetInstance = reg.InstanceID
 		state.targetPID = reg.PID
 		state.targetPIDStart = reg.PIDStart
@@ -1050,7 +1068,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		state.targetPID = reg.PID
 		state.targetPIDStart = reg.PIDStart
 		state.attemptIndex = 0
-		state.outstandingRings = 0
+		state.outstandingNotifications = 0
 		state.outstandingWritten = time.Time{}
 		state.failures = 0
 		state.echoLogged = false
@@ -1060,36 +1078,36 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 			state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
 		}
 	}
-	drain := c.readDrainStamp(identity)
-	if state.outstandingRings > 0 && drain.Token != state.lastDrainToken && drain.LastDrain >= state.outstandingWritten.Unix() {
-		state.outstandingRings = 0
+	inboxRead := c.readInboxReadMarker(identity)
+	if state.outstandingNotifications > 0 && inboxRead.Token != state.lastInboxReadToken && inboxRead.LastDrain >= state.outstandingWritten.Unix() {
+		state.outstandingNotifications = 0
 		state.outstandingWritten = time.Time{}
 		state.nextAttempt = now
 	}
-	state.lastDrainToken = drain.Token
-	if state.generation != generation {
-		state.generation = generation
+	state.lastInboxReadToken = inboxRead.Token
+	if state.pendingDigest != pendingDigest {
+		state.pendingDigest = pendingDigest
 		state.firstSeen = now
 		state.attemptIndex = 0
-		state.writtenRings = 0
+		state.notificationsSent = 0
 		state.echoLogged = false
-		if state.outstandingRings == 0 {
+		if state.outstandingNotifications == 0 {
 			if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 				state.nextAttempt = now
 			} else {
 				state.nextAttempt = state.lastAttempt.Add(c.backoff[0])
 			}
 		}
-		if err := c.writeEarSidecar(identity, *state); err != nil {
-			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		if err := c.writeListenerSidecar(identity, *state); err != nil {
+			c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 		}
 	}
 	if now.Before(state.nextAttempt) {
 		c.statesMu.Unlock()
 		return
 	}
-	if state.outstandingRings > 0 {
-		turn := c.readTurnStamp(identity)
+	if state.outstandingNotifications > 0 {
+		turn := c.readTurnMarker(identity)
 		if turn.Present && turn.LastTurn < state.outstandingWritten.Unix() {
 			c.statesMu.Unlock()
 			return
@@ -1097,7 +1115,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	}
 	state.attemptIndex++
 	attemptIndex := state.attemptIndex
-	retry := state.writtenRings
+	retry := state.notificationsSent
 	c.statesMu.Unlock()
 
 	attemptID, err := newUUID()
@@ -1107,12 +1125,12 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	}
 	journal := deliveryJournal{
 		BootID: c.bootID, Identity: identity, InstanceID: reg.InstanceID,
-		Generation: generation, AttemptID: attemptID, AttemptIndex: attemptIndex,
+		Generation: pendingDigest, AttemptID: attemptID, AttemptIndex: attemptIndex,
 		AttemptedAt: now.UTC().Format(time.RFC3339Nano), FirstSeen: state.firstSeen.UTC().Format(time.RFC3339Nano),
 		PeerStatus: "unknown", CCVersion: reg.CCVersion,
 	}
-	for _, letter := range ringLetters(letters) {
-		journal.LetterIDs = append(journal.LetterIDs, letter.id)
+	for _, messageItem := range notifiableMessages(messages) {
+		journal.LetterIDs = append(journal.LetterIDs, messageItem.id)
 	}
 	verified := reg.ConduitVerified && reg.Phase == "ready" && lease.InstanceID == reg.InstanceID &&
 		lease.Epoch > 0 && lease.Epoch == reg.LeaseEpoch && lease.PID == reg.PID &&
@@ -1123,14 +1141,14 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		journal.Error = "registration is not ready and conduit-verified"
 		deliveryErr = errors.New(journal.Error)
 	} else {
-		frame := c.frame(identity, generation, attemptID, retry, letters)
-		if conduitBeforeDoorbellWrite != nil {
-			conduitBeforeDoorbellWrite(identity)
+		frame := c.frame(identity, pendingDigest, attemptID, retry, messages)
+		if notifierBeforeNotificationWrite != nil {
+			notifierBeforeNotificationWrite(identity)
 		}
-		freshLetters := c.pending(identity)
-		if letterGeneration(freshLetters) != generation {
+		freshMessages := c.pending(identity)
+		if queueDigest(freshMessages) != pendingDigest {
 			c.logger.Printf("doorbell skipped: generation changed before write (%s)", identity)
-			if len(ringLetters(freshLetters)) == 0 {
+			if len(notifiableMessages(freshMessages)) == 0 {
 				c.statesMu.Lock()
 				delete(c.states, identity)
 				c.statesMu.Unlock()
@@ -1140,14 +1158,14 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		if reg.ChannelSocket != "" {
 			deliveryErr = c.verifyChannelSocket(reg)
 			if deliveryErr == nil {
-				deliveryErr = writeChannelDoorbell(reg.ChannelSocket, c.channelRequest(generation, attemptID, retry, letters))
+				deliveryErr = writeChannelNotification(reg.ChannelSocket, c.channelRequest(pendingDigest, attemptID, retry, messages))
 			}
 			if deliveryErr == nil {
 				journal.Via = "channel"
 				if !reg.ChannelVerified && reg.Harness != "codex" {
 					info, socketErr := os.Lstat(reg.SocketPath)
 					if socketErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode()&os.ModeSocket != 0 {
-						deliveryErr = writeDoorbell(reg.SocketPath, frame)
+						deliveryErr = writeNotification(reg.SocketPath, frame)
 						if deliveryErr == nil {
 							journal.Via = "channel+socket"
 							c.statesMu.Lock()
@@ -1169,7 +1187,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 				} else {
 					c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
 					journal.Via = "socket"
-					deliveryErr = writeDoorbell(reg.SocketPath, frame)
+					deliveryErr = writeNotification(reg.SocketPath, frame)
 				}
 			}
 		} else if reg.Harness == "codex" {
@@ -1177,7 +1195,7 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 			deliveryErr = errors.New("Codex channel is not bound")
 		} else {
 			journal.Via = "socket"
-			deliveryErr = writeDoorbell(reg.SocketPath, frame)
+			deliveryErr = writeNotification(reg.SocketPath, frame)
 		}
 		if deliveryErr != nil {
 			journal.Status = "failed"
@@ -1204,9 +1222,9 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 		state.failures = 0
 		state.lastWritten = now
 		state.outstandingWritten = now
-		state.writtenRings++
-		state.outstandingRings++
-		state.nextAttempt = now.Add(conduitRewrittenAfter(state.outstandingRings))
+		state.notificationsSent++
+		state.outstandingNotifications++
+		state.nextAttempt = now.Add(notificationRetryAfter(state.outstandingNotifications))
 	} else {
 		delayIndex := attemptIndex - 1
 		if delayIndex >= len(c.backoff) {
@@ -1219,35 +1237,35 @@ func (c *conduit) maybeRing(identity string, lease identityLease, reg sessionReg
 	sidecarState := *state
 	c.statesMu.Unlock()
 	if journal.Status == "written" {
-		if err := c.writeEarSidecar(identity, sidecarState); err != nil {
-			c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+		if err := c.writeListenerSidecar(identity, sidecarState); err != nil {
+			c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 		}
 	}
 	c.updateNativeStatus(reg, failures)
 }
 
-func (c *conduit) restoreState(identity, instance, generation string) *conduitState {
-	state := &conduitState{generation: generation}
+func (c *notifier) restoreState(identity, instance, pendingDigest string) *notifierState {
+	state := &notifierState{pendingDigest: pendingDigest}
 	sidecarCurrent := false
-	if sidecar, err := c.readEarSidecar(identity); err == nil {
+	if sidecar, err := c.readListenerSidecar(identity); err == nil {
 		if sidecar.LastWritten > 0 {
 			state.lastWritten = time.Unix(sidecar.LastWritten, 0)
 		}
-		if sidecar.Generation == generation {
+		if sidecar.Generation == pendingDigest {
 			sidecarCurrent = true
 			state.firstSeen = time.Unix(sidecar.FirstSeen, 0)
-			state.writtenRings = sidecar.WrittenRings
+			state.notificationsSent = sidecar.WrittenRings
 		}
 	}
-	drain := c.readDrainStamp(identity)
-	state.lastDrainToken = drain.Token
+	inboxRead := c.readInboxReadMarker(identity)
+	state.lastInboxReadToken = inboxRead.Token
 	dir := filepath.Join(c.runtime, "deliveries", identity, instance)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		if generation != "" && state.firstSeen.IsZero() {
+		if pendingDigest != "" && state.firstSeen.IsZero() {
 			state.firstSeen = time.Now()
-			if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
-				c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+			if err := c.writeListenerSidecar(identity, *state); err != nil && c.logger != nil {
+				c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 			}
 		}
 		return state
@@ -1267,7 +1285,7 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		}
 	}
 	if len(journals) == 0 {
-		if generation != "" {
+		if pendingDigest != "" {
 			state.firstSeen = time.Now()
 		}
 		return state
@@ -1283,15 +1301,15 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			if state.lastWritten.IsZero() || item.at.After(state.lastWritten) {
 				state.lastWritten = item.at
 			}
-			if drain.LastDrain < item.at.Unix() {
-				state.outstandingRings++
+			if inboxRead.LastDrain < item.at.Unix() {
+				state.outstandingNotifications++
 				state.outstandingWritten = item.at
 			}
-			if !sidecarCurrent && item.journal.Generation == generation {
-				state.writtenRings++
+			if !sidecarCurrent && item.journal.Generation == pendingDigest {
+				state.notificationsSent++
 			}
 		}
-		if item.journal.Generation == generation {
+		if item.journal.Generation == pendingDigest {
 			firstSeen := item.at
 			if recorded, err := time.Parse(time.RFC3339Nano, item.journal.FirstSeen); err == nil {
 				firstSeen = recorded
@@ -1306,12 +1324,12 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 		}
 	}
 	if latestCurrent.at.IsZero() {
-		if generation != "" {
+		if pendingDigest != "" {
 			if state.firstSeen.IsZero() {
 				state.firstSeen = time.Now()
 			}
-			if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
-				c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+			if err := c.writeListenerSidecar(identity, *state); err != nil && c.logger != nil {
+				c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 			}
 		}
 	} else {
@@ -1327,16 +1345,16 @@ func (c *conduit) restoreState(identity, instance, generation string) *conduitSt
 			index = len(c.backoff) - 1
 		}
 		state.nextAttempt = latest.at.Add(c.backoff[index])
-	} else if state.outstandingRings > 0 {
-		state.nextAttempt = state.outstandingWritten.Add(conduitRewrittenAfter(state.outstandingRings))
+	} else if state.outstandingNotifications > 0 {
+		state.nextAttempt = state.outstandingWritten.Add(notificationRetryAfter(state.outstandingNotifications))
 	}
-	if err := c.writeEarSidecar(identity, *state); err != nil && c.logger != nil {
-		c.logger.Printf("write ear sidecar %s failed: %v", identity, err)
+	if err := c.writeListenerSidecar(identity, *state); err != nil && c.logger != nil {
+		c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 	}
 	return state
 }
 
-func (c *conduit) updateNativeStatus(reg sessionRegistration, failures int) {
+func (c *notifier) updateNativeStatus(reg sessionRegistration, failures int) {
 	status := ""
 	if failures >= c.degradeAt {
 		status = "native-degraded"
@@ -1357,21 +1375,21 @@ func (c *conduit) updateNativeStatus(reg sessionRegistration, failures int) {
 }
 
 // retry is the number of earlier attempts already written for this same
-// generation (0 on the first ring). A session that sees retry > 0 learns that
-// earlier doorbells were opened but never drained (measured 2026-09-02: an
+// queue digest (0 on the first notification). A session that sees retry > 0 learns that
+// earlier notifications opened turns without an inbox read (measured 2026-09-02: an
 // account limit opened four turns that could not run a model call).
-func (c *conduit) frame(identity, generation, attempt string, retry int, letters []pendingLetter) map[string]any {
-	from, subjects := doorbellDisplay(letters)
-	mail, notices, urgent := letterCounts(letters)
+func (c *notifier) frame(identity, pendingDigest, attempt string, retry int, messages []pendingMessage) map[string]any {
+	from, subjects := notificationDisplay(messages)
+	mail, alerts, urgent := messageCounts(messages)
 	streamPending := c.pendingStreams(identity)
 	triageLine := ""
 	if c.triage != nil {
-		if line := c.triage.frameLine(identity, letters); line != "" {
+		if line := c.triage.frameLine(identity, messages); line != "" {
 			triageLine = line + "\n"
 		}
 	}
 	content := fmt.Sprintf("KHALA-CONDUIT/1\nrecipient: %s@%s\npending: %d\nnotices: %d\nurgent: %d\nstreams: %d\nfrom: %s\nsubjects: %s\n%sgeneration: %s\nattempt: %s\nretry: %d\nread: khala inbox --drain",
-		identity, c.self, mail, notices, urgent, streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), triageLine, generation, attempt, retry)
+		identity, c.self, mail, alerts, urgent, streamPending, strings.Join(from, ", "), strings.Join(subjects, "; "), triageLine, pendingDigest, attempt, retry)
 	if len(content) > 8192 {
 		content = content[:8192]
 		for !utf8.ValidString(content) {
@@ -1381,27 +1399,27 @@ func (c *conduit) frame(identity, generation, attempt string, retry int, letters
 	return map[string]any{
 		"type":    "user",
 		"message": map[string]string{"role": "user", "content": content},
-		"from":    "khala:conduit@" + c.self, "priority": doorbellPriority(letters), "msg_id": generation + ":" + attempt,
+		"from":    "khala:conduit@" + c.self, "priority": notificationPriority(messages), "msg_id": pendingDigest + ":" + attempt,
 	}
 }
 
-func doorbellDisplay(letters []pendingLetter) ([]string, []string) {
+func notificationDisplay(messages []pendingMessage) ([]string, []string) {
 	fromSet := make(map[string]struct{})
 	var from []string
 	var subjects []string
-	for _, letter := range letters {
-		if letter.notice && !letter.urgent {
+	for _, messageItem := range messages {
+		if messageItem.alert && !messageItem.urgent {
 			continue
 		}
-		if letter.from != "" {
-			if _, seen := fromSet[letter.from]; !seen && len(from) < 8 {
-				fromSet[letter.from] = struct{}{}
-				from = append(from, letter.from)
+		if messageItem.from != "" {
+			if _, seen := fromSet[messageItem.from]; !seen && len(from) < 8 {
+				fromSet[messageItem.from] = struct{}{}
+				from = append(from, messageItem.from)
 			}
 		}
-		if letter.subject != "" && len(subjects) < 8 {
-			subject := letter.subject
-			if letter.notice {
+		if messageItem.subject != "" && len(subjects) < 8 {
+			subject := messageItem.subject
+			if messageItem.alert {
 				subject = "U · " + subject
 			}
 			subjects = append(subjects, subject)
@@ -1410,16 +1428,16 @@ func doorbellDisplay(letters []pendingLetter) ([]string, []string) {
 	return from, subjects
 }
 
-func (c *conduit) channelRequest(generation, attempt string, retry int, letters []pendingLetter) map[string]any {
-	from, subjects := doorbellDisplay(letters)
-	mail, notices, urgent := letterCounts(letters)
+func (c *notifier) channelRequest(pendingDigest, attempt string, retry int, messages []pendingMessage) map[string]any {
+	from, subjects := notificationDisplay(messages)
+	mail, alerts, urgent := messageCounts(messages)
 	meta := map[string]string{
 		"from":       strings.Join(from, ", "),
 		"subject":    strings.Join(subjects, "; "),
 		"pending":    strconv.Itoa(mail),
-		"notices":    strconv.Itoa(notices),
+		"notices":    strconv.Itoa(alerts),
 		"urgent":     strconv.Itoa(urgent),
-		"generation": generation,
+		"generation": pendingDigest,
 		"attempt":    attempt,
 		"retry":      strconv.Itoa(retry),
 	}
@@ -1428,23 +1446,23 @@ func (c *conduit) channelRequest(generation, attempt string, retry int, letters 
 	} else {
 		meta["user"] = fmt.Sprintf("%d senders", len(from))
 	}
-	if doorbellPriority(letters) == "later" {
+	if notificationPriority(messages) == "later" {
 		meta["later"] = "1"
 	}
-	ring := ringLetters(letters)
-	lines := make([]string, 0, len(ring)+1)
-	for _, letter := range ring {
-		if letter.notice {
-			lines = append(lines, fmt.Sprintf("%s · U · %s", letter.from, letter.subject))
+	notifiable := notifiableMessages(messages)
+	lines := make([]string, 0, len(notifiable)+1)
+	for _, messageItem := range notifiable {
+		if messageItem.alert {
+			lines = append(lines, fmt.Sprintf("%s · U · %s", messageItem.from, messageItem.subject))
 		} else {
-			lines = append(lines, fmt.Sprintf("%s · %s", letter.from, letter.subject))
+			lines = append(lines, fmt.Sprintf("%s · %s", messageItem.from, messageItem.subject))
 		}
 	}
-	lines = append(lines, fmt.Sprintf("%d letters, %d notices — run khala_drain", mail, notices))
+	lines = append(lines, fmt.Sprintf("%d letters, %d notices — run khala_drain", mail, alerts))
 	return map[string]any{"v": 1, "content": strings.Join(lines, "\n"), "meta": meta}
 }
 
-func (c *conduit) verifyChannelSocket(reg sessionRegistration) error {
+func (c *notifier) verifyChannelSocket(reg sessionRegistration) error {
 	if !processAliveWithStart(reg.ChannelPID, reg.ChannelPIDStart, c.bootID) {
 		return errors.New("channel pid/start mismatch")
 	}
@@ -1476,28 +1494,28 @@ func (c *conduit) verifyChannelSocket(reg sessionRegistration) error {
 	return nil
 }
 
-// doorbellPriority is the Claude Code inbox priority of one doorbell. The
+// notificationPriority is the Claude Code inbox priority of one inbox notification. The
 // default is "next": Claude Code dequeues next between tool calls of a running
 // turn, exactly as its own SendMessage does, while "later" waits for idle —
 // and an autonomous turn can run for tens of minutes (user decision
-// 2026-08-17, superseding the 0.5.0 default). A doorbell drops to "later" only
-// when every letter in the ring set carries "Priority: later" (khala send
-// --later); info notices are outside that set, while one ordinary letter keeps
+// 2026-08-17, superseding the 0.5.0 default). A inbox notification drops to "later" only
+// when every notifiable message carries "Priority: later" (khala send
+// --later); info alerts are outside that set, while one ordinary message keeps
 // the batch prompt. "now" is never minted here.
-func doorbellPriority(letters []pendingLetter) string {
-	ring := ringLetters(letters)
-	if len(ring) == 0 {
+func notificationPriority(messages []pendingMessage) string {
+	notifiable := notifiableMessages(messages)
+	if len(notifiable) == 0 {
 		return "next"
 	}
-	for _, letter := range ring {
-		if !letter.later {
+	for _, messageItem := range notifiable {
+		if !messageItem.later {
 			return "next"
 		}
 	}
 	return "later"
 }
 
-func (c *conduit) pendingStreams(identity string) int {
+func (c *notifier) pendingStreams(identity string) int {
 	joinDir := filepath.Join(c.home, "join", identity)
 	joins, err := os.ReadDir(joinDir)
 	if err != nil {
@@ -1568,7 +1586,7 @@ func compareMessageIDs(left, right string) int {
 	return strings.Compare(left, right)
 }
 
-func writeDoorbell(socketPath string, frame map[string]any) error {
+func writeNotification(socketPath string, frame map[string]any) error {
 	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
 	if err != nil {
 		return err
@@ -1592,7 +1610,7 @@ func writeDoorbell(socketPath string, frame map[string]any) error {
 	return nil
 }
 
-func writeChannelDoorbell(socketPath string, request map[string]any) error {
+func writeChannelNotification(socketPath string, request map[string]any) error {
 	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
 	if err != nil {
 		return err
@@ -1628,7 +1646,7 @@ func writeChannelDoorbell(socketPath string, request map[string]any) error {
 		return fmt.Errorf("parse channel response: %w", err)
 	}
 	if !response.OK {
-		return fmt.Errorf("channel rejected doorbell: %s", firstNonempty(response.Error, "unspecified error"))
+		return fmt.Errorf("channel rejected inbox notification: %s", firstNonempty(response.Error, "unspecified error"))
 	}
 	return nil
 }

@@ -254,9 +254,9 @@ else
         khala_install_fail 'choose --bootstrap or provide --mailbox <name> <coordinate>'
     }
     khala_install_valid_name "$KHALA_MAILBOX_NAME" || \
-        khala_install_fail "invalid mailbox name: $KHALA_MAILBOX_NAME"
+        khala_install_fail "invalid upstream name: $KHALA_MAILBOX_NAME"
     case "$KHALA_MAILBOX_COORD" in
-        *[[:space:]]*) khala_install_fail 'mailbox coordinate must be one whitespace-free config token' ;;
+        *[[:space:]]*) khala_install_fail 'upstream coordinate must be one whitespace-free config token' ;;
     esac
 fi
 
@@ -283,9 +283,9 @@ khala_install_say "using $KHALA_DOWNLOADER for release downloads"
 
 if [ "$KHALA_BOOTSTRAP" -eq 0 ]; then
     if ssh -o BatchMode=yes -o ConnectTimeout=8 "$KHALA_MAILBOX_COORD" true </dev/null >/dev/null 2>&1; then
-        khala_install_say "mailbox $KHALA_MAILBOX_COORD is reachable over batch SSH"
+        khala_install_say "upstream $KHALA_MAILBOX_COORD is reachable over batch SSH"
     else
-        printf 'khala install: WARNING: mailbox %s is unreachable right now; installation continues and sync will retry\n' \
+        printf 'khala install: WARNING: upstream %s is unreachable right now; installation continues and sync will retry\n' \
             "$KHALA_MAILBOX_COORD" >&2
     fi
 fi
@@ -413,12 +413,12 @@ else
 fi
 
 if cmp -s "$KHALA_DESIRED_CONFIG" "$KHALA_CONFIG"; then
-    khala_install_say 'fleet config already matches the requested topology'
+    khala_install_say 'cluster config already matches the requested topology'
 elif [ "$KHALA_CONFIG_CREATED" -eq 1 ]; then
     if ! mv "$KHALA_DESIRED_CONFIG" "$KHALA_CONFIG"; then
-        khala_install_fail 'cannot install the requested fleet config'
+        khala_install_fail 'cannot install the requested cluster config'
     fi
-    khala_install_say 'wrote the requested fleet config atomically'
+    khala_install_say 'wrote the requested cluster config atomically'
 else
     khala_install_show_config_conflict
 fi
@@ -469,7 +469,7 @@ fi
 if ! "$KHALA_CLI" node ensure; then
     khala_install_fail 'khala node ensure failed'
 fi
-khala_install_say 'ensured the node conduit and fleet link services'
+khala_install_say 'ensured the node notifier and cluster relay services'
 
 khala_install_set_cross_session
 
@@ -484,7 +484,7 @@ printf '%s\n' \
     '' \
     'Khala installation complete:' \
     "  CLI: $KHALA_CLI (v$KHALA_VERSION)" \
-    "  link: $KHALA_LINK" \
+    "  relay: $KHALA_LINK" \
     "  config: $KHALA_CONFIG" \
     '' \
     'Next steps:' \

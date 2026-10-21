@@ -287,7 +287,7 @@ khala_link_is_fresh() {
 }
 
 # Run only a hook-owned child for at most $1 seconds. Output paths are explicit
-# so a killed drain can still expose any complete letters it printed first.
+# so a killed inbox read can still expose any complete messages it printed first.
 khala_run_with_deadline() {
     khala_deadline_seconds=$1
     khala_deadline_stdout=$2
