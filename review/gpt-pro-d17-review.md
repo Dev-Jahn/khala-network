@@ -6,11 +6,11 @@
 
 I would block the A release on three issues:
 
-1. **Notice custody is not R4-durable under the rsync fallback.**
+1. **Alert custody is not R4-durable under the rsync fallback.**
 2. **The proposed mutable `.watcher` record has no coherent single-writer or monotonic-update rule.**
 3. **Thirty-day retention based on file age will delete some items immediately after their state transition and can reopen deduplication holes.**
 
-The pre-write conduit recheck is worthwhile, but it only narrows the stale-doorbell race. For B, the design should use **Telegram topics in the user’s private chat**, not a supergroup, and `Type: user` should become an authenticated `Type: operator`. For C, per-session `.ear` files are viable at this scale, but a **single versioned per-node listening/status snapshot** is the better long-term object.
+The pre-write notifier recheck is worthwhile, but it only narrows the stale inbox notification race. For B, the design should use **Telegram topics in the user’s private chat**, not a supergroup, and `Type: user` should become an authenticated `Type: operator`. For C, per-session `.ear` files are viable at this scale, but a **single versioned per-node listening/status snapshot** is the better long-term object.
 
 All code conclusions below are pinned to `78174c70e21652ea2a176e4dc96d6d726dbd81d4`. The `dev` branch moved to a child implementation commit while this review was in progress; I did not mix those changes into the audit.
 
@@ -22,18 +22,18 @@ The draft itself says its line references are against `c813c1f`, not the request
 
 ### Fact 1 — mostly correct, with one type-system conflation
 
-`cmd_send` does write the stated headers, at actual HEAD approximately `bin/khala:2525-2685`, and the conduit parses only `From`, `Subject`, and `Priority`, at `link/conduit.go:669-708`.
+`cmd_send` does write the stated headers, at actual HEAD approximately `bin/khala:2525-2685`, and the notifier parses only `From`, `Subject`, and `Priority`, at `link/conduit.go:669-708`.
 
 Two corrections:
 
-- `Type: entry` is a **stream-object type**, written by `cmd_say`; it is not one of the mail-envelope types accepted in `spool`/`inbox`. `DESIGN.md:457-490` defines mail as `message | ack | bounce | notice`.
-- The existing `queue_infrastructure_message` is not usable as the proposed notice constructor without redesign: it requires a reference message, derives the ID deterministically from that reference, always writes `Refs`, and fixes `Expires` to `ref-epoch + 30 days`, at `bin/khala:1341-1415`.
+- `Type: entry` is a **stream-object type**, written by `cmd_say`; it is not one of the message-header types accepted in `spool`/`inbox`. `DESIGN.md:457-490` defines mail as `message | ack | bounce | notice`.
+- The existing `queue_infrastructure_message` is not usable as the proposed alert constructor without redesign: it requires a reference message, derives the ID deterministically from that reference, always writes `Refs`, and fixes `Expires` to `ref-epoch + 30 days`, at `bin/khala:1341-1415`.
 
 “No current producer creates notice” is correct at this HEAD.
 
 ### Fact 2 — code result correct; explanation of the channel path is stronger than the repository proves
 
-The socket doorbell is `later` only when every pending letter has `Priority: later`, at `link/conduit.go:1044-1072`. The channel request merely sets `meta.later = "1"`; the channel server forwards `content` and `meta` in `notifications/claude/channel` and supplies no explicit queue-priority parameter, at `link/conduit.go:970-1013` and `plugin/channel/server.ts:550-586`.
+The socket inbox notification is `later` only when every pending message has `Priority: later`, at `link/conduit.go:1044-1072`. The channel request merely sets `meta.later = "1"`; the channel server forwards `content` and `meta` in `notifications/claude/channel` and supplies no explicit queue-priority parameter, at `link/conduit.go:970-1013` and `plugin/channel/server.ts:550-586`.
 
 Therefore:
 
@@ -63,9 +63,9 @@ The four runtime subdirectories are correct. The four replicated object classes 
 
 ### Fact 6 — correct
 
-At the pinned HEAD, expiry is checked before a regular spool message is installed in an inbox, at `bin/khala:1806-1831`, but there is no subsequent `new/` or `cur/` expiry. `reconcile_cycle` prunes delivered-log entries, streams, minds, presence and dead-session stream state, but not inboxes or `outbox/{acked,dead}`, at `bin/khala:2230-2265`.
+At the pinned HEAD, expiry is checked before a regular spool message is installed in an inbox, at `bin/khala:1806-1831`, but there is no subsequent `new/` or `cur/` expiry. `reconcile_cycle` prunes delivered-log entries, streams, status board, presence and dead-session stream state, but not inboxes or `outbox/{acked,dead}`, at `bin/khala:2230-2265`.
 
-There is an additional omission not called out in §1: `deliver_fire_and_forget` does **not validate `Expires` at all**, so a current-format notice can be installed even when already expired.
+There is an additional omission not called out in §1: `deliver_fire_and_forget` does **not validate `Expires` at all**, so a current-format alert can be installed even when already expired.
 
 ### Fact 7 — correct
 
@@ -93,21 +93,21 @@ The 29/29 transcript count, latency distribution, and CC-version observations ar
 
 ### Fact 12 — periodic behavior is code-verifiable; `retry: N` interpretation is wrong
 
-The conduit does schedule a successfully written generation for another attempt after ten minutes, at `link/conduit.go:209-222, 821-844`.
+The notifier does schedule a successfully written generation for another attempt after ten minutes, at `link/conduit.go:209-222, 821-844`.
 
-But the draft says the existing `attemptIndex` can be exposed directly as the number of prior missed rings. That is false:
+But the draft says the existing `attemptIndex` can be exposed directly as the number of prior missed inbox notifications. That is false:
 
 - `attemptIndex` increments **before** the delivery attempt.
 - Failed socket/channel writes also consume an attempt index.
 - A successful channel write followed by a failed compatibility socket echo is another ambiguous case.
 
-Thus `attemptIndex` is an attempt count, not a count of doorbells known to have opened a turn, and certainly not a count the session “missed.” `link/conduit.go:710-837`.
+Thus `attemptIndex` is an attempt count, not a count of inbox notifications known to have opened a turn, and certainly not a count the session “missed.” `link/conduit.go:710-837`.
 
 ---
 
 # 2. A — ranked failure modes and smallest closing spec change
 
-## 1. P0: notice custody is lost after relay acceptance, before destination installation — A3
+## 1. P0: alert custody is lost after relay acceptance, before destination installation — A3
 
 There are three separate problems.
 
@@ -119,29 +119,29 @@ First, the draft’s proposed constructor does not match the existing helper. `q
 - always writes into `spool/for/<node>`;
 - does **not** directly install a self-addressed object into `inbox`.
 
-See `bin/khala:1341-1415`. A dedicated notice writer is required.
+See `bin/khala:1341-1415`. A dedicated alert writer is required.
 
-Second, the Go link path and rsync fallback have different custody semantics:
+Second, the Go relay path and rsync fallback have different custody semantics:
 
-- In the Go path, a dial-side source spool candidate has `deleteAfterStored=false`; the source copy remains. A hub’s transit copy is removable only after the downstream peer returns `STORED`. The receiver validates size and digest, synchronizes its temporary file, atomically installs it, synchronizes the directory, and only then returns success. `link/watch.go:322-367`, `link/pump.go:414-563`, `link/install.go:144-244`.
-- In the rsync fallback, the source pushes to the mailbox without source removal, but after the rest of `exchange_with_endpoint` succeeds, `remove_pushed_infrastructure` deletes every local `ack|bounce|notice`. The destination node has not necessarily pulled or installed that notice. `bin/khala:1622-1634, 1637-1708`.
+- In the Go path, a dial-side source spool candidate has `deleteAfterStored=false`; the source copy remains. A upstream’s in-flight copy is removable only after the downstream peer returns `STORED`. The receiver validates size and digest, synchronizes its temporary file, atomically installs it, synchronizes the directory, and only then returns success. `link/watch.go:322-367`, `link/pump.go:414-563`, `link/install.go:144-244`.
+- In the rsync fallback, the source pushes to the mailbox without source removal, but after the rest of `exchange_with_endpoint` succeeds, `remove_pushed_infrastructure` deletes every local `ack|bounce|notice`. The destination node has not necessarily pulled or installed that alert. `bin/khala:1622-1634, 1637-1708`.
 
-So this sequence loses a notice:
+So this sequence loses an alert:
 
-1. Source rsyncs notice to mailbox.
-2. Source deletes its spool copy.
+1. Source rsyncs alert to mailbox.
+2. Source deletes its queued copy.
 3. Mailbox disk disappears.
-4. Destination has never pulled the notice.
+4. Destination has never pulled the alert.
 
 That is precisely the disappearing-relay case R4 was designed around.
 
-**Smallest spec change:** remove `notice` from `remove_pushed_infrastructure`. The originating node retains the notice in its source spool until `Expires`; repeated pushes are deduplicated at the destination. Every spool copy may be silently pruned after a valid `Expires`, but **mailbox custody is not delivery custody**. This preserves “no outbox, no user-visible ack” while restoring at-least-once delivery as long as the source node’s disk survives.
+**Smallest spec change:** remove `notice` from `remove_pushed_infrastructure`. The originating node retains the alert in its source spool until `Expires`; repeated pushes are deduplicated at the destination. Every queued copy may be silently pruned after a valid `Expires`, but **mailbox custody is not delivery custody**. This preserves “no outbox, no user-visible ack” while restoring at-least-once delivery as long as the source node’s disk survives.
 
 Also require the destination to validate `From`, `To`, `Id`, `Type`, `Urgency`, and `Expires` before inbox installation. Today `deliver_fire_and_forget` validates only `To`, at `bin/khala:1862-1904`.
 
 ---
 
-## 2. P0: the five-line mutable watcher marker has no safe ownership model — A4
+## 2. P0: the five-line mutable watchdog marker has no safe ownership model — A4
 
 The current presence installer treats presence as an uninterpreted mutable blob and atomically overwrites the existing path. It performs no schema validation, no monotonicity check, and no conflict detection, at `link/install.go:225-244`. The `now+86400` future-epoch rule applies only to `stream` and `mind`, not to presence, at `link/install.go:193-220`.
 
@@ -149,25 +149,25 @@ Consequences:
 
 - A delayed `active` copy can overwrite a later `retired` copy.
 - Two machines configured with different owners can each compute and publish incompatible `active|silent` state.
-- If the watcher node updates `last-notify` and the owner node updates `active|silent`, there are two writers to one replicated path.
+- If the watchdog node updates `last-notify` and the owner node updates `active|silent`, there are two writers to one replicated path.
 - `owner: steno` is ambiguous; ownership needs to be a full address such as `steno@b200`.
-- Clock skew can cause premature or delayed dead-man transitions if the owner compares its clock directly to a remote epoch.
+- Clock skew can cause premature or delayed heartbeat timeout transitions if the owner compares its clock directly to a remote epoch.
 - Generic current CLI GC is incompatible with the format. `prune_presence` skips only `.watching` and determines age from the first line. A declaration whose first line is a fixed epoch can be deleted after `retain` days even while it remains active. `bin/khala:2165-2203`.
 - Existing `khala presence` accepts only a bare address or `.watching`; an unhandled `.watcher` suffix is an invalid heartbeat filename.
 
 **Smallest sound spec change:**
 
-- Make the replicated watcher object **source-owned only**.
+- Make the replicated watchdog object **source-owned only**.
 - Remove replicated `active|silent`; the owner derives that state locally.
 - Store the full `Owner-Address`.
 - Add a monotonic `Generation: <epoch>.<counter>`.
 - Every notification refresh produces a higher generation carrying `Last-Notify`.
 - Retirement is a higher-generation tombstone, never deletion.
 - The installer accepts a replacement only when the generation is greater; equal generation with different bytes is quarantined.
-- The owner’s dead-man timer is based on **local first-observed time for the latest generation**, not direct subtraction of remote and local wall clocks.
-- Exempt active watcher declarations from generic presence retention; retain retired tombstones for a defined conflict horizon.
+- The owner’s heartbeat timeout is based on **local first-observed time for the latest generation**, not direct subtraction of remote and local wall clocks.
+- Exempt active watchdog declarations from generic presence retention; retain retired tombstones for a defined conflict horizon.
 
-A mind-style immutable generation family is cleaner, but a generation-checked, single-writer presence object is the minimum viable correction. Do not let the owner write fields back into the source-owned marker.
+A session-status-style immutable generation family is cleaner, but a generation-checked, single-writer presence object is the minimum viable correction. Do not let the owner write fields back into the source-owned marker.
 
 ---
 
@@ -175,17 +175,17 @@ A mind-style immutable generation family is cleaner, but a generation-checked, s
 
 A raw “delete files whose mtime is older than 30 days” implementation is wrong because all relevant state changes are renames:
 
-- inbox drain: `new/<Id> → cur/<Id>`;
+- inbox read: `new/<Id> → cur/<Id>`;
 - ack settlement: `outbox/new/<Id> → outbox/acked/<Id>`;
 - expiry: `outbox/new/<Id> → outbox/dead/<Id>`.
 
 A rename preserves the file’s mtime. Therefore:
 
-- a message that waited 31 days in `new` can be deleted immediately after its first drain;
+- a message that waited 31 days in `new` can be deleted immediately after its first inbox read;
 - a message acknowledged after 31 days can disappear from `acked` immediately;
 - a long-lived message moved to `dead` can disappear before any forensic inspection.
 
-The relevant moves are at `bin/khala:1928-1988` and in the inbox drain around `bin/khala:3890-3960`.
+The relevant moves are at `bin/khala:1928-1988` and in the inbox read around `bin/khala:3890-3960`.
 
 There is also a deduplication hole. `log/delivered` is retained for a fixed 60 days, while `send -e` accepts an arbitrary nonnegative TTL. If:
 
@@ -212,11 +212,11 @@ Recommended defaults:
 | `outbox/acked` | 30 days | 90–180 days |
 | `outbox/dead` | 90–180 days | same or longer |
 
-`In-Reply-To` delivery itself does not require the ancestor body, but a useful dashboard, audit trail, and conversation reconstruction need at least `Id`, `From`, `To`, `Date`, `Type`, `Subject`, `In-Reply-To`, digest, and state timestamps. Yes, retention should be per-Type and per-state.
+`In-Reply-To` delivery itself does not require the ancestor body, but a useful dashboard, audit trail, and conversation reconstruction need at least `Id`, `From`, `To`, `Date`, `Type`, `Subject`, `In-Reply-To`, digest, and state timemarkers. Yes, retention should be per-Type and per-state.
 
 ---
 
-## 4. P1: malformed envelope parsing can incorrectly suppress a ring — A1
+## 4. P1: malformed message headers parsing can incorrectly suppress an inbox notification — A1
 
 Supported khala paths mostly protect against partial arrival:
 
@@ -226,7 +226,7 @@ Supported khala paths mostly protect against partial arrival:
 
 Thus a partial file in `inbox/new` mainly comes from unsupported in-place writers, bugs, or manual interference. Still, because `info` suppresses wake-up, its recognition rule must be fail-safe.
 
-The current conduit parser:
+The current notifier parser:
 
 - reads up to 64 KiB;
 - ignores `Scanner.Err`;
@@ -236,57 +236,57 @@ The current conduit parser:
 
 `link/conduit.go:669-738`.
 
-**Correct default:** malformed classification should degrade toward ringing, but not toward a rapid retry loop.
+**Correct default:** malformed classification should degrade toward sending inbox notifications, but not toward a rapid retry loop.
 
 Define:
 
-- `Type` absent or `Type: message` from a 0.7.3 sender → ordinary mail ring rules.
-- Unknown or duplicate `Type` → ring-set, marked malformed.
+- `Type` absent or `Type: message` from a 0.7.3 sender → ordinary mail inbox notification rules.
+- Unknown or duplicate `Type` → notification set, marked malformed.
 - `Type: notice` plus exactly one `Urgency: info` → info only.
-- Missing, duplicate, or unknown `Urgency` on a notice → urgent ring-set.
-- A notice may suppress ringing as `info` only when the full mandatory envelope is valid, the blank header terminator was seen, and `From` resolves to a declared watcher principal.
-- Missing or malformed `Expires` → ring and report malformed; valid already-expired notice → no ring and immediate prune.
-- `Urgency` on any non-notice type is ignored or rejected; it must not downgrade mail or future operator instructions.
+- Missing, duplicate, or unknown `Urgency` on an alert → urgent notification set.
+- An alert may suppress sending inbox notifications as `info` only when the full mandatory message headers is valid, the blank header terminator was seen, and `From` resolves to a declared watchdog principal.
+- Missing or malformed `Expires` → inbox notification and report malformed; valid already-expired alert → no inbox notification and immediate prune.
+- `Urgency` on any non-alert type is ignored or rejected; it must not downgrade mail or future operator instructions.
 
-Also include `(Id, effective lane, effective urgency, effective priority)`—or a digest of the validated control envelope—in the conduit generation. ID-only generation means a changed classification under the same file name is invisible to conduit state.
+Also include `(Id, effective lane, effective urgency, effective priority)`—or a digest of the validated control message headers—in the notifier generation. ID-only generation means a changed classification under the same file name is invisible to notifier state.
 
 ---
 
 ## 5. P1: info-only queues can become permanently invisible — A2
 
-The current SessionStart hook performs one bounded `khala inbox --drain` invocation. Current CLI drain defaults are 20 objects and 64 KiB; the proposed split caps make the invisible-remainder problem more likely. A session with only info notices can therefore have:
+The current SessionStart hook performs one bounded `khala inbox --drain` invocation. Current CLI inbox read defaults are 20 objects and 64 KiB; the proposed split caps make the invisible-remainder problem more likely. A session with only info alerts can therefore have:
 
-- no doorbell;
-- one bounded SessionStart drain;
-- more info notices left behind;
+- no inbox notification;
+- one bounded SessionStart inbox read;
+- more info alerts left behind;
 - no future mail or SessionStart event to surface the remainder.
 
-A notice larger than the per-lane byte cap is worse: without a creation-size limit or “consume one oversize item” rule, it can remain permanently undrainable.
+An alert larger than the per-lane byte cap is worse: without a creation-size limit or “consume one oversize item” rule, it can remain permanently unreadable.
 
 `Priority: later` creates another edge:
 
-- later mail plus info notices produces a later doorbell;
-- a continuously active session may not see that doorbell until idle;
-- after the ring-set portion drains, leftover infos again have no trigger.
+- later mail plus info alerts produces a later inbox notification;
+- a continuously active session may not see that inbox notification until idle;
+- after the notification set portion is read, leftover infos again have no trigger.
 
-**Add a maximum-age rule, in the conduit.** The conduit owns wake decisions; the CLI should only implement deterministic draining.
+**Add a maximum-age rule, in the notifier.** The notifier owns wake decisions; the CLI should only implement deterministic reading the inbox.
 
 Recommended policy:
 
 - Track recipient-local `first-seen` for an unchanged info-only generation.
 - After six hours, emit one `later`-priority “stale info batch” nudge.
-- If still unchanged, repeat at most once per 24 hours until drained or expired.
-- Never place info in the urgent ten-minute re-ring schedule.
+- If still unchanged, repeat at most once per 24 hours until read or expired.
+- Never place info in the urgent ten-minute notification retry schedule.
 - Reset the timer when the info generation changes or becomes empty.
 - Do not use sender `Date` or file mtime as the age clock.
 
-Drain should reserve capacity and order lanes rather than simply scan filename order:
+Inbox read should reserve capacity and order lanes rather than simply scan filename order:
 
 1. authenticated future `operator`;
-2. ordinary messages and urgent notices;
-3. info notices.
+2. ordinary messages and urgent alerts;
+3. info alerts.
 
-Within notices, urgent must not sit behind an info backlog. Enforce a maximum notice body/envelope size below the smallest drain byte budget, or permit one oversize object to be emitted in truncated form and moved to `cur`.
+Within alerts, urgent must not sit behind an info backlog. Enforce a maximum alert body/header size below the smallest inbox read byte budget, or permit one oversize object to be emitted in truncated form and moved to `cur`.
 
 ---
 
@@ -296,19 +296,19 @@ The measurement rules out a terminal retry cap: a cap of four would have lost ex
 
 - a multi-hour account limit;
 - a permission dialog;
-- a malformed object the CLI refuses to drain;
-- an object larger than the drain cap;
-- a forged urgent notice.
+- a malformed object the CLI refuses to inbox read;
+- an object larger than the inbox read cap;
+- a forged urgent alert.
 
 Use **no terminal cap, but lane-sensitive bounded-frequency backoff**:
 
-- authenticated operator or urgent notice: every 10 minutes for the first hour, then every 30 minutes until drain or expiry;
+- authenticated operator or urgent alert: every 10 minutes for the first hour, then every 30 minutes until inbox read or expiry;
 - ordinary message: 10 minutes, 30 minutes, then at most every 2 hours;
 - info-only generation: first nudge at six hours, then at most daily.
 
-Reset the schedule on a generation change or successful drain. Suspend it when there is no verified live registration; resume when a verified registration returns. Validation and maximum-object-size enforcement are prerequisites, otherwise a permanently undrainable object becomes a permanent wake source.
+Reset the schedule on a generation change or successful inbox read. Suspend it when there is no verified live registration; resume when a verified registration returns. Validation and maximum-object-size enforcement are prerequisites, otherwise a permanently unreadable object becomes a permanent wake source.
 
-For genuinely urgent notices, a default two-day expiry should also be reconsidered: expiry is effectively the terminal retry cap. Seven days is safer for operational alerts unless the source is expected to regenerate the condition.
+For genuinely urgent alerts, a default two-day expiry should also be reconsidered: expiry is effectively the terminal retry cap. Seven days is safer for operational alerts unless the source is expected to regenerate the condition.
 
 ---
 
@@ -316,25 +316,25 @@ For genuinely urgent notices, a default two-day expiry should also be reconsider
 
 With the proposed recheck:
 
-1. conduit scans generation `G`;
-2. immediately before writing, conduit rescans and confirms `G`;
-3. the CLI drains `G`;
-4. conduit writes the stale doorbell.
+1. notifier scans generation `G`;
+2. immediately before writing, notifier rescans and confirms `G`;
+3. the CLI reads `G` from the inbox;
+4. notifier writes the stale inbox notification.
 
-The interval is shorter, but nonzero. The only full closure is synchronization shared with inbox drain—e.g. holding the brain lock across final scan and socket/channel write—or an acknowledgement protocol between drain and conduit. That is likely disproportionate for a benign stale wake.
+The interval is shorter, but nonzero. The only full closure is synchronization shared with inbox read—e.g. holding the state lock across final scan and socket/channel write—or an acknowledgement protocol between inbox read and notifier. That is likely disproportionate for a benign stale wake.
 
 The recheck should nevertheless ship, with precise state handling:
 
-- perform it before incrementing the attempt/ring count and before assigning the attempt ID;
+- perform it before incrementing the attempt/notification count and before assigning the attempt ID;
 - if the set is empty, abort without journaling a delivery attempt;
 - if generation changed, restart `maybeRing` using the new snapshot;
 - reset `nextAttempt` for the new generation so an old ten-minute deadline does not suppress it.
 
-A legitimate letter arriving after the final recheck is not inherently lost: fsnotify or the one-second periodic scan should observe a new generation. It may produce a second immediate ring after the first undercounted frame. The spec should say “narrows and bounds stale snapshots,” not “closes the window.”
+A legitimate message arriving after the final recheck is not inherently lost: fsnotify or the one-second periodic scan should observe a new generation. It may produce a second immediate inbox notification after the first undercounted frame. The spec should say “narrows and bounds stale snapshots,” not “closes the window.”
 
 ---
 
-## 8. P2: `retry: N` claims knowledge the conduit does not have — A8
+## 8. P2: `retry: N` claims knowledge the notifier does not have — A8
 
 Use:
 
@@ -350,13 +350,13 @@ not:
 retry: 4
 ```
 
-`pending-for` should be based on recipient-local first observation of the unchanged ring generation. `ring-index` should count only **successfully written doorbells for that generation**, requiring a separate counter from `attemptIndex`.
+`pending-for` should be based on recipient-local first observation of the unchanged inbox notification generation. `ring-index` should count only **successfully written inbox notifications for that generation**, requiring a separate counter from `attemptIndex`.
 
 The model-facing wording should be:
 
-> This pending generation is unchanged after five doorbells.
+> This pending generation is unchanged after five inbox notifications.
 
-It should not say earlier rings were “missed”: the addendum shows they opened turns, while transport-level failures may not have reached CC at all. The oldest-undrained age is the most actionable signal; ring count is useful secondary context.
+It should not say earlier inbox notifications were “missed”: the addendum shows they opened turns, while transport-level failures may not have reached CC at all. The oldest-unread age is the most actionable signal; inbox notification count is useful secondary context.
 
 ---
 
@@ -370,7 +370,7 @@ This is now the best topology. Telegram added forum-topic support for private ch
 
 Use:
 
-- the main/private-chat topic as fleet console;
+- the main/private-chat topic as cluster console;
 - one private topic per `session@node`;
 - numeric `chat_id` and `message_thread_id` as authority;
 - topic names only as display labels.
@@ -407,7 +407,7 @@ I accept the concept—owner-to-agent control is not arbitrary human-to-human me
 
 - the human actor;
 - the network principal carrying the message;
-- CC’s own `role: "user"` doorbell representation, which khala already emits at `link/conduit.go:945-960`.
+- CC’s own `role: "user"` inbox notification representation, which khala already emits at `link/conduit.go:945-960`.
 
 Use:
 
@@ -434,14 +434,14 @@ Also:
 
 CLI flag omission is not an authenticity mechanism. Any same-UID process can construct a file with `Type: operator`, and the consequence is elevated model authority.
 
-An HMAC with one fleet-shared key is also a poor fit: every verifier needs the secret, so every node that can read it can forge operator messages.
+An HMAC with one cluster-shared key is also a poor fit: every verifier needs the secret, so every node that can read it can forge operator messages.
 
 Use an Ed25519 gateway key pair:
 
 - private key only on the gateway node;
 - pinned public key and `Key-Id` on receiving nodes;
 - signature covers a canonical representation of:
-  - envelope version;
+  - message headers version;
   - `Id`, `From`, `To`, `Date`, `Expires`;
   - `Type`, `Actor`, `Origin`, `Conversation`, `Origin-Ref`;
   - SHA-256 of the exact body bytes.
@@ -476,7 +476,7 @@ Required engineering:
 - one stable outbound event ID across chunks;
 - store numeric thread IDs; names are mutable and non-authoritative;
 - handle deleted, closed, recreated, or renamed topics;
-- persist the topic mapping outside khala inbox retention.
+- persist the topic mapping outside khalan inbox retention.
 
 The Bot API does not provide arbitrary chat-history retrieval. `getUpdates` is an update stream, and unconfirmed updates are retained for no longer than 24 hours. The gateway must durably journal and enqueue an inbound event before advancing its update offset. [![](https://www.google.com/s2/favicons?domain=https://core.telegram.org&sz=128)Telegram+1](https://core.telegram.org/bots/api)
 
@@ -488,7 +488,7 @@ Prefer private-chat topics. Multiple groups/chats add administration without add
 
 The draft’s single topic round-trip measurement is insufficient. These are mandatory:
 
-1. **Full path latency:** phone → Telegram update → durable gateway journal → khala destination `new/` → doorbell → drain → reply letter → durable gateway outbound journal → Telegram topic. Measure local, remote, sleeping, idle, active-turn, permission-prompt, and account-limited cases.
+1. **Full path latency:** phone → Telegram update → durable gateway journal → khala destination `new/` → inbox notification → inbox read → reply message → durable gateway outbound journal → Telegram topic. Measure local, remote, sleeping, idle, active-turn, permission-prompt, and account-limited cases.
 2. **Inbound crash windows:** kill the gateway:
 
 Derive khala `Id` deterministically from bot ID plus `update_id` so replay is harmless.
@@ -497,16 +497,16 @@ Derive khala `Id` deterministically from bot ID plus `update_id` so replay is ha
   - after enqueue but before advancing the Telegram offset.
 3. **Outbound crash windows:** kill it:
 
-The gateway must not use a destructive drain as its only copy of an unposted reply.
-  - after draining a session reply but before persisting outbound state;
+The gateway must not use a destructive inbox read as its only copy of an unposted reply.
+  - after reading the inbox a session reply but before persisting outbound state;
   - after Telegram accepts the send but before recording success.
 4. **Poller exclusivity and recovery:** second consumer, `409`, process restart, host restart, gateway failover, stale offset, duplicated updates, and outage beyond Telegram’s update-retention window.
 5. **Burst/backpressure:** 30–60 topics, simultaneous replies, 429 handling, queue fairness, coalescing, and time-to-delivery for an urgent operator command behind bulk output.
 6. **Topic lifecycle:** create, reuse, rename, close, delete, permission loss, bot removal, private-topic client behavior, and mapping reconstruction.
 7. **Payload correctness:** 4096-character boundary, multi-byte Unicode, Markdown/entities, chunk ordering, replies to chunked messages, and unsupported attachments.
 8. **Authority tests:** valid signature, invalid signature, unknown key, replay, changed body, changed destination, expired command, and peer-session forgery.
-9. **CC non-processing states:** both permission prompt and five-hour usage limit are now mandatory. Record written doorbell, new-turn creation, actual model invocation, drain, and response as separate milestones.
-10. **Health-signal precision:** measure how often `.ear + pending` fires during legitimate long turns, `Priority: later`, bounded drains, and ordinary replication delay.
+9. **CC non-processing states:** both permission prompt and five-hour usage limit are now mandatory. Record written inbox notification, new-turn creation, actual model invocation, inbox read, and response as separate milestones.
+10. **Health-signal precision:** measure how often `.ear + pending` fires during legitimate long turns, `Priority: later`, bounded inbox reads, and ordinary replication delay.
 
 ---
 
@@ -517,7 +517,7 @@ The raw condition is useful, but the proposed wording overclaims.
 A live `.ear` establishes only:
 
 - a recently verified registration/socket existed;
-- the conduit believed it had a routable endpoint.
+- the notifier believed it had a routable endpoint.
 
 It does not establish:
 
@@ -544,22 +544,22 @@ last-drained-generation
 
 False positives include:
 
-- info notices intentionally awaiting piggyback;
+- info alerts intentionally awaiting piggyback;
 - a fresh delivery still inside normal latency;
 - `Priority: later` waiting for idle;
 - a legitimate long tool call;
-- bounded drain leaving a remainder;
-- an oversize or malformed undrainable object;
-- ear/status replication skew;
+- bounded inbox read leaving a remainder;
+- an oversize or malformed unreadable object;
+- listener snapshot/status replication skew;
 - session handoff between instances.
 
-A false negative also matters: the session may drain an operator letter immediately and then fail or ignore it; pending disappears even though the instruction was not substantively processed.
+A false negative also matters: the session may inbox read an operator message immediately and then fail or ignore it; pending disappears even though the instruction was not substantively processed.
 
 Recommended notification:
 
-> `steno@b200` ear seen 42s ago; operator generation `abc…` remains undrained for 18m after 3 written doorbells.
+> `steno@b200` listener snapshot seen 42s ago; operator generation `abc…` remains unread for 18m after 3 written inbox notifications.
 
-Do not say “not processing” or diagnose an account limit. Alert once per unchanged generation, clear on drain or generation change, and suppress when the ear becomes stale. Suggested initial thresholds: 15 minutes for authenticated operator/urgent input, 60 minutes for ordinary mail, and no such alert for info notices.
+Do not say “not processing” or diagnose an account limit. Alert once per unchanged generation, clear on inbox read or generation change, and suppress when the listener snapshot becomes stale. Suggested initial thresholds: 15 minutes for authenticated operator/urgent input, 60 minutes for ordinary mail, and no such alert for info alerts.
 
 ---
 
@@ -570,8 +570,8 @@ Do not say “not processing” or diagnose an account limit. Alert once per unc
 Assuming approximately 30 registered identities total across eight nodes:
 
 - per-session `.ear` gives about 30 file replacements per minute;
-- in a seven-edge hub-and-spoke fan-out, roughly 210 tiny network installations per minute;
-- more significantly, every presence event causes `scanPresence` to enumerate the presence directory, and each serve-side peer watcher does so independently. At a hub, the rough upper bound is on the order of
+- in a seven-edge upstream/downstream fan-out, roughly 210 tiny network installations per minute;
+- more significantly, every presence event causes `scanPresence` to enumerate the presence directory, and each serve-side peer watchdog does so independently. At a upstream, the rough upper bound is on the order of
 
 `30 events/min × 7 peer watchers × 30 files ≈ 6,300` candidate file reads/hashes per minute.
 
@@ -590,44 +590,44 @@ containing all verified local listeners and minimal delivery telemetry. That red
 Requirements:
 
 - atomic replacement;
-- one writer: the local conduit;
+- one writer: the local notifier;
 - schema version;
 - monotonic generation;
 - bounded identity count and record size;
-- omission means not listening;
+- omission means unreachable;
 - no socket paths, PIDs, Telegram IDs, subjects, or bodies;
 - installer rejects generation regression and quarantines equal-generation/different-bytes conflicts.
 
-Freshness should preferably use a local installer-observed timestamp. Direct comparison against a remote wall clock makes a `2 × 60s` expiry fragile under clock skew. The rsync fallback preserves source mtimes, so inode mtime is not automatically a receiver timestamp; store a local `seen-at` sidecar or explicitly refresh receiver-side metadata after validated installation.
+Freshness should preferably use a local installer-observed timemarker. Direct comparison against a remote wall clock makes a `2 × 60s` expiry fragile under clock skew. The rsync fallback preserves source mtimes, so inode mtime is not automatically a receiver timemarker; store a local `seen-at` sidecar or explicitly refresh receiver-side metadata after validated installation.
 
-This same per-node snapshot should carry the redacted pending/drain fields needed by B6. Avoid introducing separate `.ear`, `.processing`, and `.pending` heartbeat families.
+This same per-node snapshot should carry the redacted pending/inbox-read fields needed by B6. Avoid introducing separate `.ear`, `.processing`, and `.pending` heartbeat families.
 
 ---
 
 ## C2. Data to add now, and data not to expose
 
-A dashboard on one node can read local inbox and runtime truth, but it cannot infer remote inbox state from existing replicated objects. Without a replicated redacted node summary, it is a **local dashboard plus remote presence view**, not a fleet dashboard.
+A dashboard on one node can read local inbox and runtime truth, but it cannot infer remote inbox state from existing replicated objects. Without a replicated redacted node summary, it is a **local dashboard plus remote presence view**, not a cluster dashboard.
 
 Add now:
 
-- per-letter state index:
-  - installed, drained, acked, dead timestamps;
+- per-message state index:
+  - installed, read, acked, dead timemarkers;
   - current state;
   - type;
   - expiry;
-  - envelope/body digest;
+  - header/body digest;
 - per-identity:
   - pending counts by lane;
   - oldest recipient-local pending age;
   - current generation;
-  - last drain time and generation;
-  - last written ring, ring count, and delivery result;
-- per-link peer:
+  - last inbox read time and generation;
+  - last written inbox notification, inbox notification count, and delivery result;
+- per-relay peer:
   - last successful HELLO;
   - last `STORED`;
   - queue depth by class;
   - last recoverable/fatal error;
-- watcher:
+- watchdog:
   - latest declaration generation;
   - owner address;
   - cadence;
@@ -641,7 +641,7 @@ Add now:
 
 Do not expose by default on a tailnet port:
 
-- message or notice bodies;
+- message or alert bodies;
 - subjects, which frequently contain secrets;
 - raw Telegram IDs or `Origin-Ref`;
 - bearer tokens or signing material;
@@ -649,7 +649,7 @@ Do not expose by default on a tailnet port:
 - process IDs and process command lines;
 - SSH coordinates, usernames, or raw config;
 - model-account or usage-limit details;
-- free-text mind focus/stance unless explicitly enabled.
+- free-text session status focus/stance unless explicitly enabled.
 
 Serving rules:
 
@@ -671,7 +671,7 @@ Serving rules:
 
 ## X1. Changes to make in A now so B and C do not force a rewrite
 
-### 1. Reserve the final envelope vocabulary now
+### 1. Reserve the final message headers vocabulary now
 
 Use:
 
@@ -689,32 +689,32 @@ Signature: <base64>
 
 Do not ship `Type: user`. Parsers should already reserve these names and reject duplicate control headers.
 
-### 2. Do not reuse `queue_infrastructure_message` for notices
+### 2. Do not reuse `queue_infrastructure_message` for alerts
 
-Current `DESIGN.md:457-480` says notices carry `Refs`; proposal A says they do not. Resolve that contradiction now. Give notice a dedicated writer with:
+Current `DESIGN.md:457-480` says alerts carry `Refs`; proposal A says they do not. Resolve that contradiction now. Give alert a dedicated writer with:
 
 - a fresh ordinary message ID;
 - no `Refs`;
 - explicit `Urgency`;
 - explicit `Expires`;
-- no heartbeat side effect for the watcher identity;
+- no heartbeat side effect for the watchdog identity;
 - atomic direct spool creation.
 
-### 3. Fix source custody before any notice is emitted
+### 3. Fix source custody before any alert is emitted
 
-Origin notice remains in source spool until expiry. A relay accepting bytes is not delivery completion. This choice is also what a future operator lane needs if it ever bypasses the ordinary outbox.
+Origin alert remains in source spool until expiry. A relay accepting bytes is not delivery completion. This choice is also what a future operator lane needs if it ever bypasses the ordinary outbox.
 
 ### 4. Make principal class explicit
 
 Introduce `session`, `watcher`, and `gateway` principals. Do not infer them from common identity names. Reserve gateway identities so a CC session cannot bind them.
 
-An info notice should be allowed to suppress a ring only when its sender resolves as a valid watcher principal; otherwise fail toward ringing.
+An info alert should be allowed to suppress an inbox notification only when its sender resolves as a valid watchdog principal; otherwise fail toward sending inbox notifications.
 
 ### 5. Replace the five-line multi-writer marker
 
-Use source-owned, generation-checked watcher declarations/tombstones. Use one per-node ears/status snapshot for C and B6. The owner derives silence locally and does not mutate the source marker.
+Use source-owned, generation-checked watchdog declarations/tombstones. Use one per-node listener/status snapshot for C and B6. The owner derives silence locally and does not mutate the source marker.
 
-### 6. Define state timestamps and tombstones now
+### 6. Define state timemarkers and tombstones now
 
 A/C/B all need:
 
@@ -727,23 +727,23 @@ A/C/B all need:
 
 Do not postpone these until the dashboard. Retrofitting them after 30-day deletion has begun cannot reconstruct historical transitions.
 
-### 7. Define drain precedence and maximum object sizes
+### 7. Define inbox read precedence and maximum object sizes
 
 The future order should be:
 
 1. authenticated operator;
-2. ordinary messages and urgent notices;
-3. info notices.
+2. ordinary messages and urgent alerts;
+3. info alerts.
 
-Give each lane reserved count/byte capacity. Enforce object-size limits at creation and ingress so every valid object is drainable.
+Give each lane reserved count/byte capacity. Enforce object-size limits at creation and ingress so every valid object is readable.
 
 ### 8. Define generation as effective behavior, not only filenames
 
-Conduit generation should incorporate the validated ring class, urgency, priority, and expiry status. Persist local `first-seen` and successfully written ring count. These are required for A7, dashboard health, and B6.
+Notifier generation should incorporate the validated inbox notification class, urgency, priority, and expiry status. Persist local `first-seen` and successfully written inbox notification count. These are required for A7, dashboard health, and B6.
 
 ---
 
-## X2. What a 0.7.3 link actually does with `.watcher` or `.ear`
+## X2. What a 0.7.3 relay actually does with `.watcher` or `.ear`
 
 `presenceNode` strips only `.watching`. For `steno@b200.ear` or `gpu-guard@b200.watcher`, it interprets the node portion as `b200.ear` or `b200.watcher`, which is invalid. `link/config.go:115-123`.
 
@@ -771,14 +771,14 @@ Presence is excluded from the `now + 86400` check. That check applies only to `s
 
 The proposed order is directionally correct but incomplete:
 
-1. **New link binary everywhere**, with suffix-aware parsing, schema validation, and generation-regression protection.
+1. **New relay binary everywhere**, with suffix-aware parsing, schema validation, and generation-regression protection.
 2. **New CLI everywhere**, including:
   - shell rsync presence glob;
   - `cmd_presence`;
   - `cmd_minds`;
   - `prune_presence`;
-  - any watcher display/reconcile parser.
-3. Only then create watcher or ears markers.
+  - any watchdog display/reconcile parser.
+3. Only then create watchdog or listener snapshots markers.
 
 The current rsync fallback pushes only:
 
@@ -791,4 +791,4 @@ at `bin/khala:1676-1686`; new suffixes will not replicate through that path unti
 
 Creating markers after only the Go binary upgrade is therefore unsafe: the fallback will omit them, and old CLI commands may reject or incorrectly age-prune them. The actual compatibility outcome is **silent skip on an old sender, recoverable refusal on an old receiver, no quarantine, no disconnect**.
 
-The minimum pre-ship gates for A are therefore: source-retained notice custody, generation-checked single-writer watcher state, and transition-time/dedup-aware retention.
+The minimum pre-ship gates for A are therefore: source-retained alert custody, generation-checked single-writer watchdog state, and transition-time/dedup-aware retention.

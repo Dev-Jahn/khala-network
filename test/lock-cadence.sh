@@ -4,6 +4,7 @@ set -u
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 RIG=$HOME/.khala-lock-cadence-test-$$
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -15,13 +16,13 @@ die() {
 }
 
 mkdir -p "$RIG"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 home=$RIG/home
 KHALA_HOME=$home "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" ||
     die "init failed"
 KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 0 --owner owner >/dev/null ||
-    die "watcher declaration failed"
+    die "watchdog declaration failed"
 
 # Keep all six callers behind the same live lock long enough that a one-second
 # retry cadence cannot meet the bound. The 300-second stale threshold remains

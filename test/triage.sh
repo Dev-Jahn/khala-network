@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Jev triage display (CLI half, review/jev-triage-r1.md §2.3-2.4): the conduit
-# writes run/triage/<identity>/<id>.tag; drain, inbox list and status only show it.
+# Jev triage display (CLI half, review/jev-triage-r1.md §2.3-2.4): the notifier
+# writes run/triage/<identity>/<id>.tag; inbox read, inbox list and status only show it.
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 RIG=$HOME/.khala-triage-test-$$
 DOT=$(printf '\302\267')
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -22,7 +23,7 @@ init_home() {
     KHALA_HOME=$init_home_path "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" ||
         die "init failed: $(tr '\n' ' ' < "$RIG/init.err")"
     printf 'retention-interval 0\n' >> "$init_home_path/config" || die "config append failed"
-    # status needs a link binary; the stub prints the runtime line and table head.
+    # status needs a relay binary; the stub prints the runtime line and table head.
     mkdir -p "$init_home_path/bin" || die "bin mkdir failed"
     printf '%s\n' '#!/bin/sh' \
         'case "$*" in' \
@@ -54,7 +55,7 @@ write_letter() {
     } > "$write_dir/$write_id"
 }
 
-# 2 letters + 1 notice
+# 2 messages + 1 alert
 fixture() {
     init_home "$1"
     write_letter "$1" "$A" a@alpha message 'letter a'
@@ -69,14 +70,14 @@ run_khala() {
 }
 
 mkdir -p "$RIG"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 now=$(date +%s)
 future=$((now + 99999))
 A=$now.1.1.a@alpha
 B=$now.1.2.b@alpha
 N=$now.1.3.guard@alpha
 
-# P1: no run/triage and no triage.conf -> drain and list unchanged, status says off.
+# P1: no run/triage and no triage.conf -> inbox read and list unchanged, status says off.
 property_P1() {
     home=$RIG/p1
     fixture "$home"
@@ -85,25 +86,25 @@ property_P1() {
         > "$RIG/p1-summary.exp"
     cmp -s "$RIG/p1-summary.exp" "$RIG/p1-summary.out" || die "P1 inbox summary changed without triage"
     run_khala "$home" inbox list > "$RIG/p1-list.out" 2>>"$RIG/p1.err" || die "P1 list failed"
-    printf '%s\ta@alpha\tletter a\t2000-01-01T00:00:00Z\n%s\tb@alpha\tletter b\t2000-01-01T00:00:00Z\n%s\tguard@alpha\tnotice n\t2000-01-01T00:00:00Z\n' "$A" "$B" "$N" \
+    printf '%s\ta@alpha\tletter a\t2000-01-01T00:00:00Z\tunread\n%s\tb@alpha\tletter b\t2000-01-01T00:00:00Z\tunread\n%s\tguard@alpha\tnotice n\t2000-01-01T00:00:00Z\tunread\n' "$A" "$B" "$N" \
         > "$RIG/p1-list.exp"
     cmp -s "$RIG/p1-list.exp" "$RIG/p1-list.out" || die "P1 inbox list changed without triage"
     cp -R "$home" "$RIG/p1-copy" || die "P1 copy failed"
-    run_khala "$home" inbox --drain > "$RIG/p1-drain.out" 2>>"$RIG/p1.err" || die "P1 drain failed"
-    grep -qx -- "--- letter $A ---" "$RIG/p1-drain.out" || die "P1 letter A line changed"
-    grep -qx -- "--- letter $B ---" "$RIG/p1-drain.out" || die "P1 letter B line changed"
+    run_khala "$home" inbox --drain > "$RIG/p1-drain.out" 2>>"$RIG/p1.err" || die "P1 inbox read failed"
+    grep -qx -- "--- letter $A ---" "$RIG/p1-drain.out" || die "P1 message A line changed"
+    grep -qx -- "--- letter $B ---" "$RIG/p1-drain.out" || die "P1 message B line changed"
     grep -qx -- "--- notice $N --- guard@alpha $DOT urgent $DOT notice n" "$RIG/p1-drain.out" ||
-        die "P1 notice line changed"
+        die "P1 alert line changed"
     run_khala "$home" status > "$RIG/p1-status.out" 2>>"$RIG/p1.err" || die "P1 status failed"
     printf 'runtime: /fixture/runtime\ntriage: off\nIDENTITY\tPENDING\n' > "$RIG/p1-status.exp"
     cmp -s "$RIG/p1-status.exp" "$RIG/p1-status.out" ||
         die "P1 status differs: $(tr '\n' '|' < "$RIG/p1-status.out")"
     [ ! -s "$RIG/p1.err" ] || die "P1 stderr not empty: $(cat "$RIG/p1.err")"
     [ ! -e "$home/run/triage" ] || die "P1 CLI created run/triage"
-    printf 'ok P1 — without triage, drain and list are unchanged and status says off\n'
+    printf 'ok P1 — without triage, inbox read and list are unchanged and status says off\n'
 }
 
-# P2: valid tags are shown on the drain line and as the list's last column.
+# P2: valid tags are shown on the inbox read line and as the list's last column.
 property_P2() {
     home=$RIG/p2
     fixture "$home"
@@ -117,23 +118,25 @@ property_P2() {
     cmp -s "$RIG/p2-summary.exp" "$RIG/p2-summary.out" ||
         die "P2 inbox summary lacks the Triage column: $(tr '\n\t' '|,' < "$RIG/p2-summary.out")"
     run_khala "$home" inbox list > "$RIG/p2-list.out" 2>>"$RIG/p2.err" || die "P2 list failed"
-    printf '%s\ta@alpha\tletter a\t2000-01-01T00:00:00Z\taction,urgent\n%s\tb@alpha\tletter b\t2000-01-01T00:00:00Z\tfyi\n%s\tguard@alpha\tnotice n\t2000-01-01T00:00:00Z\t-\n' "$A" "$B" "$N" \
+    printf '%s\ta@alpha\tletter a\t2000-01-01T00:00:00Z\tunread\taction,urgent\n%s\tb@alpha\tletter b\t2000-01-01T00:00:00Z\tunread\tfyi\n%s\tguard@alpha\tnotice n\t2000-01-01T00:00:00Z\tunread\t-\n' "$A" "$B" "$N" \
         > "$RIG/p2-list.exp"
     cmp -s "$RIG/p2-list.exp" "$RIG/p2-list.out" || die "P2 inbox list lacks the Triage column"
-    run_khala "$home" inbox --drain > "$RIG/p2-drain.out" 2>>"$RIG/p2.err" || die "P2 drain failed"
-    grep -qx -- "--- letter $A --- $DOT action,urgent" "$RIG/p2-drain.out" || die "P2 letter A tag missing"
-    grep -qx -- "--- letter $B --- $DOT fyi" "$RIG/p2-drain.out" || die "P2 letter B tag missing"
+    run_khala "$home" inbox --drain > "$RIG/p2-drain.out" 2>>"$RIG/p2.err" || die "P2 inbox read failed"
+    grep -qx -- "--- letter $A --- $DOT action,urgent" "$RIG/p2-drain.out" || die "P2 message A tag missing"
+    grep -qx -- "--- letter $B --- $DOT fyi" "$RIG/p2-drain.out" || die "P2 message B tag missing"
     grep -qx -- "--- notice $N --- guard@alpha $DOT urgent $DOT notice n" "$RIG/p2-drain.out" ||
-        die "P2 notice line changed"
-    # Apart from the suffixes, the drain output equals the untagged one.
-    run_khala "$RIG/p1-copy" inbox --drain > "$RIG/p2-base.out" 2>>"$RIG/p2.err" || die "P2 base drain failed"
+        die "P2 alert line changed"
+    # Apart from the suffixes, the inbox read output equals the untagged one.
+    run_khala "$RIG/p1-copy" inbox --drain > "$RIG/p2-base.out" 2>>"$RIG/p2.err" || die "P2 base inbox read failed"
     sed "s/ $DOT action,urgent\$//; s/ $DOT fyi\$//" "$RIG/p2-drain.out" > "$RIG/p2-stripped.out"
-    cmp -s "$RIG/p2-base.out" "$RIG/p2-stripped.out" || die "P2 drain differs beyond the tag suffix"
-    # After the drain the letters are in cur/ and list still shows the tags.
-    run_khala "$home" inbox list > "$RIG/p2-list2.out" 2>>"$RIG/p2.err" || die "P2 list after drain failed"
-    cmp -s "$RIG/p2-list.exp" "$RIG/p2-list2.out" || die "P2 list after drain lost the tags"
+    cmp -s "$RIG/p2-base.out" "$RIG/p2-stripped.out" || die "P2 inbox read differs beyond the tag suffix"
+    # After the inbox read the messages are in cur/ and list still shows the tags.
+    run_khala "$home" inbox list > "$RIG/p2-list2.out" 2>>"$RIG/p2.err" || die "P2 list after inbox read failed"
+    printf '%s\ta@alpha\tletter a\t2000-01-01T00:00:00Z\tread\taction,urgent\n%s\tb@alpha\tletter b\t2000-01-01T00:00:00Z\tread\tfyi\n%s\tguard@alpha\tnotice n\t2000-01-01T00:00:00Z\tread\t-\n' "$A" "$B" "$N" \
+        > "$RIG/p2-list2.exp"
+    cmp -s "$RIG/p2-list2.exp" "$RIG/p2-list2.out" || die "P2 list after inbox read lost the tags"
     [ ! -s "$RIG/p2.err" ] || die "P2 stderr not empty: $(cat "$RIG/p2.err")"
-    printf 'ok P2 — tags on the drain line and the list column; notice untouched\n'
+    printf 'ok P2 — tags on the inbox read line and the list column; alert untouched\n'
 }
 
 # P3: malformed tags are silently no triage.
@@ -161,7 +164,7 @@ property_P3() {
         die "P3 summary shows a malformed tag: $(tr '\n\t' '|,' < "$RIG/p3-summary.out")"
     run_khala "$home" inbox list > "$RIG/p3-list.out" 2>>"$RIG/p3.err" || die "P3 list exit"
     [ "$(grep -c "$(printf '\t-$')" "$RIG/p3-list.out")" -eq 8 ] || die "P3 list shows a malformed tag"
-    run_khala "$home" inbox --drain > "$RIG/p3-drain.out" 2>>"$RIG/p3.err" || die "P3 drain exit"
+    run_khala "$home" inbox --drain > "$RIG/p3-drain.out" 2>>"$RIG/p3.err" || die "P3 inbox read exit"
     for l in "$L1" "$L2" "$L3" "$L4" "$L5" "$L6" "$L7" "$L8"; do
         grep -qx -- "--- letter $l ---" "$RIG/p3-drain.out" || die "P3 malformed tag shown for $l"
     done
@@ -173,14 +176,14 @@ property_P3() {
     ln -s "$RIG/elsewhere" "$home/run/triage/reader"
     printf 'fyi\n' > "$RIG/elsewhere/$A.tag"
     write_letter "$home" "$A" a@alpha message 'letter a'
-    run_khala "$home" inbox --drain > "$RIG/p3b-drain.out" 2>"$RIG/p3b.err" || die "P3b drain exit"
+    run_khala "$home" inbox --drain > "$RIG/p3b-drain.out" 2>"$RIG/p3b.err" || die "P3b inbox read exit"
     grep -qx -- "--- letter $A ---" "$RIG/p3b-drain.out" || die "P3b followed a symlinked triage dir"
     [ ! -s "$RIG/p3b.err" ] || die "P3b stderr not empty"
     printf 'ok P3 — empty, bogus, long, symlink, directory, unordered, unterminated, multi-line tags ignored\n'
 }
 
-# P4: a stray tag for a notice or operator letter is never shown, while a
-# message letter in the same drain keeps its tag.
+# P4: a stray tag for an alert or operator message is never shown, while a
+# message in the same inbox read keeps its tag.
 property_P4() {
     home=$RIG/p4
     init_home "$home"
@@ -196,12 +199,12 @@ property_P4() {
     grep -qx "$(printf '%s\top@alpha\toperator\t-' "$O")" "$RIG/p4-summary.out" ||
         die "P4 summary shows a stray operator tag"
     grep -qx "$(printf '%s\tguard@alpha\tnotice\t-' "$N")" "$RIG/p4-summary.out" ||
-        die "P4 summary shows a stray notice tag"
-    run_khala "$home" inbox --drain > "$RIG/p4-drain.out" 2>>"$RIG/p4.err" || die "P4 drain exit"
+        die "P4 summary shows a stray alert tag"
+    run_khala "$home" inbox --drain > "$RIG/p4-drain.out" 2>>"$RIG/p4.err" || die "P4 inbox read exit"
     grep -qx -- "--- letter $A --- $DOT reply" "$RIG/p4-drain.out" || die "P4 message tag missing"
     grep -qx -- "--- letter $O ---" "$RIG/p4-drain.out" || die "P4 operator line changed by a stray tag"
     grep -qx -- "--- notice $N --- guard@alpha $DOT urgent $DOT notice n" "$RIG/p4-drain.out" ||
-        die "P4 notice line changed by a stray tag"
+        die "P4 alert line changed by a stray tag"
     grep -q "$DOT action" "$RIG/p4-drain.out" && die "P4 stray tag shown"
     [ ! -s "$RIG/p4.err" ] || die "P4 stderr not empty: $(cat "$RIG/p4.err")"
     printf 'ok P4 — stray tags on notice/operator are not shown; the message tag is\n'

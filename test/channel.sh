@@ -3,7 +3,7 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
-GO=${GO:-/NHNHOME/jahn/go-toolchain/bin/go}
+GO=${GO:-$(command -v go)}
 BUN=${BUN:-$(command -v bun)}
 SERVER=${KHALA_CHANNEL_SERVER:-$ROOT/plugin/channel/server.ts}
 CASE=${1:-all}
@@ -16,12 +16,15 @@ CC_SESSIONS=$RIG/cc-sessions
 SESSION_ID=h21-session
 IDENTITY=h21
 PROJECT_DIR=$RIG/project
+# The MCP SDK, read from the caller's own Claude Code plugin cache.
+SDK_ROOT=$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/node_modules
 PIDS=
 
 case $CASE in
     all|fast|e1a|e1b|e1caps|h21a|h21b|h21c|h21d|h21e) ;;
     *) printf 'usage: %s [all|fast|e1a|e1b|e1caps|h21a|h21b|h21c|h21d|h21e]\n' "$0" >&2; exit 2 ;;
 esac
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_pid in $PIDS; do
@@ -49,7 +52,7 @@ wait_file() {
 
 mkdir -p "$RIG/bin" "$HOME_RIG" "$CC_SESSIONS" "$HOME/.cache/khala-go-tmp" \
     "$HOME/.cache/khala-go-build" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 mkdir -p "$PROJECT_DIR" && printf '%s\n' "$IDENTITY" > "$PROJECT_DIR/.khala-session" || fail "project fixture"
 
 (cd "$ROOT/link" && GOTMPDIR=$HOME/.cache/khala-go-tmp \
@@ -103,7 +106,6 @@ INSTANCE_2=$(printf '%s\n' "$REGISTER_2" | sed -n 's/^instance //p')
 [ "$INSTANCE" != "$INSTANCE_2" ] || fail "second session registration reused the first instance"
 REGISTRATION_2=$RUNTIME/sessions/$INSTANCE_2.json
 
-SDK_ROOT=$HOME/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/node_modules
 [ -d "$SDK_ROOT/@modelcontextprotocol/sdk" ] || fail "telegram MCP SDK cache missing"
 ln -s "$SDK_ROOT" "$RIG/node_modules" || fail "MCP SDK rig symlink failed"
 
@@ -173,7 +175,7 @@ if [ "$CASE" = all ] || [ "$CASE" = fast ] || [ "$CASE" = e1b ]; then
     set_child_registry "$SESSION_ID"
     reset_inbox
     run_channel_client full || fail "fast MCP/channel/reply protocol failed"
-    printf 'ok H21 fast / T-E1b — flagged ancestry attached a verified channel, forwarded, drained, replied, and cleaned up\n'
+    printf 'ok H21 fast / T-E1b — flagged ancestry attached a verified channel, forwarded, read, replied, and cleaned up\n'
 fi
 
 if [ "$CASE" = all ] || [ "$CASE" = e1a ]; then

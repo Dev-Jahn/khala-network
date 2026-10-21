@@ -49,7 +49,7 @@ func testStreamOffer(stream, node, name string, data []byte) offer {
 	return offer{ID: transferID("stream", stream, node, "", name, digest), Class: "stream", Stream: stream, Node: node, Basename: name, Size: uint64(len(data)), Digest: digest}
 }
 
-func testMindOffer(node, session, generation string, data []byte) offer {
+func testStatusOffer(node, session, generation string, data []byte) offer {
 	digest := sha256.Sum256(data)
 	return offer{
 		ID: transferID("mind", "", node, session, generation, digest), Class: "mind",
@@ -192,7 +192,7 @@ func TestStreamDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T
 
 func TestMindDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T) {
 	home := testKhalaHome(t)
-	o := testMindOffer("alpha", "worker", "123.4", []byte("mind"))
+	o := testStatusOffer("alpha", "worker", "123.4", []byte("mind"))
 	dial := installer{home: home, role: "dial", peer: "beta", logger: testLogger{t}}
 	dest, err := dial.destination(o)
 	if err != nil {
@@ -203,9 +203,9 @@ func TestMindDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T) 
 		t.Fatalf("destination=%q want %q", dest, want)
 	}
 	for _, bad := range []offer{
-		testMindOffer("alpha", "Bad", "123.4", []byte("x")),
-		testMindOffer("alpha", "worker", "01.2", []byte("x")),
-		testMindOffer("beta", "worker", "123.4", []byte("x")),
+		testStatusOffer("alpha", "Bad", "123.4", []byte("x")),
+		testStatusOffer("alpha", "worker", "01.2", []byte("x")),
+		testStatusOffer("beta", "worker", "123.4", []byte("x")),
 	} {
 		if _, err := dial.destination(bad); err == nil {
 			t.Errorf("dial accepted invalid/reflected mind offer %#v", bad)
@@ -215,7 +215,7 @@ func TestMindDestinationReconstructsPathAndEnforcesShardOwnership(t *testing.T) 
 	if _, err := serve.destination(o); err != nil {
 		t.Fatalf("serve rejected connected spoke mind shard: %v", err)
 	}
-	if _, err := serve.destination(testMindOffer("gamma", "worker", "123.4", []byte("x"))); err == nil {
+	if _, err := serve.destination(testStatusOffer("gamma", "worker", "123.4", []byte("x"))); err == nil {
 		t.Fatal("serve accepted a mind shard not owned by its connected spoke")
 	}
 }
@@ -224,7 +224,7 @@ func TestFutureMindInstallMovesToBrainQuarantineEncoding(t *testing.T) {
 	home := testKhalaHome(t)
 	generation := fmt.Sprintf("%d.0", time.Now().Unix()+86401)
 	data := []byte("future mind bytes")
-	o := testMindOffer("alpha", "worker", generation, data)
+	o := testStatusOffer("alpha", "worker", generation, data)
 	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
 	result, path, err := i.receive(o, data)
 	if err == nil || result != quarantined {
@@ -243,7 +243,7 @@ func TestExpiredMindInstallSkipsWithoutLiveOrQuarantineFile(t *testing.T) {
 	home := testKhalaHome(t)
 	generation := fmt.Sprintf("%d.0", time.Now().Unix()-32*86400)
 	data := []byte("expired mind bytes")
-	o := testMindOffer("alpha", "worker", generation, data)
+	o := testStatusOffer("alpha", "worker", generation, data)
 	i := installer{home: home, role: "serve", peer: "alpha", retainDays: 30, logger: testLogger{t}}
 	result, _, err := i.receive(o, data)
 	if err != nil || result != expiredSkipped {
@@ -452,11 +452,11 @@ func TestEarInstallMatrix(t *testing.T) {
 			home := testKhalaHome(t)
 			i := installer{home: home, role: endpoint.role, peer: endpoint.peer, logger: testLogger{t}}
 			name := "conduit@alpha.ear"
-			ears := func(generation int64, writtenAt int64) []byte {
-				return []byte(strings.Replace(validEarsFixture("alpha", generation), "written-at 1788402001", fmt.Sprintf("written-at %d", writtenAt), 1))
+			snapshotSet := func(generation int64, writtenAt int64) []byte {
+				return []byte(strings.Replace(validListenerSnapshotFixture("alpha", generation), "written-at 1788402001", fmt.Sprintf("written-at %d", writtenAt), 1))
 			}
 			destination := filepath.Join(home, "presence", name)
-			current := ears(20, 100)
+			current := snapshotSet(20, 100)
 			if err := os.WriteFile(destination, current, 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -474,25 +474,25 @@ func TestEarInstallMatrix(t *testing.T) {
 				return path
 			}
 			assertReceive(unparsable, current)
-			assertReceive(ears(19, 90), current)
+			assertReceive(snapshotSet(19, 90), current)
 			before, _ := os.Stat(destination)
 			assertReceive(current, current)
 			after, _ := os.Stat(destination)
 			if !before.ModTime().Equal(after.ModTime()) {
 				t.Fatal("equal generation and bytes rewrote destination")
 			}
-			conflict := ears(20, 101)
+			conflict := snapshotSet(20, 101)
 			quarantine := assertReceive(conflict, current)
 			wantDigest := fmt.Sprintf("%x", sha256.Sum256(conflict))[:8]
 			if filepath.Base(quarantine) != "alpha.20."+wantDigest {
 				t.Fatalf("quarantine=%q", quarantine)
 			}
-			assertReceive(ears(21, 110), ears(21, 110))
+			assertReceive(snapshotSet(21, 110), snapshotSet(21, 110))
 
 			if err := os.WriteFile(destination, unparsable, 0600); err != nil {
 				t.Fatal(err)
 			}
-			valid := ears(22, 120)
+			valid := snapshotSet(22, 120)
 			assertReceive(valid, valid)
 		})
 	}
@@ -502,7 +502,7 @@ func TestEarConflictQuarantineIsCappedAtEight(t *testing.T) {
 	home := testKhalaHome(t)
 	i := installer{home: home, role: "serve", peer: "alpha", logger: testLogger{t}}
 	name := "conduit@alpha.ear"
-	current := []byte(validEarsFixture("alpha", 20))
+	current := []byte(validListenerSnapshotFixture("alpha", 20))
 	if err := os.WriteFile(filepath.Join(home, "presence", name), current, 0600); err != nil {
 		t.Fatal(err)
 	}

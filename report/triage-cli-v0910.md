@@ -8,7 +8,7 @@ Branch `task/triage-cli`, base `ad33ad9`. Design: `review/jev-triage-r1.md` §1.
     `run`, `run/triage` and `run/triage/<identity>` are not symlinks and the last is a directory; the tag file must be a
     regular non-symlink file with exactly one LF-terminated line from the whitelist
     `fyi|action|reply|urgent|action,reply|action,urgent|reply,urgent|action,reply,urgent`. Anything else = no triage, silent.
-  - drain: `Type: message` letters with a tag print `--- letter <id> --- · <tag>`; operator/notice lines unchanged.
+  - inbox read: `Type: message` messages with a tag print `--- letter <id> --- · <tag>`; operator/alert lines unchanged.
   - `khala inbox` (the no-arg summary, which is the `Id\tFrom\tType` printer at ≈5679) and `khala inbox list`
     (`Id\tFrom\tSubject\tDate`): a trailing Triage column (tag or `-`) — **only when `run/triage/<identity>` exists**,
     so nodes without triage keep byte-identical output (and `test/cli-polish.sh` P5's exact 4-column check holds).
@@ -19,16 +19,16 @@ Branch `task/triage-cli`, base `ad33ad9`. Design: `review/jev-triage-r1.md` §1.
     Added (not in the brief): a malformed `model` (not `[A-Za-z0-9._-]{1,64}`) or `threshold` (not a decimal) prints
     `triage: invalid (triage.conf <key>)` instead of echoing arbitrary text. The link's exit code is preserved.
 - `DESIGN.md` §9.6: `run/triage/<identity>/<id>.{json,tag}` in the `run/` list + subsection "Jev 판정 캐시(triage)".
-- `README.md`: triage paragraph after the notices paragraph; `khala status` line in "Daily use".
+- `README.md`: triage paragraph after the alerts paragraph; `khala status` line in "Daily use".
 - `plugin/skills/khala/SKILL.md`: hint-only paragraph after the operator `Auth:` rule.
 
 ## Decisions to note for main
 - The brief says "`inbox list` prints `Id\tFrom\tType`" but that printer is the no-arg `khala inbox` summary; real
   `inbox list` prints subject/date. Both got the column (same rule).
 - The column is conditional on the triage directory existing, rather than always present with `-`, to satisfy P1
-  byte-identity. Consequence: once the conduit has created `run/triage/<identity>`, rows gain a 5th/4th field
+  byte-identity. Consequence: once the notifier has created `run/triage/<identity>`, rows gain a 5th/4th field
   (`-` when untagged). The ChatGPT bridge (`khala-network-chatgpt`) does not parse CLI list output (checked: it
-  reads its own mailbox store), so no downstream parser breaks.
+  reads its own inbox store), so no downstream parser breaks.
 
 ## RED (commit 0b5fac6, test only, against base bin/khala)
 ```

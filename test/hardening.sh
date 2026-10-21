@@ -3,8 +3,9 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA="$ROOT/bin/khala"
-export KHALA_HOME="$HOME/.khala-hardening-$$"
 TEST_DIR="$HOME/.khala-hardening-test-$$"
+. "$ROOT/test/lib/isolate.sh"
+export KHALA_HOME="$HOME/.khala-hardening-$$"
 
 cleanup() {
     rm -rf -- "$KHALA_HOME" "$TEST_DIR"
@@ -31,7 +32,7 @@ pass() {
 }
 
 mkdir -p -- "$TEST_DIR"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 if ! "$KHALA" init b200 >"$TEST_DIR/init.out" 2>"$TEST_DIR/init.err"; then
     fail 1 "init failed: $(tr '\n' ' ' < "$TEST_DIR/init.err")"

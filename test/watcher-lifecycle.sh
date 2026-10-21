@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 RIG=$HOME/.khala-watcher-lifecycle-test-$$
 FAILURES=0
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -86,16 +87,16 @@ property_declared_notify() {
         die "P1 undeclared notify created an inbox file"
 
     KHALA_HOME=$home "$KHALA" watcher declare declared --cadence 0 --owner reader >/dev/null ||
-        die "P1 watcher declaration failed"
+        die "P1 watchdog declaration failed"
     declared_id=$(printf 'declared\n' | KHALA_HOME=$home "$KHALA" \
         notify reader@alpha --as declared -s declared) || die "P1 declared notify failed"
     KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P1 declared reconcile failed"
-    [ -f "$home/inbox/reader/new/$declared_id" ] || die "P1 declared notice was not delivered"
+    [ -f "$home/inbox/reader/new/$declared_id" ] || die "P1 declared alert was not delivered"
 
     KHALA_HOME=$home "$KHALA" watcher declare retired-name --cadence 0 --owner reader >/dev/null ||
-        die "P1 retired watcher declaration failed"
+        die "P1 retired watchdog declaration failed"
     KHALA_HOME=$home "$KHALA" watcher retire retired-name >/dev/null ||
-        die "P1 watcher retirement failed"
+        die "P1 watchdog retirement failed"
     before_spool=$(count_files "$home/spool/for/alpha")
     before_inbox=$(count_files "$home/inbox/reader/new")
     if printf '' | KHALA_HOME=$home "$KHALA" notify reader@alpha --as retired-name \
@@ -118,12 +119,12 @@ property_presence_split() {
     now=$(date +%s)
     printf '%s\n' "$now" > "$home/presence/human@alpha"
     KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 0 --owner human >/dev/null ||
-        die "P2 watcher declaration failed"
+        die "P2 watchdog declaration failed"
     KHALA_HOME=$home "$KHALA" presence >"$RIG/presence.out" || die "P2 presence failed"
     grep -q '^human@alpha' "$RIG/presence.out" || die "P2 session row is missing"
-    ! grep -qx 'watchers:' "$RIG/presence.out" || die "P2 default presence printed watchers:"
+    ! grep -qx 'watchers:' "$RIG/presence.out" || die "P2 default presence printed watchdogs:"
     ! grep -q $'^guard\talpha\t' "$RIG/presence.out" ||
-        die "P2 default presence printed a watcher row"
+        die "P2 default presence printed a watchdog row"
     grep -Fq 'khala watcher list' "$RIG/presence.out" ||
         die "P2 presence legend does not mention khala watcher list"
     KHALA_HOME=$home "$KHALA" presence --watchers >"$RIG/presence-watchers.out" ||
@@ -131,11 +132,11 @@ property_presence_split() {
     grep -qx 'watchers:' "$RIG/presence-watchers.out" ||
         die "P2 presence --watchers omitted its heading"
     grep -q $'^guard\talpha\t' "$RIG/presence-watchers.out" ||
-        die "P2 presence --watchers omitted the active watcher"
+        die "P2 presence --watchers omitted the active watchdog"
     KHALA_HOME=$home "$KHALA" watcher list >"$RIG/watcher-list.out" ||
-        die "P2 watcher list failed"
+        die "P2 watchdog list failed"
     grep -q $'^guard\talpha\t' "$RIG/watcher-list.out" ||
-        die "P2 watcher list omitted the watcher"
+        die "P2 watchdog list omitted the watchdog"
 }
 
 property_automatic_retire() {
@@ -167,11 +168,11 @@ property_automatic_retire() {
     rm -f "$home/run/retention.stamp"
     KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P3 retire reconcile failed"
     grep -Eq '^retired [0-9]+$' "$home/presence/owner-dead@alpha.watcher" ||
-        die "P3 watcher owned by a retired session was not retired"
+        die "P3 watchdog owned by a retired session was not retired"
     grep -Eq '^retired [0-9]+$' "$home/presence/silent-old@alpha.watcher" ||
-        die "P3 watcher silent over seven days was not retired"
+        die "P3 watchdog silent over seven days was not retired"
     grep -Eq '^retired [0-9]+$' "$home/presence/orphan-old@alpha.watcher" ||
-        die "P3 old ownerless watcher was not retired"
+        die "P3 old ownerless watchdog was not retired"
     [ "$(sed -n '2,6p' "$home/presence/owner-dead@alpha.watcher")" = "$owner_dead_tail" ] ||
         die "P3 owner-dead retirement changed lines 2-6"
     [ "$(sed -n '2,6p' "$home/presence/silent-old@alpha.watcher")" = "$silent_old_tail" ] ||
@@ -179,30 +180,30 @@ property_automatic_retire() {
     [ "$(sed -n '2,6p' "$home/presence/orphan-old@alpha.watcher")" = "$orphan_old_tail" ] ||
         die "P3 ownerless retirement changed lines 2-6"
     [ -f "$home/presence/event-live@alpha.watcher" ] ||
-        die "P3 live owned cadence-0 watcher disappeared"
+        die "P3 live owned cadence-0 watchdog disappeared"
     ! grep -q '^retired ' "$home/presence/event-live@alpha.watcher" ||
-        die "P3 live owned cadence-0 watcher was retired"
+        die "P3 live owned cadence-0 watchdog was retired"
     [ -f "$home/presence/silent-recent@alpha.watcher" ] ||
-        die "P3 recently silent watcher disappeared"
+        die "P3 recently silent watchdog disappeared"
     ! grep -q '^retired ' "$home/presence/silent-recent@alpha.watcher" ||
-        die "P3 recently silent watcher was retired"
+        die "P3 recently silent watchdog was retired"
     [ -f "$home/presence/remote-old@beta.watcher" ] ||
-        die "P3 remote-node watcher disappeared"
+        die "P3 remote-node watchdog disappeared"
     ! grep -q '^retired ' "$home/presence/remote-old@beta.watcher" ||
-        die "P3 remote-node watcher was retired"
+        die "P3 remote-node watchdog was retired"
 
-    KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P3 notice delivery reconcile failed"
+    KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P3 alert delivery reconcile failed"
     [ "$(count_files "$home/inbox/silent-owner/new")" -eq 1 ] ||
-        die "P3 silent watcher owner did not receive exactly one notice"
+        die "P3 silent watchdog owner did not receive exactly one alert"
     retire_notice=$(find "$home/inbox/silent-owner/new" -type f -print -quit)
-    grep -qx 'Urgency: info' "$retire_notice" || die "P3 retirement notice is not info"
+    grep -qx 'Urgency: info' "$retire_notice" || die "P3 retirement alert is not info"
     grep -Eq '^Subject: \[watcher\] silent-old retired after [0-9]+[smhd] silent$' \
-        "$retire_notice" || die "P3 retirement notice subject differs"
+        "$retire_notice" || die "P3 retirement alert subject differs"
     [ "$(count_files "$home/inbox/dead-owner/new")" -eq 0 ] ||
-        die "P3 owner-dead retirement sent a notice"
+        die "P3 owner-dead retirement sent an alert"
     KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P3 steady reconcile failed"
     [ "$(count_files "$home/inbox/silent-owner/new")" -eq 1 ] ||
-        die "P3 silent retirement sent more than one notice"
+        die "P3 silent retirement sent more than one alert"
 }
 
 property_fold_info_notices() {
@@ -222,9 +223,9 @@ property_fold_info_notices() {
     done
     [ "$(grep -l '^From: watcher-w@alpha$' "$home"/inbox/reader/new/* | \
         xargs grep -l '^Urgency: info$' | wc -l | tr -d ' ')" -eq 1 ] ||
-        die "P4 three watcher W info notices did not fold to one"
+        die "P4 three watchdog W info alerts did not coalesce to one"
     grep -q '^Subject: info-4$' "$home"/inbox/reader/new/* ||
-        die "P4 newest watcher W info notice was not kept"
+        die "P4 newest watchdog W info alert was not kept"
 
     urgent_id="$((now + 5)).1.5.watcher-w@alpha"
     write_notice "$home/spool/for/alpha/$urgent_id" "$urgent_id" watcher-w@alpha urgent \
@@ -233,22 +234,22 @@ property_fold_info_notices() {
     other_id="$((now + 6)).1.6.watcher-v@alpha"
     write_notice "$home/spool/for/alpha/$other_id" "$other_id" watcher-v@alpha info \
         other-kept "$future"
-    KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P4 other watcher reconcile failed"
+    KHALA_HOME=$home "$KHALA" reconcile >/dev/null || die "P4 other watchdog reconcile failed"
     [ "$(count_files "$home/inbox/reader/new")" -eq 3 ] ||
-        die "P4 urgent or other watcher notice was folded"
-    [ -f "$home/inbox/reader/cur/$cur_id" ] || die "P4 cur notice was folded"
+        die "P4 urgent or other watchdog alert was coalesced"
+    [ -f "$home/inbox/reader/cur/$cur_id" ] || die "P4 cur alert was coalesced"
 
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/fold-drain.out" ||
-        die "P4 drain failed"
-    grep -q 'info-4' "$RIG/fold-drain.out" || die "P4 drain omitted the newest folded notice"
+        die "P4 inbox read failed"
+    grep -q 'info-4' "$RIG/fold-drain.out" || die "P4 inbox read omitted the newest coalesced alert"
     ! grep -Eq 'info-2|info-3' "$RIG/fold-drain.out" ||
-        die "P4 drain showed an older folded notice"
-    grep -q 'urgent-kept' "$RIG/fold-drain.out" || die "P4 drain omitted the urgent notice"
-    grep -q 'other-kept' "$RIG/fold-drain.out" || die "P4 drain omitted watcher V info"
+        die "P4 inbox read showed an older coalesced alert"
+    grep -q 'urgent-kept' "$RIG/fold-drain.out" || die "P4 inbox read omitted the urgent alert"
+    grep -q 'other-kept' "$RIG/fold-drain.out" || die "P4 inbox read omitted watchdog V info"
 }
 
 mkdir -p "$RIG"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property P1 property_declared_notify
 run_property P2 property_presence_split

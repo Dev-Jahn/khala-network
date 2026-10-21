@@ -3,8 +3,9 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA="$ROOT/bin/khala"
-export KHALA_HOME="$HOME/.khala-test-$$"
 TEST_DIR="$HOME/.khala-local-roundtrip-$$"
+. "$ROOT/test/lib/isolate.sh"
+export KHALA_HOME="$HOME/.khala-test-$$"
 
 cleanup() {
     rm -rf -- "$KHALA_HOME" "$TEST_DIR"
@@ -53,7 +54,7 @@ first_file() {
 }
 
 mkdir -p -- "$TEST_DIR"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 # 1. RED before init.
 if KHALA_SESSION=bob "$KHALA" send alice@b200 -m "hello" \
@@ -146,21 +147,21 @@ fi
 [ "$(count_files "$KHALA_HOME/spool/for/b200")" -eq 0 ] || fail 6 "duplicate was not consumed from spool"
 pass 6 "delivered ids are deduplicated"
 
-# 7. Drain once, then prove that there is nothing new to drain again.
+# 7. Read the inbox once, then prove that there is nothing new to read again.
 if ! KHALA_SESSION=alice "$KHALA" inbox --drain \
     >"$TEST_DIR/drain-1.out" 2>"$TEST_DIR/drain-1.err"; then
-    fail 7 "first drain failed: $(tr '\n' ' ' < "$TEST_DIR/drain-1.err")"
+    fail 7 "first inbox read failed: $(tr '\n' ' ' < "$TEST_DIR/drain-1.err")"
 fi
-grep -q 'hello' "$TEST_DIR/drain-1.out" || fail 7 "drain did not print the message"
+grep -q 'hello' "$TEST_DIR/drain-1.out" || fail 7 "inbox read did not print the message"
 [ -f "$KHALA_HOME/inbox/alice/cur/$message_id" ] || fail 7 "message did not move to cur"
 [ "$(count_files "$KHALA_HOME/inbox/alice/new")" -eq 0 ] || fail 7 "alice new inbox is not empty"
 if ! KHALA_SESSION=alice "$KHALA" inbox --drain \
     >"$TEST_DIR/drain-2.out" 2>"$TEST_DIR/drain-2.err"; then
-    fail 7 "second drain failed: $(tr '\n' ' ' < "$TEST_DIR/drain-2.err")"
+    fail 7 "second inbox read failed: $(tr '\n' ' ' < "$TEST_DIR/drain-2.err")"
 fi
 [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$TEST_DIR/drain-2.out")" -eq 0 ] ||
-    fail 7 "second drain printed an old message"
-pass 7 "inbox drain moves new to cur exactly once"
+    fail 7 "second inbox read printed an old message"
+pass 7 "inbox read moves new to cur exactly once"
 
 # 8. Expire an unread message and receive one bounce only.
 if ! KHALA_SESSION=bob "$KHALA" send nobody@b200 -e 1 -m "expire me" \

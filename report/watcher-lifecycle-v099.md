@@ -1,4 +1,4 @@
-# Watcher lifecycle (0.9.9 CLI) report
+# Watchdog lifecycle (0.9.9 CLI) report
 
 ## Scope and base
 
@@ -27,7 +27,7 @@ not ok P4
 RESULT: FAIL (4 properties)
 ```
 
-P3 was then strengthened to make the owned cadence-0 fixture 40 days old and to require the
+P3 was then strengthened to make the owned heartbeat interval-0 fixture 40 days old and to require the
 non-target marker files to still exist, not merely lack a `retired` line. Before the retention
 deletion fix, the same command produced:
 
@@ -42,29 +42,29 @@ RESULT: FAIL (1 properties)
 
 ## Implementation
 
-- P1: `notify` now rejects missing and retired local watcher markers before queueing a notice or
+- P1: `notify` now rejects missing and retired local watchdog markers before queueing an alert or
   writing the marker. The Korean diagnostic includes the complete
-  `khala watcher declare <name> --cadence <초> --owner <session@node>` command. Explicit cadence-0
+  `khala watcher declare <name> --cadence <초> --owner <session@node>` command. Explicit heartbeat interval-0
   declarations and re-declaration revival remain supported.
-- P2: default `presence` stops after the session table and legend. The unchanged watcher-only path
+- P2: default `presence` stops after the session table and legend. The unchanged watchdog-only path
   remains behind `presence --watchers`; `watcher list` still includes retired rows. The legend keeps
   the existing `watching` explanation and points to `khala watcher list`.
-- P3: the retention-due pass scans only local-node watcher markers and rewrites L1 to
-  `retired <epoch>` when the owner session is retired, a cadence watcher has been silent for more
-  than seven days, or an ownerless legacy watcher has been idle for more than seven days. Silent
-  retirement queues one info notice before the marker transition. Lines 2-6 are preserved. Local
+- P3: the retention-due pass scans only local-node watchdog markers and rewrites L1 to
+  `retired <epoch>` when the owner session is retired, a periodic watchdog has missed heartbeats for more
+  than seven days, or an ownerless legacy watchdog has been idle for more than seven days. Missed-heartbeat
+  deregistration queues one info alert before the marker transition. Lines 2-6 are preserved. Local
   non-retired markers are no longer age-deleted; remote replica cleanup and retired-marker
   retention remain.
-- P4: a newly delivered info notice removes only unread `new/` files whose header block has exact
-  `Type: notice`, `Urgency: info`, and matching `From`. Dedup is checked first. Urgent notices,
-  other watchers, `cur/`, and `log/delivered` are untouched.
+- P4: a newly delivered info alert removes only unread `new/` files whose header block has exact
+  `Type: notice`, `Urgency: info`, and matching `From`. Dedup is checked first. Urgent alerts,
+  other watchdogs, `cur/`, and `log/delivered` are untouched.
 
 ## Existing assertions changed
 
 - `test/notices.sh`
   - Replaced the auto-declare hint and owner-`-` assertions with explicit declarations for the
     successful `sentinel`, `local`, trigger, and custody fixtures.
-  - Kept the existing envelope, last-notify, trigger, spool-custody, and no-ack assertions; only
+  - Kept the existing message headers, last-notify, trigger, spool-custody, and no-ack assertions; only
     their old implicit-declaration setup changed.
 - `test/watchers.sh`
   - Replaced “default presence contains `watchers:` and the watcher row” with the inverse assertions,
@@ -73,9 +73,9 @@ RESULT: FAIL (1 properties)
     retained,” because local lifecycle transitions must replicate through a retired marker first.
 - `test/ears.sh`, `test/cli-polish.sh`, and `test/local-roundtrip.sh` required no assertion changes.
 - `test/watcher-lifecycle.sh` is the new focused P1-P4 suite. It also verifies no undeclared side
-  effects, retired-name refusal, watcher-list compatibility, all retire exclusions, L2-L6
-  preservation, exactly one silent-retirement notice, folding of three sequential info notices,
-  urgent/other-watcher preservation, `cur/` preservation, and drain output.
+  effects, retired-name refusal, watchdog-list compatibility, all deregistration exclusions, L2-L6
+  preservation, exactly one missed-heartbeat deregistration alert, coalescing of three sequential info alerts,
+  urgent/other-watchdog preservation, `cur/` preservation, and inbox read output.
 
 ## GREEN verification
 
@@ -105,9 +105,9 @@ All passed; `cmp` was silent. `shellcheck` is not installed on this host, as sta
 ## Documentation
 
 - `DESIGN.md` §5.4 and §9.6 now define session-only default presence, declared-only notify,
-  retire-first local watcher lifecycle, unread info folding, and the updated CLI/retention contract
+  deregister-first local watchdog lifecycle, unread info coalescing, and the updated CLI/retention contract
   in Korean.
-- `README.md` declares watchers before notify examples and describes all four behaviors.
+- `README.md` declares watchdogs before notify examples and describes all four behaviors.
 - `plugin/skills/khala/SKILL.md` gives the same operator-facing contract.
 - Searches for the old auto-declare and “presence shows watchers below the session table” wording
   return no matches.

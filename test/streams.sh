@@ -6,9 +6,10 @@ KHALA=$ROOT/bin/khala
 START=$ROOT/plugin/hooks/session-start.sh
 RIG=$HOME/.khala-streams-test-$$
 FAILURES=
-GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO=${GO_BINARY-$(command -v go)}
 GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
@@ -169,14 +170,14 @@ property_2() {
     KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/p2-a.err" || die "alpha sync failed"
     KHALA_HOME=$home_b "$KHALA" sync >/dev/null 2>"$RIG/p2-b.err" || die "b200 sync failed"
     KHALA_HOME=$home_b KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/p2-first.out" 2>"$RIG/p2-first.err" || die "first drain failed"
-    grep -Fq "$entry_id" "$RIG/p2-first.out" || die "first drain missed the entry"
+        >"$RIG/p2-first.out" 2>"$RIG/p2-first.err" || die "first inbox read failed"
+    grep -Fq "$entry_id" "$RIG/p2-first.out" || die "first inbox read missed the entry"
     KHALA_HOME=$home_b KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/p2-second.out" 2>"$RIG/p2-second.err" || die "second drain failed"
+        >"$RIG/p2-second.out" 2>"$RIG/p2-second.err" || die "second inbox read failed"
     [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p2-second.out")" -eq 0 ] ||
-        die "second drain redelivered an entry"
+        die "second inbox read redelivered an entry"
     [ "$(sed -n '1p' "$home_b/cursor/reader/khala")" = "$entry_id" ] ||
-        die "cursor did not record the drained Id"
+        die "cursor did not record the read Id"
 }
 
 property_3() {
@@ -214,7 +215,7 @@ property_4() {
     mkdir -p "$project" || die "could not make hook project"
     printf 'commons-reader\n' > "$project/.khala-session"
     run_start "$home" "$project" "$RIG/p4-start-1.out" || die "first SessionStart failed"
-    grep -q '^joined ' "$home/join/commons-reader/khala" || die "commons was not auto-joined"
+    grep -q '^joined ' "$home/join/commons-reader/khala" || die "default stream was not auto-joined"
     KHALA_HOME=$home KHALA_SESSION=commons-reader "$KHALA" leave khala >/dev/null || die "leave failed"
     run_start "$home" "$project" "$RIG/p4-start-2.out" || die "second SessionStart failed"
     grep -q '^left ' "$home/join/commons-reader/khala" || die "SessionStart overwrote left"
@@ -239,19 +240,19 @@ property_5() {
         item=$((item + 1))
     done
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain --max-n 20 --max-bytes 65536 \
-        >"$RIG/p5-first.out" 2>"$RIG/p5-first.err" || die "bounded drain failed"
+        >"$RIG/p5-first.out" 2>"$RIG/p5-first.err" || die "bounded inbox read failed"
     [ "$(grep -c '^--- .* ---$' "$RIG/p5-first.out")" -eq 20 ] || die "shared count cap was not 20"
     first_stream_line=$(grep -n '^--- stream ' "$RIG/p5-first.out" | sed -n '1s/:.*//p')
     second_mail_line=$(grep -n '^--- .* ---$' "$RIG/p5-first.out" | sed -n '2s/:.*//p')
     [ -n "$first_stream_line" ] && [ "$second_mail_line" -lt "$first_stream_line" ] ||
-        die "mail was not drained before streams"
+        die "mail was not read before streams"
     grep -qx 'stream khala: 4건 더' "$RIG/p5-first.out" || die "stream remainder summary differs"
     drained_cursor=$(sed -n '1p' "$home/cursor/reader/khala")
     grep -Fq -- "--- stream khala $drained_cursor ---" "$RIG/p5-first.out" ||
         die "cursor advanced beyond actual output"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/p5-second.out" 2>"$RIG/p5-second.err" || die "continuation drain failed"
-    [ "$(grep -c '^--- stream ' "$RIG/p5-second.out")" -eq 4 ] || die "continuation did not drain four"
+        >"$RIG/p5-second.out" 2>"$RIG/p5-second.err" || die "continuation inbox read failed"
+    [ "$(grep -c '^--- stream ' "$RIG/p5-second.out")" -eq 4 ] || die "continuation did not read four"
     ! grep -q 'mail-first' "$RIG/p5-second.out" || die "mail redelivered on continuation"
 }
 
@@ -267,9 +268,9 @@ property_6() {
     mkdir -p "$home_h/streams/khala/alpha"
     cp "$home_a/streams/khala/alpha/$old_id" "$home_h/streams/khala/alpha/$old_id"
     KHALA_HOME=$home_a "$KHALA" reconcile >/dev/null 2>"$RIG/p6-a-rec.err" || die "alpha prune failed"
-    KHALA_HOME=$home_h "$KHALA" reconcile >/dev/null 2>"$RIG/p6-h-rec.err" || die "hub prune failed"
+    KHALA_HOME=$home_h "$KHALA" reconcile >/dev/null 2>"$RIG/p6-h-rec.err" || die "upstream prune failed"
     [ ! -e "$home_a/streams/khala/alpha/$old_id" ] || die "alpha retained expired entry"
-    [ ! -e "$home_h/streams/khala/alpha/$old_id" ] || die "hub retained expired entry"
+    [ ! -e "$home_h/streams/khala/alpha/$old_id" ] || die "upstream retained expired entry"
     KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/p6-sync.err" || die "post-prune sync failed"
     [ ! -e "$home_a/streams/khala/alpha/$old_id" ] || die "sync resurrected expired entry"
     KHALA_HOME=$home_a KHALA_SESSION=laggard "$KHALA" inbox --drain >/dev/null
@@ -277,9 +278,9 @@ property_6() {
     printf 'joined 0\n' > "$home_a/join/laggard/khala"
     printf '%s\n' "$old_id" > "$home_a/cursor/laggard/khala"
     KHALA_HOME=$home_a KHALA_SESSION=laggard "$KHALA" inbox --drain >"$RIG/p6-lost.out" ||
-        die "laggard drain failed"
+        die "laggard inbox read failed"
     grep -q '커서 이전 항목들이 retention을 지나 소멸했습니다' "$RIG/p6-lost.out" ||
-        die "retention-loss notice was omitted"
+        die "retention-loss alert was omitted"
 
     KHALA_HOME=$home_a KHALA_SESSION=flight-reader "$KHALA" inbox >/dev/null ||
         die "in-flight reader heartbeat failed"
@@ -316,14 +317,14 @@ property_6() {
     while [ "$flight_attempt" -le 8 ]; do
         KHALA_HOME=$home_a KHALA_SESSION=flight-reader "$KHALA" inbox --drain \
             >>"$RIG/p6-flight-drain.out" 2>"$RIG/p6-flight-drain.err" ||
-            die "in-flight drain attempt $flight_attempt failed"
+            die "in-flight inbox read attempt $flight_attempt failed"
         flight_attempt=$((flight_attempt + 1))
     done
     rm -f "$flight_control"
     wait "$flight_inject_pid" || die "in-flight injector failed"
     [ ! -s "$RIG/p6-flight-watch.out" ] || die "expired watch produced output"
     [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p6-flight-drain.out")" -eq 0 ] ||
-        die "expired entry appeared in drain"
+        die "expired entry appeared in inbox read"
     [ ! -e "$home_a/cursor/flight-reader/flight" ] || die "expired entry advanced the cursor"
 }
 
@@ -361,7 +362,7 @@ run_link_streams_suite() {
         grep -qx PASS "$link_streams_status"
         return
     fi
-    if PATH=$HOME/go-toolchain/bin:$PATH bash "$ROOT/test/link-streams.sh" \
+    if GO_BINARY=$GO bash "$ROOT/test/link-streams.sh" \
         >"$RIG/link-streams.out" 2>"$RIG/link-streams.err"; then
         printf 'PASS\n' > "$link_streams_status"
         return 0
@@ -371,15 +372,15 @@ run_link_streams_suite() {
 }
 
 property_8() {
-    run_link_streams_suite || die "link stream suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
+    run_link_streams_suite || die "link-streams.sh suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
     for property in 8a 8b 8c L1 L2 H1 H2; do
-        grep -q "^ok $property —" "$RIG/link-streams.out" || die "link stream suite omitted $property"
+        grep -q "^ok $property —" "$RIG/link-streams.out" || die "link-streams.sh suite omitted $property"
     done
 }
 
 property_10() {
-    run_link_streams_suite || die "link stream suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
-    grep -q '^ok 10 —' "$RIG/link-streams.out" || die "link stream suite omitted property 10"
+    run_link_streams_suite || die "link-streams.sh suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
+    grep -q '^ok 10 —' "$RIG/link-streams.out" || die "link-streams.sh suite omitted property 10"
 }
 
 property_9() {
@@ -393,11 +394,11 @@ property_9() {
         fi
         grep -q '^RESULT: PASS$' "$RIG/p9-$suite.out" || die "$suite omitted RESULT: PASS"
     done
-    if [ -x "$HOME/go-toolchain/bin/go" ]; then
-        PATH=$HOME/go-toolchain/bin:$PATH bash "$ROOT/test/link.sh" \
+    if [ -x "$GO" ]; then
+        GO_BINARY=$GO bash "$ROOT/test/link.sh" \
             >"$RIG/p9-link.out" 2>"$RIG/p9-link.err" ||
-            die "link regression failed: $(tail -n 3 "$RIG/p9-link.err" | tr '\n' ' ')"
-        grep -q '^RESULT: PASS$' "$RIG/p9-link.out" || die "link omitted RESULT: PASS"
+            die "link.sh regression failed: $(tail -n 3 "$RIG/p9-link.err" | tr '\n' ' ')"
+        grep -q '^RESULT: PASS$' "$RIG/p9-link.out" || die "link.sh omitted RESULT: PASS"
     else
         printf 'SKIP property 9 link — Go toolchain unavailable\n'
     fi
@@ -458,7 +459,7 @@ property_13() {
     printf '%s\n' "$old" > "$home_a/presence/ghost@alpha"
     printf '%s\n' "$old" > "$home_h/presence/ghost@alpha"
     KHALA_HOME=$home_a "$KHALA" reconcile >/dev/null || die "alpha presence GC failed"
-    KHALA_HOME=$home_h "$KHALA" reconcile >/dev/null || die "hub presence GC failed"
+    KHALA_HOME=$home_h "$KHALA" reconcile >/dev/null || die "upstream presence GC failed"
     KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/p13-gc-sync.err" || die "presence post-GC sync failed"
     [ ! -e "$home_a/presence/ghost@alpha" ] && [ ! -e "$home_h/presence/ghost@alpha" ] ||
         die "old heartbeat survived or revived"
@@ -470,7 +471,7 @@ property_13() {
     grep -q '^restarter@alpha' "$RIG/p13-retired.out" && die "retired identity remained visible"
     KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/p13-retire-sync.err" || die "retire sync failed"
     grep -q '^retired ' "$home_h/presence/restarter@alpha" || die "retirement did not project"
-    KHALA_HOME=$home_h "$KHALA" presence >"$RIG/p13-hub-presence.out" || die "hub presence failed"
+    KHALA_HOME=$home_h "$KHALA" presence >"$RIG/p13-hub-presence.out" || die "upstream presence failed"
     grep -q '^restarter@alpha' "$RIG/p13-hub-presence.out" && die "projection shows retired identity"
     KHALA_HOME=$home_a KHALA_SESSION=restarter "$KHALA" say -m 'revived' >/dev/null || die "revival say failed"
     KHALA_HOME=$home_a "$KHALA" presence >"$RIG/p13-revived.out" || die "revived presence failed"
@@ -498,10 +499,10 @@ property_14() {
     future2=$((future + 1))
     future2_id=$(write_entry "$home" khala alpha timewarp "$future2" 'future drain') || die "second future fixture failed"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/p14-drain.out" 2>"$RIG/p14-drain.err" || die "future drain failed"
-    grep -q 'future drain' "$RIG/p14-drain.out" && die "drain displayed a future entry"
-    [ ! -e "$home/streams/khala/alpha/$future2_id" ] || die "drain left future entry live"
-    grep -Fq "$future2_id" "$RIG/p14-drain.err" || die "drain quarantine warning omitted Id"
+        >"$RIG/p14-drain.out" 2>"$RIG/p14-drain.err" || die "future inbox read failed"
+    grep -q 'future drain' "$RIG/p14-drain.out" && die "inbox read displayed a future entry"
+    [ ! -e "$home/streams/khala/alpha/$future2_id" ] || die "inbox read left future entry live"
+    grep -Fq "$future2_id" "$RIG/p14-drain.err" || die "inbox read quarantine warning omitted Id"
 }
 
 property_15() {
@@ -513,8 +514,8 @@ property_15() {
         die "quiet join failed"
     first=$(KHALA_HOME=$home KHALA_SESSION=speaker "$KHALA" say -m 'quiet still drains') || die "say failed"
     KHALA_HOME=$home KHALA_SESSION=quiet-reader "$KHALA" inbox --drain >"$RIG/p15-drain.out" ||
-        die "quiet drain failed"
-    grep -Fq "$first" "$RIG/p15-drain.out" || die "quiet stream was excluded from drain"
+        die "quiet inbox read failed"
+    grep -Fq "$first" "$RIG/p15-drain.out" || die "quiet stream was excluded from inbox read"
     KHALA_HOME=$home "$KHALA" watch --session quiet-reader --interval 1 --max-wait 2 \
         >"$RIG/p15-watch.out" 2>"$RIG/p15-watch.err" &
     quiet_pid=$!
@@ -556,7 +557,7 @@ property_16() {
     [ ! -e "$home/join/retired-one" ] && [ ! -e "$home/cursor/retired-one" ] ||
         die "retired session state remained"
     KHALA_HOME=$home KHALA_SESSION=living "$KHALA" inbox --drain >"$RIG/p16-drain.out" ||
-        die "living drain failed"
+        die "living inbox read failed"
     if grep -q 'already consumed' "$RIG/p16-drain.out"; then
         die "preserved cursor redelivered an entry"
     fi
@@ -576,23 +577,23 @@ run_property() {
 }
 
 mkdir -p "$RIG" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property 1 'offline say lands durably and sync propagates it' property_1
 run_property 2 'sync-only delivery advances a no-redelivery cursor' property_2
 run_property 3 'publisher shards merge in identical epoch/Id order' property_3
-run_property 4 'SessionStart commons auto-join respects leave and rejoin' property_4
+run_property 4 'SessionStart default-stream auto-join respects leave and rejoin' property_4
 run_property 5 'mail and streams share caps with mail priority and exact cursor advancement' property_5
 run_property 6 'retention prunes independently, cannot revive, and reports cursor loss' property_6
 run_property 7 'watch wakes only for joined loud streams' property_7
-if [ -x "$HOME/go-toolchain/bin/go" ]; then
-    run_property 8 'link streams propagate, negotiate minor 0, avoid echo, and quarantine future epochs' property_8
+if [ -x "$GO" ]; then
+    run_property 8 'relay streams propagate, negotiate minor 0, avoid echo, and quarantine future epochs' property_8
 else
     printf 'SKIP 8 — Go toolchain unavailable\n'
 fi
 run_property 9 'all seven legacy suites remain green' property_9
-if [ -x "$HOME/go-toolchain/bin/go" ]; then
-    run_property 10 'link and rsync race converges to one file and one drain' property_10
+if [ -x "$GO" ]; then
+    run_property 10 'relay and rsync race converges to one file and one inbox read' property_10
 else
     printf 'SKIP 10 — Go toolchain unavailable\n'
 fi
@@ -600,7 +601,7 @@ run_property 11 'R13, bash 3.2, no-jq, no-system-temp audits remain green' prope
 run_property 12 'streams and stream cat agree with physical files' property_12
 run_property 13 'presence ages, retires, projects, and revives correctly' property_13
 run_property 14 'future-epoch entries are quarantined loudly' property_14
-run_property 15 'quiet streams drain without waking and survive SessionStart' property_15
+run_property 15 'quiet streams are read without waking and survive SessionStart' property_15
 run_property 16 'only retired or absent session stream state is collected' property_16
 
 if [ -n "$FAILURES" ]; then

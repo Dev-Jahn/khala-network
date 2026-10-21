@@ -11,6 +11,7 @@ HOME_MISSING="$HOME/.khala-watch-missing-$$"
 BOGUS="$HOME/.khala-watch-bogus-$$"
 TEST_DIR="$HOME/.khala-watch-test-$$"
 ACTIVE_PID=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     if [ -n "$ACTIVE_PID" ]; then
@@ -65,7 +66,7 @@ write_alpha_config() {
 }
 
 mkdir -p -- "$TEST_DIR"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" init alpha \
     >"$TEST_DIR/init-local.out" 2>"$TEST_DIR/init-local.err"; then
@@ -93,7 +94,7 @@ immediate_line=$(printf '%s\t%s' "$immediate_id" 'sender@alpha')
 grep -Fqx "$immediate_line" "$TEST_DIR/immediate-watch.out" || fail 1 "watch did not list Id and From"
 pass 1 "pre-delivered mail wakes immediately with count, Id, and From"
 
-# 2. A watch advertises its ear without creating a heartbeat, then cleans up.
+# 2. A watch advertises its reachable state without creating a heartbeat, then cleans up.
 arrival_started=$(date +%s) || fail 2 "could not read arrival start time"
 KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session w2 --interval 1 --max-wait 8 \
     >"$TEST_DIR/arrival-watch.out" 2>"$TEST_DIR/arrival-watch.err" &
@@ -125,7 +126,7 @@ arrival_line=$(printf '%s\t%s' "$arrival_id" 'other@alpha')
 grep -Fqx "$arrival_line" "$TEST_DIR/arrival-watch.out" || fail 2 "arrival output omitted Id or From"
 [ ! -e "$HOME_LOCAL/presence/w2@alpha" ] || fail 2 "watch exit created a heartbeat"
 [ ! -e "$arrival_marker" ] || fail 2 "watching marker remained after mail wake"
-pass 2 "watch advertises only its ear and removes the marker after mail wake"
+pass 2 "watch advertises only its reachable state and removes the marker after mail wake"
 
 # 3. An empty inbox reaches the distinct timeout status with no stdout.
 if KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session empty --interval 1 --max-wait 3 \
@@ -195,7 +196,7 @@ mv "$HOME_LOCAL/presence" "$TEST_DIR/presence.saved" || fail 6 "could not move p
 : > "$HOME_LOCAL/presence" || fail 6 "could not break presence path"
 if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session routed --interval 1 --max-wait 2 \
     >"$TEST_DIR/broken-presence-watch.out" 2>"$TEST_DIR/broken-presence-watch.err"; then
-    fail 6 "broken presence path killed the ear: $(tr '\n' ' ' < "$TEST_DIR/broken-presence-watch.err")"
+    fail 6 "broken presence path killed the watch: $(tr '\n' ' ' < "$TEST_DIR/broken-presence-watch.err")"
 fi
 grep -Fq "$routed_id" "$TEST_DIR/broken-presence-watch.out" || fail 6 "broken presence path blocked wake"
 grep -q 'watching marker를 갱신하지 못했습니다; watch를 계속합니다' \
@@ -204,14 +205,14 @@ rm -f "$HOME_LOCAL/presence" || fail 6 "could not remove broken presence path"
 mv "$TEST_DIR/presence.saved" "$HOME_LOCAL/presence" || fail 6 "could not restore presence"
 pass 6 "marker garbage and marker-write failure have no routing effect"
 
-# 7. A non-mailbox watcher pulls its own mail from an absolute-path mailbox.
+# 7. A downstream watch process pulls its own mail from an absolute-path upstream.
 if ! KHALA_HOME="$HOME_A" "$KHALA" init alpha \
     >"$TEST_DIR/init-alpha.out" 2>"$TEST_DIR/init-alpha.err"; then
     fail 7 "alpha init failed: $(tr '\n' ' ' < "$TEST_DIR/init-alpha.err")"
 fi
 if ! KHALA_HOME="$HOME_M" "$KHALA" init b200 \
     >"$TEST_DIR/init-mailbox.out" 2>"$TEST_DIR/init-mailbox.err"; then
-    fail 7 "mailbox init failed: $(tr '\n' ' ' < "$TEST_DIR/init-mailbox.err")"
+    fail 7 "upstream init failed: $(tr '\n' ' ' < "$TEST_DIR/init-mailbox.err")"
 fi
 write_alpha_config working || fail 7 "alpha config setup failed"
 if ! cross_id=$(KHALA_HOME="$HOME_M" KHALA_SESSION=remote \
@@ -220,9 +221,9 @@ if ! cross_id=$(KHALA_HOME="$HOME_M" KHALA_SESSION=remote \
 fi
 if ! KHALA_HOME="$HOME_M" "$KHALA" sync \
     >"$TEST_DIR/cross-mailbox-sync.out" 2>"$TEST_DIR/cross-mailbox-sync.err"; then
-    fail 7 "mailbox sync failed: $(tr '\n' ' ' < "$TEST_DIR/cross-mailbox-sync.err")"
+    fail 7 "upstream sync failed: $(tr '\n' ' ' < "$TEST_DIR/cross-mailbox-sync.err")"
 fi
-[ -f "$HOME_M/spool/for/alpha/$cross_id" ] || fail 7 "mail did not reach the mailbox spool"
+[ -f "$HOME_M/spool/for/alpha/$cross_id" ] || fail 7 "mail did not reach the upstream spool"
 if ! KHALA_HOME="$HOME_A" "$KHALA" watch --session crosswatch --interval 1 --max-wait 5 \
     >"$TEST_DIR/cross-watch.out" 2>"$TEST_DIR/cross-watch.err"; then
     fail 7 "cross watch failed: $(tr '\n' ' ' < "$TEST_DIR/cross-watch.err")"
@@ -230,7 +231,7 @@ fi
 cross_line=$(printf '%s\t%s' "$cross_id" 'remote@b200')
 grep -Fqx "$cross_line" "$TEST_DIR/cross-watch.out" || fail 7 "pulled mail was not reported"
 [ -f "$HOME_A/inbox/crosswatch/new/$cross_id" ] || fail 7 "watch did not pull and deliver mail"
-pass 7 "non-mailbox watch pulls from the mailbox without manual local sync"
+pass 7 "downstream watch pulls from the upstream without manual local sync"
 
 # 8. Watching markers ride the two-home presence exchange.
 KHALA_HOME="$HOME_A" "$KHALA" watch --session exchange-ear --interval 1 --max-wait 20 \
@@ -259,8 +260,8 @@ ACTIVE_PID=
 [ ! -e "$HOME_A/presence/exchange-ear@alpha.watching" ] || fail 8 "exchange watch left its local marker"
 pass 8 "watching markers ride the two-home presence exchange"
 
-# 9. Repeated mailbox failures stay loud but do not abort the watcher.
-write_alpha_config broken || fail 9 "broken mailbox config setup failed"
+# 9. Repeated upstream failures stay loud but do not abort the watch process.
+write_alpha_config broken || fail 9 "broken upstream config setup failed"
 if KHALA_HOME="$HOME_A" "$KHALA" watch --session resilient --interval 1 --max-wait 4 \
     >"$TEST_DIR/resilient.out" 2>"$TEST_DIR/resilient.err"; then
     resilient_status=0
@@ -300,7 +301,7 @@ fi
 grep -q 'khala init 먼저' "$TEST_DIR/broken.err" || fail 10 "broken config guidance is absent"
 pass 10 "configuration and interval errors exit 1 with guidance"
 
-# 11. A second arm is idempotent and does not create another watcher.
+# 11. A second arm is idempotent and does not create another watch process.
 KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session singleton --interval 1 --max-wait 10 \
     >"$TEST_DIR/singleton-first.out" 2>"$TEST_DIR/singleton-first.err" &
 ACTIVE_PID=$!
@@ -310,7 +311,7 @@ if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session singleton --interval 1 --
     fail 11 "second singleton arm did not exit 0"
 fi
 grep -Eq '^이미 감시 중: singleton \(pid [0-9]+\)$' "$TEST_DIR/singleton-second.out" || \
-    fail 11 "second arm did not report the running watcher"
+    fail 11 "second arm did not report the running watch process"
 [ ! -s "$TEST_DIR/singleton-second.err" ] || fail 11 "second arm wrote unexpected stderr"
 [ -d "$HOME_LOCAL/run/watch.singleton.lock.d" ] || fail 11 "singleton lock is missing"
 if ! singleton_id=$(KHALA_HOME="$HOME_LOCAL" KHALA_SESSION=sender \
@@ -318,13 +319,13 @@ if ! singleton_id=$(KHALA_HOME="$HOME_LOCAL" KHALA_SESSION=sender \
     fail 11 "singleton fixture send failed: $(tr '\n' ' ' < "$TEST_DIR/singleton-send.err")"
 fi
 if ! wait "$ACTIVE_PID"; then
-    fail 11 "first singleton watcher did not exit successfully"
+    fail 11 "first singleton watch process did not exit successfully"
 fi
 ACTIVE_PID=
-grep -Fq "$singleton_id" "$TEST_DIR/singleton-first.out" || fail 11 "sole watcher missed the mail"
+grep -Fq "$singleton_id" "$TEST_DIR/singleton-first.out" || fail 11 "sole watch process missed the mail"
 [ ! -e "$HOME_LOCAL/presence/singleton@alpha.watching" ] || fail 11 "singleton marker remained"
 [ ! -e "$HOME_LOCAL/run/watch.singleton.lock.d" ] || fail 11 "singleton lock remained"
-pass 11 "a second arm exits idempotently and the sole watcher cleans up"
+pass 11 "a second arm exits idempotently and the sole watch process cleans up"
 
 # 12. A stale singleton lock is reclaimed using its recorded interval.
 if ! stale_watch_id=$(KHALA_HOME="$HOME_LOCAL" KHALA_SESSION=sender \

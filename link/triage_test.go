@@ -40,7 +40,7 @@ type jevRequest struct {
 	body   []byte
 }
 
-// fakeJev answers by the letter subject: nouls[subject] = {needs_action, awaits_reply, time_sensitive}.
+// fakeJev answers by the message subject: nouls[subject] = {needs_action, awaits_reply, time_sensitive}.
 type fakeJev struct {
 	mu       sync.Mutex
 	requests []jevRequest
@@ -105,7 +105,7 @@ func (j *fakeJev) request(i int) jevRequest {
 }
 
 type triageFixture struct {
-	*conduitFixture
+	*notifierFixture
 	jev    *fakeJev
 	clock  *fakeClock
 	sleeps []time.Duration
@@ -114,20 +114,20 @@ type triageFixture struct {
 }
 
 // newTriageFixture writes conf (when non-empty; "{endpoint}" is replaced by the fake
-// server URL) with mode 0600 and builds the engine the way the conduit does.
+// server URL) with mode 0600 and builds the engine the way the notifier does.
 func newTriageFixture(t *testing.T, conf string) *triageFixture {
 	t.Helper()
-	f := &triageFixture{conduitFixture: newConduitFixture(t), jev: newFakeJev(t),
+	f := &triageFixture{notifierFixture: newNotifierFixture(t), jev: newFakeJev(t),
 		clock: &fakeClock{now: time.Unix(1790100000, 0)}}
 	if conf != "" {
 		f.writeConf(conf)
 	}
-	f.engine = newTriageEngineAt(f.home, f.conduit.logger, f.clock.Now, func(d time.Duration) {
+	f.engine = newTriageEngineAt(f.home, f.notifier.logger, f.clock.Now, func(d time.Duration) {
 		f.sleepM.Lock()
 		f.sleeps = append(f.sleeps, d)
 		f.sleepM.Unlock()
 	})
-	f.conduit.triage = f.engine
+	f.notifier.triage = f.engine
 	t.Cleanup(f.engine.close)
 	return f
 }
@@ -161,8 +161,8 @@ func (f *triageFixture) waitTag(identity, id string) string {
 }
 
 func (f *triageFixture) frameContent(identity string) string {
-	letters := f.conduit.pending(identity)
-	frame := f.conduit.frame(identity, letterGeneration(letters), "attempt-1", 0, letters)
+	messages := f.notifier.pending(identity)
+	frame := f.notifier.frame(identity, queueDigest(messages), "attempt-1", 0, messages)
 	return frame["message"].(map[string]string)["content"]
 }
 
@@ -179,12 +179,12 @@ const baseConf = "# test\nprovider typesafe\nkey test-key\nendpoint {endpoint}\n
 
 func TestTriageP1OffIsInert(t *testing.T) {
 	f := newTriageFixture(t, "")
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: hello\n\nplease do x\n")
-	f.stageEnvelope("ink", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
-	f.conduit.triage = nil
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: hello\n\nplease do x\n")
+	f.stageMessageData("ink", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	f.notifier.triage = nil
 	before := f.frameContent("ink")
-	f.conduit.triage = f.engine
-	f.conduit.scan()
+	f.notifier.triage = f.engine
+	f.notifier.scan()
 	f.engine.refresh()
 	f.engine.scan()
 	time.Sleep(200 * time.Millisecond)
@@ -208,18 +208,18 @@ func TestTriageP2AsksOncePerMessageAndWritesCache(t *testing.T) {
 	f.jev.nouls["act"] = [3]float64{0.9, 0.8, 0.75}
 	f.jev.nouls["info"] = [3]float64{0.1, 0.1, 0.1}
 	longBody := "a" + strings.Repeat("가", 1200) + "\n"
-	f.stageEnvelope("ink", "1.act", "Khala: 0.1\nId: 1.act\nFrom: alice@alpha\nTo: ink@alpha\nType: message\nSubject: act\nIn-Reply-To: 0.prev\n\n"+longBody)
-	f.stageEnvelope("ink", "2.info", "From: bob@alpha\nTo: ink@alpha\nType: message\n\nfyi only\n")
+	f.stageMessageData("ink", "1.act", "Khala: 0.1\nId: 1.act\nFrom: alice@alpha\nTo: ink@alpha\nType: message\nSubject: act\nIn-Reply-To: 0.prev\n\n"+longBody)
+	f.stageMessageData("ink", "2.info", "From: bob@alpha\nTo: ink@alpha\nType: message\n\nfyi only\n")
 	f.jev.nouls[""] = [3]float64{0.1, 0.1, 0.1}
-	f.stageEnvelope("ink", "3.notice", "From: monitor@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "3.notice", "From: monitor@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
+	f.notifier.scan()
 	if got := f.waitTag("ink", "1.act"); got != "action,reply,urgent\n" {
 		t.Fatalf("P2: tag for 1.act=%q want %q", got, "action,reply,urgent\n")
 	}
 	if got := f.waitTag("ink", "2.info"); got != "fyi\n" {
 		t.Fatalf("P2: tag for 2.info=%q want fyi", got)
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	time.Sleep(100 * time.Millisecond)
 	if n := f.jev.count(); n != 2 {
 		t.Fatalf("P2: %d requests for 2 message letters, want exactly 2", n)
@@ -266,24 +266,24 @@ func TestTriageP2AsksOncePerMessageAndWritesCache(t *testing.T) {
 		if err := json.Unmarshal(body["state"], &state); err != nil || len(state) != 1 {
 			t.Fatalf("P2: state=%s err=%v", body["state"], err)
 		}
-		letter := state["letter"]
+		messageItem := state["letter"]
 		keys := make([]string, 0)
-		for k := range letter {
+		for k := range messageItem {
 			keys = append(keys, k)
 		}
-		if len(keys) != 5 || letter["from"] == nil || letter["to"] == nil || letter["subject"] == nil || letter["is_reply"] == nil || letter["body"] == nil {
+		if len(keys) != 5 || messageItem["from"] == nil || messageItem["to"] == nil || messageItem["subject"] == nil || messageItem["is_reply"] == nil || messageItem["body"] == nil {
 			t.Fatalf("P2: letter state keys=%v", keys)
 		}
-		if letter["subject"] == "act" {
+		if messageItem["subject"] == "act" {
 			actState = body["state"]
-			if letter["from"] != "alice@alpha" || letter["to"] != "ink@alpha" || letter["is_reply"] != true {
-				t.Fatalf("P2: act letter state=%v", letter)
+			if messageItem["from"] != "alice@alpha" || messageItem["to"] != "ink@alpha" || messageItem["is_reply"] != true {
+				t.Fatalf("P2: act letter state=%v", messageItem)
 			}
-			if want := "a" + strings.Repeat("가", 999); letter["body"] != want {
-				t.Fatalf("P2: body not cut at 3000 bytes on a UTF-8 boundary: len=%d", len(letter["body"].(string)))
+			if want := "a" + strings.Repeat("가", 999); messageItem["body"] != want {
+				t.Fatalf("P2: body not cut at 3000 bytes on a UTF-8 boundary: len=%d", len(messageItem["body"].(string)))
 			}
-		} else if letter["subject"] != "" || letter["is_reply"] != false || letter["body"] != "fyi only\n" {
-			t.Fatalf("P2: info letter state=%v", letter)
+		} else if messageItem["subject"] != "" || messageItem["is_reply"] != false || messageItem["body"] != "fyi only\n" {
+			t.Fatalf("P2: info letter state=%v", messageItem)
 		}
 	}
 	var entry map[string]any
@@ -317,21 +317,21 @@ func TestTriageP2AsksOncePerMessageAndWritesCache(t *testing.T) {
 func TestTriageP2bThresholds(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
 	f.jev.nouls["edge"] = [3]float64{0.69, 0.70, 0.0}
-	f.stageEnvelope("ink", "1.edge", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: edge\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.edge", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: edge\n\nbody\n")
+	f.notifier.scan()
 	if got := f.waitTag("ink", "1.edge"); got != "reply\n" {
 		t.Fatalf("P2b: noul 0.69/0.70 at threshold 0.7 tagged %q, want %q", got, "reply\n")
 	}
 	f.writeConf(baseConf + "threshold 0.5\n")
 	f.clock.Advance(61 * time.Second)
-	f.conduit.scan()
+	f.notifier.scan()
 	data, _ := os.ReadFile(f.cachePath("ink", "1.edge", ".tag"))
 	if string(data) != "action,reply\n" {
 		t.Fatalf("P2b: threshold 0.5 did not re-derive the tag: %q", data)
 	}
 	f.writeConf(baseConf + "threshold 0.5\nthreshold-reply 0.9\n")
 	f.clock.Advance(61 * time.Second)
-	f.conduit.scan()
+	f.notifier.scan()
 	data, _ = os.ReadFile(f.cachePath("ink", "1.edge", ".tag"))
 	if string(data) != "action\n" {
 		t.Fatalf("P2b: threshold-reply 0.9 did not re-derive the tag: %q", data)
@@ -347,18 +347,18 @@ func TestTriageP3DoorbellDoesNotWaitForJudgment(t *testing.T) {
 	f.jev.delay = 5 * time.Second
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: please\n\nplease do x\n")
-	originalHook := conduitBeforeDoorbellWrite
-	t.Cleanup(func() { conduitBeforeDoorbellWrite = originalHook })
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: please\n\nplease do x\n")
+	originalHook := notifierBeforeNotificationWrite
+	t.Cleanup(func() { notifierBeforeNotificationWrite = originalHook })
 	var hookCacheExists = true
 	hookCalled := false
-	conduitBeforeDoorbellWrite = func(string) {
+	notifierBeforeNotificationWrite = func(string) {
 		hookCalled = true
 		_, err := os.Stat(f.cachePath("ink", "1.mail", ".json"))
 		hookCacheExists = err == nil
 	}
 	started := time.Now()
-	f.conduit.scan()
+	f.notifier.scan()
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("P3: doorbell not written")
 	}
@@ -393,8 +393,8 @@ func countLines(logs, substr string) int {
 func TestTriageP4ErrorCachedAndBackedOff(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
 	f.jev.statuses = []int{401, 401, 401}
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
+	f.notifier.scan()
 	jsonPath := f.cachePath("ink", "1.mail", ".json")
 	if !waitForTest(3*time.Second, func() bool { _, err := os.Stat(jsonPath); return err == nil }) {
 		t.Fatalf("P4: 401 did not write an error entry; requests=%d", f.jev.count())
@@ -408,7 +408,7 @@ func TestTriageP4ErrorCachedAndBackedOff(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		f.clock.Advance(3 * time.Minute)
-		f.conduit.scan()
+		f.notifier.scan()
 	}
 	time.Sleep(200 * time.Millisecond)
 	if n := f.jev.count(); n != 1 {
@@ -418,7 +418,7 @@ func TestTriageP4ErrorCachedAndBackedOff(t *testing.T) {
 		t.Fatalf("P4: frame with error entry=%q", line)
 	}
 	f.clock.Advance(2 * time.Minute)
-	f.conduit.scan()
+	f.notifier.scan()
 	if !waitForTest(3*time.Second, func() bool { return f.jev.count() == 2 }) {
 		t.Fatalf("P4: no retry after 10 minutes (requests=%d)", f.jev.count())
 	}
@@ -431,8 +431,8 @@ func TestTriageP4ErrorCachedAndBackedOff(t *testing.T) {
 func TestTriageP4RateLimitBacksOffThenSucceeds(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
 	f.jev.statuses = []int{429, 529}
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
+	f.notifier.scan()
 	if got := f.waitTag("ink", "1.mail"); got != "action\n" {
 		t.Fatalf("P4: tag after 429/529 backoff=%q", got)
 	}
@@ -447,8 +447,8 @@ func TestTriageP4RateLimitBacksOffThenSucceeds(t *testing.T) {
 func TestTriageP4RateLimitExhaustedIsNotCached(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
 	f.jev.statuses = []int{429, 429, 429}
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
+	f.notifier.scan()
 	if !waitForTest(3*time.Second, func() bool { return f.jev.count() == 3 }) {
 		t.Fatalf("P4: requests=%d want 3 tries", f.jev.count())
 	}
@@ -456,7 +456,7 @@ func TestTriageP4RateLimitExhaustedIsNotCached(t *testing.T) {
 	if _, err := os.Stat(f.cachePath("ink", "1.mail", ".json")); !os.IsNotExist(err) {
 		t.Fatalf("P4: exhausted 429 was cached (err=%v)", err)
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	if got := f.waitTag("ink", "1.mail"); got != "action\n" {
 		t.Fatalf("P4: next scan after 429 did not retry: %q", got)
 	}
@@ -464,10 +464,10 @@ func TestTriageP4RateLimitExhaustedIsNotCached(t *testing.T) {
 
 func TestTriageP5SkipsOperatorAndNotice(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
-	f.stageEnvelope("ink", "1.op", "From: operator@alpha\nTo: ink@alpha\nType: operator\nSubject: op\n\nbody\n")
-	f.stageEnvelope("ink", "2.notice", "From: gpu@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
-	f.stageEnvelope("ink", "3.info", "From: gpu@alpha\nType: notice\nUrgency: info\nSubject: cool\n\nbody\n")
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.op", "From: operator@alpha\nTo: ink@alpha\nType: operator\nSubject: op\n\nbody\n")
+	f.stageMessageData("ink", "2.notice", "From: gpu@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
+	f.stageMessageData("ink", "3.info", "From: gpu@alpha\nType: notice\nUrgency: info\nSubject: cool\n\nbody\n")
+	f.notifier.scan()
 	time.Sleep(300 * time.Millisecond)
 	if n := f.jev.count(); n != 0 {
 		t.Fatalf("P5: operator/notice letters made %d requests", n)
@@ -480,12 +480,12 @@ func TestTriageP5SkipsOperatorAndNotice(t *testing.T) {
 func TestTriageP6HourlyBudget(t *testing.T) {
 	f := newTriageFixture(t, baseConf+"max-per-hour 2\n")
 	for i := 1; i <= 3; i++ {
-		f.stageEnvelope("ink", fmt.Sprintf("%d.mail", i), fmt.Sprintf("From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: s%d\n\nbody\n", i))
+		f.stageMessageData("ink", fmt.Sprintf("%d.mail", i), fmt.Sprintf("From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: s%d\n\nbody\n", i))
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	f.waitTag("ink", "1.mail")
 	f.waitTag("ink", "2.mail")
-	f.conduit.scan()
+	f.notifier.scan()
 	time.Sleep(200 * time.Millisecond)
 	if n := f.jev.count(); n != 2 {
 		t.Fatalf("P6: max-per-hour 2 made %d requests", n)
@@ -497,7 +497,7 @@ func TestTriageP6HourlyBudget(t *testing.T) {
 		t.Fatalf("P6: budget logged %d times, want 1:\n%s", n, f.logs.String())
 	}
 	f.clock.Advance(61 * time.Minute)
-	f.conduit.scan()
+	f.notifier.scan()
 	f.waitTag("ink", "3.mail")
 	if n := f.jev.count(); n != 3 {
 		t.Fatalf("P6: after an hour requests=%d want 3", n)
@@ -506,9 +506,9 @@ func TestTriageP6HourlyBudget(t *testing.T) {
 
 func TestTriageP7CacheFollowsLetters(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
-	a := f.stageEnvelope("ink", "1.kept", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: a\n\nbody\n")
-	b := f.stageEnvelope("ink", "2.gone", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: b\n\nbody\n")
-	f.conduit.scan()
+	a := f.stageMessageData("ink", "1.kept", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: a\n\nbody\n")
+	b := f.stageMessageData("ink", "2.gone", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: b\n\nbody\n")
+	f.notifier.scan()
 	f.waitTag("ink", "1.kept")
 	f.waitTag("ink", "2.gone")
 	cur := filepath.Join(f.home, "inbox", "ink", "cur")
@@ -521,7 +521,7 @@ func TestTriageP7CacheFollowsLetters(t *testing.T) {
 	if err := os.Remove(b); err != nil {
 		t.Fatal(err)
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	for _, ext := range []string{".json", ".tag"} {
 		if _, err := os.Stat(f.cachePath("ink", "1.kept", ext)); err != nil {
 			t.Fatalf("P7: cache %s for letter moved to cur was removed: %v", ext, err)
@@ -535,9 +535,9 @@ func TestTriageP7CacheFollowsLetters(t *testing.T) {
 func TestTriageP8FrameBoundAndPosition(t *testing.T) {
 	f := newTriageFixture(t, baseConf)
 	for i := 0; i < 12; i++ {
-		f.stageEnvelope("ink", fmt.Sprintf("%02d.mail", i), fmt.Sprintf("From: sender%02d-%s@alpha\nTo: ink@alpha\nType: message\nSubject: %s\n\nbody\n", i, strings.Repeat("x", 100), strings.Repeat("s", 300)))
+		f.stageMessageData("ink", fmt.Sprintf("%02d.mail", i), fmt.Sprintf("From: sender%02d-%s@alpha\nTo: ink@alpha\nType: message\nSubject: %s\n\nbody\n", i, strings.Repeat("x", 100), strings.Repeat("s", 300)))
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	f.waitTag("ink", "11.mail")
 	content := f.frameContent("ink")
 	if len(content) > 8192 {
@@ -579,12 +579,12 @@ func TestTriageP9UnsafeConfIsOffWithOneLogLine(t *testing.T) {
 			f := newTriageFixture(t, "")
 			setup(f)
 			f.engine.close()
-			f.engine = newTriageEngineAt(f.home, f.conduit.logger, f.clock.Now, func(time.Duration) {})
-			f.conduit.triage = f.engine
+			f.engine = newTriageEngineAt(f.home, f.notifier.logger, f.clock.Now, func(time.Duration) {})
+			f.notifier.triage = f.engine
 			t.Cleanup(f.engine.close)
-			f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
+			f.stageMessageData("ink", "1.mail", "From: alice@alpha\nTo: ink@alpha\nType: message\nSubject: x\n\nbody\n")
 			for i := 0; i < 3; i++ {
-				f.conduit.scan()
+				f.notifier.scan()
 				f.clock.Advance(61 * time.Second)
 			}
 			time.Sleep(200 * time.Millisecond)
@@ -600,7 +600,7 @@ func TestTriageP9UnsafeConfIsOffWithOneLogLine(t *testing.T) {
 			// Turning it on needs no restart: a fixed conf is picked up within a minute.
 			f.writeConf(baseConf)
 			f.clock.Advance(61 * time.Second)
-			f.conduit.scan()
+			f.notifier.scan()
 			f.waitTag("ink", "1.mail")
 			if n := countLines(f.logs.String(), "triage: enabled"); n != 1 {
 				t.Fatalf("P9 %s: enable not logged once:\n%s", name, f.logs.String())

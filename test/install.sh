@@ -9,6 +9,7 @@ RIG=$ROOT/.install-test-$$
 SHIM=$RIG/shim
 RELEASE=$RIG/release
 REAL_CURL=$(command -v curl)
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -83,7 +84,7 @@ run_install() {
 }
 
 mkdir -p "$RIG" "$SHIM" "$RELEASE" || fail setup 'could not create rig directories'
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 cat > "$SHIM/claude" <<'EOF'
 #!/bin/sh
@@ -218,7 +219,7 @@ printf '%s\n' \
 cmp -s "$RIG/settings.original" "$BOOT_SETTINGS_BACKUP" || fail 1 'settings.json backup bytes differ'
 grep -q '^Khala installation complete:$' "$RIG/bootstrap.out" || fail 1 'summary block is missing'
 grep -q 'put a session name in .khala-session' "$RIG/bootstrap.out" || fail 1 'session next step is missing'
-pass 1 'bootstrap writes exact config, installs mode-755 link, ensures node, sets accept, and summarizes'
+pass 1 'bootstrap writes exact config, installs mode-755 relay, ensures node, sets accept, and summarizes'
 
 # 2. Join install.
 JOIN_HOME=$RIG/join-home
@@ -230,9 +231,9 @@ printf '%s\n' 'self laptop' 'peer hub user@hub' 'mailbox hub' 'ttl 120' > "$RIG/
 cmp -s "$RIG/join.expected" "$JOIN_HOME/.khala/config" || fail 2 'join config bytes differ'
 grep -F $'ssh\t-o\tBatchMode=yes\t-o\tConnectTimeout=8\tuser@hub\ttrue' \
     "$JOIN_HOME/ssh.argv" >/dev/null || fail 2 'join reachability probe argv differ'
-pass 2 'join writes exact peer/mailbox config and probes the mailbox without blocking install'
+pass 2 'join writes exact peer/mailbox config and probes the upstream without blocking install'
 
-# 2b. Streamed join (sh -s < install.sh), the invite path: the mailbox probe must not
+# 2b. Streamed join (sh -s < install.sh), the invite path: the upstream probe must not
 # hand the script's stdin to ssh, or the rest of the installer is swallowed.
 STREAM_HOME=$RIG/stream-home
 make_home "$STREAM_HOME" || fail 2b 'could not create streamed-join HOME'
@@ -251,7 +252,7 @@ printf '%s\n' 'self laptop2' 'peer hub user@hub' 'mailbox hub' 'ttl 120' > "$RIG
 cmp -s "$RIG/stream.expected" "$STREAM_HOME/.khala/config" || fail 2b 'streamed join config bytes differ'
 grep -F $'ssh\t-o\tBatchMode=yes\t-o\tConnectTimeout=8\tuser@hub\ttrue' \
     "$STREAM_HOME/ssh.argv" >/dev/null || fail 2b 'streamed join skipped the reachability probe'
-pass 2b 'streamed join (sh -s) survives an stdin-draining mailbox probe and completes'
+pass 2b 'streamed join (sh -s) survives an stdin-draining upstream probe and completes'
 
 # 3. Idempotent rerun.
 BOOT_CONFIG_SUM=$(cksum "$BOOT_HOME/.khala/config")
@@ -262,9 +263,9 @@ run_install "$BOOT_HOME" --name hub --bootstrap > "$RIG/rerun.out" 2> "$RIG/reru
 [ "$(cksum "$BOOT_HOME/.khala/config")" = "$BOOT_CONFIG_SUM" ] || fail 3 'rerun changed config content'
 [ "$(file_mtime "$BOOT_HOME/.khala/config")" = "$BOOT_CONFIG_MTIME" ] || fail 3 'rerun changed config mtime'
 [ "$(line_count "$BOOT_HOME/curl.argv")" = "$BOOT_CURL_COUNT" ] || fail 3 'rerun downloaded khala-link again'
-grep -q 'already initialized' "$RIG/rerun.out" || fail 3 'rerun omitted initialized notice'
-grep -q 'config already matches' "$RIG/rerun.out" || fail 3 'rerun omitted matching config notice'
-grep -q 'khala-link already installed' "$RIG/rerun.out" || fail 3 'rerun omitted link notice'
+grep -q 'already initialized' "$RIG/rerun.out" || fail 3 'rerun omitted initialized alert'
+grep -q 'config already matches' "$RIG/rerun.out" || fail 3 'rerun omitted matching config alert'
+grep -q 'khala-link already installed' "$RIG/rerun.out" || fail 3 'rerun omitted relay alert'
 pass 3 'rerun is idempotent, leaves config bytes/mtime untouched, and does not refetch'
 
 run_install "$BOOT_HOME" --name hub --bootstrap --fix-path \
@@ -284,9 +285,9 @@ if run_install "$CONFLICT_HOME" --name hub --bootstrap \
     fail 4 'conflicting config unexpectedly succeeded'
 fi
 [ "$(cksum "$CONFLICT_HOME/.khala/config")" = "$CONFLICT_SUM" ] || fail 4 'conflicting config was modified'
-grep -q '^--- ~/.khala/config (existing)$' "$RIG/conflict.err" || fail 4 'conflict omitted diff-style notice'
+grep -q '^--- ~/.khala/config (existing)$' "$RIG/conflict.err" || fail 4 'conflict omitted diff-style alert'
 grep -q 'refusing to overwrite' "$RIG/conflict.err" || fail 4 'conflict omitted refusal reason'
-pass 4 'conflicting config fails with a diff-style notice and remains byte-identical'
+pass 4 'conflicting config fails with a diff-style alert and remains byte-identical'
 
 # 5. Claude Code preflight.
 MISSING_HOME=$RIG/missing-claude-home
@@ -380,7 +381,7 @@ printf '%s\n' 'self alpha' 'peer hub mini-t' 'mailbox hub' 'ttl 120' > "$INVITE_
 if HOME=$INVITE_HOME KHALA_HOME=$INVITE_KHALA_HOME PATH=$SHIM:/usr/bin:/bin \
     KHALA_TEST_SSH_LOG=$INVITE_HOME/ssh.argv KHALA_TEST_SSH_STDIN=$INVITE_HOME/ssh.stdin \
     "$KHALA" invite new@node --name gamma > "$RIG/invite-alias.out" 2> "$RIG/invite-alias.err"; then
-    fail 7 'non-portable mailbox alias unexpectedly succeeded'
+    fail 7 'non-portable upstream alias unexpectedly succeeded'
 fi
 [ ! -s "$INVITE_HOME/ssh.argv" ] || fail 7 'non-portable alias attempted SSH'
 grep -q -- '--mailbox-coord <user@host>' "$RIG/invite-alias.err" || \

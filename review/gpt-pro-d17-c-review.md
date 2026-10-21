@@ -8,16 +8,16 @@
 
 I verified that `dev` resolves to `2a3f44702f2030a1ad991132cfe60a09a29878b8` and reviewed the requested files at that commit.
 
-The overall shape—one source-owned per-node snapshot, local conduit as sole writer, generation-checked replacement, and an on-demand read-only dashboard—is sound. The r1 normative text is not ready to brief because it currently permits false “listening” claims, makes freshness transport-dependent, leaves the rsync path outside the generation guard, contradicts its own omission invariant when truncated, and reserves the wrong gateway identity while forbidding the recipient address B will need.
+The overall shape—one source-owned per-node snapshot, local notifier as sole writer, generation-checked replacement, and an on-demand read-only dashboard—is sound. The r1 normative text is not ready to brief because it currently permits false “listening” claims, makes freshness transport-dependent, leaves the rsync path outside the generation guard, contradicts its own omission invariant when truncated, and reserves the wrong gateway identity while forbidding the recipient address B will need.
 
 The minimum P0 set is:
 
-1. Define an ear row from the **owned lease and its exact registration**, using the full ring-time gate.
-2. Make truncated snapshots incomplete/unknown, not evidence of non-listening.
+1. Define an listener snapshot row from the **owned lease and its exact registration**, using the full notification-time gate.
+2. Make truncated snapshots incomplete/unknown, not evidence of unreachable.
 3. Add `written-at`, local `seen-at` normalization, and a clock-skew/progress rule.
 4. Put rsync `.ear` transmission and installation through the same validation and generation guard.
 5. Reject malformed incoming snapshots instead of replacing a valid one.
-6. Backport `.ear` tolerance to 0.8.2 or add a fleet-wide enable gate.
+6. Backport `.ear` tolerance to 0.8.2 or add a cluster-wide enable gate.
 7. Replace the empty shutdown snapshot with an explicit transitional state.
 8. Restrict 0.9.0 HTTP to loopback, or require transport encryption for non-loopback.
 9. Define principal classes and reserve `khala-gateway`; do not globally forbid addressing it.
@@ -31,14 +31,14 @@ The proposed 12-token line is **not sufficient or fully safe**. `truncated <n>` 
 
 1. **P0 — r1 §3.1 and §6, identity selection and `route`.**
 
-**Evidence:** Actual ringing begins from an owned lease and its `lease.InstanceID` registration in `link/conduit.go:336-414`. Before a doorbell, the code additionally requires matching lease epoch, PID, PID-start token, Claude session ID, and registration lease epoch at `link/conduit.go:829-833`. r1 defines `route != none` from registration verification and socket fields alone and does not define which registration wins when an identity has multiple registrations.
+**Evidence:** Actual sending inbox notifications begins from an owned lease and its `lease.InstanceID` registration in `link/conduit.go:336-414`. Before an inbox notification, the code additionally requires matching lease epoch, PID, PID-start token, Claude session ID, and registration lease epoch at `link/conduit.go:829-833`. r1 defines `route != none` from registration verification and socket fields alone and does not define which registration wins when an identity has multiple registrations.
 
-**Failure:** A verified non-owner registration can yield `route socket` while the owned lease refers to a different or stale registration. The snapshot says “listening”; `maybeRing` writes only a failed journal and no doorbell.
+**Failure:** A verified non-owner registration can yield `route socket` while the owned lease refers to a different or stale registration. The snapshot says “listening”; `maybeRing` writes only a failed journal and no inbox notification.
 
 **Smallest change:** For each identity, first resolve the current `state=owned` lease, then select exactly `registrations[lease.instanceId]`. Set `listening=yes` only if the complete `maybeRing` lease/registration gate passes. With no valid owned lease, set `route none`. Specify deterministic behavior for orphaned and multiple registrations.
 2. **P0 — r1 §3.1, route vocabulary.**
 
-**Evidence:** At ring time a non-empty channel socket is dynamically verified and attempted even when `ChannelVerified` is false; on success an unverified channel may be accompanied by a socket echo, and on failure the conduit falls back to the socket: `link/conduit.go:853-886`.
+**Evidence:** At notification time a non-empty channel socket is dynamically verified and attempted even when `ChannelVerified` is false; on success an unverified channel may be accompanied by a socket echo, and on failure the notifier falls back to the socket: `link/conduit.go:853-886`.
 
 **Failure:** The proposed `channel | socket | none` projection can disagree with actual `via=channel+socket` and fallback behavior.
 
@@ -50,16 +50,16 @@ The proposed 12-token line is **not sufficient or fully safe**. `truncated <n>` 
 **Smallest change:** Define exact maximum lengths and grammars for every value. Encode unconstrained strings such as version as bounded base64url/percent-encoding, or restrict them to a documented safe token grammar. Reject rows with missing, duplicate, or extra positional tokens.
 4. **P0 — r1 §3.1 and §6.2, truncation.**
 
-**Evidence:** There are seven fixed header lines. Under a total 64-line cap, reserving the final line for `truncated <n>` leaves at most **56 identity rows**, not 64. r1 simultaneously says that an absent identity means not listening.
+**Evidence:** There are seven fixed header lines. Under a total 64-line cap, reserving the final line for `truncated <n>` leaves at most **56 identity rows**, not 64. r1 simultaneously says that an absent identity means unreachable.
 
-**Failure:** On a node with 60 identities, four alphabetically later identities are absent and therefore falsely reported as not listening.
+**Failure:** On a node with 60 identities, four alphabetically later identities are absent and therefore falsely reported as unreachable.
 
 **Smallest change:** Define `complete yes|no` or make `truncated <n>` explicitly change absence semantics to **unknown**. Increase the limit to at least 256 identity rows and a corresponding byte cap, or remove the separate 64-line limit and retain a byte/record-count bound.
-5. **P0 — r1 §3.1, pending and drain telemetry.**
+5. **P0 — r1 §3.1, pending and inbox read telemetry.**
 
-**Evidence:** B6 required `last-drained-generation`, but the proposed row contains only the last-drain epoch. It also publishes only the first eight hex digits of the SHA-256 generation. The earlier requirement is explicit in `review/gpt-pro-d17-review.md:625-744`; current generation production is full SHA-256 at `link/conduit.go:744-758`.
+**Evidence:** B6 required `last-drained-generation`, but the proposed row contains only the last inbox-read epoch. It also publishes only the first eight hex digits of the SHA-256 generation. The earlier requirement is explicit in `review/gpt-pro-d17-review.md:625-744`; current generation production is full SHA-256 at `link/conduit.go:744-758`.
 
-**Failure:** A 32-bit generation tag can collide across long-lived generation churn, and an epoch alone cannot prove that the current pending generation was the one drained.
+**Failure:** A 32-bit generation tag can collide across long-lived generation churn, and an epoch alone cannot prove that the current pending generation was the one read.
 
 **Smallest change:** Carry the complete 64-hex generation and complete `last-drained-generation`, using `-` for absent values. Add a principal class and pending counts by future lane now; see Q10.
 6. **P0 — r1 §3.1/§3.2, missing `written-at`.**
@@ -71,12 +71,12 @@ The proposed 12-token line is **not sufficient or fully safe**. `truncated <n>` 
 
 **Evidence:** Native offers already bind bytes to SHA-256, and equal-generation conflict detection can compare the incoming bytes/digest with the existing file. An in-file digest is unauthenticated and would require a special canonicalization rule to avoid self-reference.
 
-**Smallest change:** Do not add a digest. Preserve/quarantine equal-generation conflicting bytes and log both transport digests. Ed25519 in B can sign canonical envelope bytes directly.
+**Smallest change:** Do not add a digest. Preserve/quarantine equal-generation conflicting bytes and log both transport digests. Ed25519 in B can sign canonical message header bytes directly.
 8. **P2 — r1 §3.1/§5.4, replicated `mailbox` and component version.**
 
 **Evidence:** The line exposes logical node aliases but not `peer` SSH coordinates. Prior C2 explicitly asked for component versions while forbidding raw config and SSH coordinates.
 
-**Conclusion:** I do not object under the declared all-user-owned-fleet threat model. `conduit <version>` is useful operational metadata. `mailbox <names...>` is mild topology disclosure.
+**Conclusion:** I do not object under the declared all-user-owned-cluster threat model. `conduit <version>` is useful operational metadata. `mailbox <names...>` is mild topology disclosure.
 
 **Smallest change:** None required. For stricter minimization, publish `role hub|spoke` or a sorted logical mailbox list rather than raw config ordering.
 
@@ -91,16 +91,16 @@ The code confirms both transport facts, but the resulting rule is **not sound** 
 **Evidence:** Native receive writes a new temporary inode and renames it, with no `Chtimes`, so destination mtime is receiver installation time: `link/install.go:146-187,223-250`. The fallback always invokes `rsync -a`, which preserves source mtime: `bin/khala:1803-1868`, especially `bin/khala:1857`. Presence is pulled directly at `bin/khala:2025-2030`.
 
 **Failure scenarios:**
-  - A conduit stopped at 10:00, leaving an old snapshot. At 12:00 the link reconnects and installs it through the native path. Its destination mtime becomes 12:00 and it appears fresh for another two intervals.
+  - A notifier stopped at 10:00, leaving an old snapshot. At 12:00 the relay reconnects and installs it through the native path. Its destination mtime becomes 12:00 and it appears fresh for another two intervals.
   - A source clock one hour ahead gives a stale snapshot a future mtime. Under the literal test `now - mtime <= 2*interval`, the negative age is fresh until the reader clock catches up.
   - A snapshot installed recently on a relay through the native path acquires a new mtime, which rsync then preserves to later readers.
 
   **Smallest change:** Normalize every accepted installation, including fallback rsync, through one installer that records a node-local `seen-at`. Add `written-at`. Either:
   - state a bounded clock-skew assumption and require both recent `seen-at` and plausible `written-at`; or
   - for clock-independent liveness, treat a first observation as `warming/unknown` and require observation of a strictly higher generation within the expected interval before declaring it fresh. Persist the two observations in node-local runtime state.
-2. **P1 — r1 §3.2, future timestamps and pruning.**
+2. **P1 — r1 §3.2, future timemarkers and pruning.**
 
-**Evidence:** r1 also proposes pruning `.ear` by inode mtime. On the rsync path, that timestamp may be a future source timestamp.
+**Evidence:** r1 also proposes pruning `.ear` by inode mtime. On the rsync path, that timemarker may be a future source timemarker.
 
 **Failure:** A future-dated stale snapshot can remain both “fresh” and retention-ineligible for an arbitrarily long local interval.
 
@@ -126,7 +126,7 @@ The proposed guard is bypassed by fallback rsync. It matters despite mtime-based
 **Smallest change:** Add the source-owned `.ear` to fallback push. Pull `.ear` files into a staging directory, validate them, run the same generation matrix as native receive, atomically install, and update local `seen-at`. Exclude `.ear` from the existing direct presence merge.
 2. **P1 — r1 §3.2, rsync quick-check.**
 
-**Evidence:** `rsync -a` normally decides transfer from size and mtime, not content. Mutable equal-size snapshots written close together can therefore be skipped on implementations/filesystems with insufficient timestamp resolution.
+**Evidence:** `rsync -a` normally decides transfer from size and mtime, not content. Mutable equal-size snapshots written close together can therefore be skipped on implementations/filesystems with insufficient timemarker resolution.
 
 **Smallest change:** Use `--checksum` for staged `.ear` transfers. The objects are tiny; this does not justify an in-file digest.
 3. **P0 — r1 §3.2, malformed incoming replacement.**
@@ -170,33 +170,33 @@ The hard-fail claim is half correct. `khala presence` always fails; `reconcile` 
 **Smallest change:** Change r1/factsheet wording to: “presence fails on every invocation; reconcile fails on each due presence-retention sweep—every pass only when `retention-interval 0`.”
 2. **P0 — r1 §7, order safety.**
 
-**Evidence:** An ear produced on one upgraded node replicates to every reachable old-CLI node. Checking only the writer node’s CLI version does not protect those remote nodes.
+**Evidence:** An listener snapshot produced on one upgraded node replicates to every reachable old-CLI node. Checking only the writer node’s CLI version does not protect those remote nodes.
 
 **Failure:** `conduit 0.9` observes local `khala 0.9` and writes the file; a remote 0.8.1 CLI receives it and loses `khala presence`, regardless of the writer’s local check.
 
-**Smallest change:** Add `.ear`-tolerant skip/prune handling to the in-flight 0.8.2 CLI, roll 0.8.2 to every node, and only then permit an ear producer. This is substantially safer than relying on a 0.9-only ordered rollout.
+**Smallest change:** Add `.ear`-tolerant skip/prune handling to the in-flight 0.8.2 CLI, roll 0.8.2 to every node, and only then permit an listener snapshot producer. This is substantially safer than relying on a 0.9-only ordered rollout.
 3. **P0 — r1 §7, producer enablement.**
 
-**Evidence:** During a rolling link-binary upgrade, old receivers also lack the proposed native generation guard, even though they already accept `.ear`.
+**Evidence:** During a rolling relay-binary upgrade, old receivers also lack the proposed native generation guard, even though they already accept `.ear`.
 
-**Smallest change:** Default ear production off behind a local config/capability switch. Enable it only after the fleet has both a tolerant CLI and guarded link/fallback installers. A per-node check of one local CLI executable is not sufficient; a fleet enable point is.
+**Smallest change:** Default listener snapshot production off behind a local config/capability switch. Enable it only after the cluster has both a tolerant CLI and guarded link/fallback installers. A per-node check of one local CLI executable is not sufficient; a cluster enable point is.
 4. **P1 — r1 §7, suggested local semver probe.**
 
-**Conclusion:** A conduit search for “the local CLI ≥0.9” is not worth the reverse-discovery/version-skew complexity. `khala-link` currently has no authoritative reverse mapping to the CLI selected by every hook or fallback path; CLI-to-link selection is one-way at `bin/khala:4202-4229`.
+**Conclusion:** A notifier search for “the local CLI ≥0.9” is not worth the reverse-discovery/version-skew complexity. `khala-link` currently has no authoritative reverse mapping to the CLI selected by every hook or fallback path; CLI-to-relay selection is one-way at `bin/khala:4202-4229`.
 
-**Smallest change:** Use the 0.8.2 compatibility backport plus explicit fleet enablement. Do not dynamically probe arbitrary local CLI paths.
+**Smallest change:** Use the 0.8.2 compatibility backport plus explicit cluster enablement. Do not dynamically probe arbitrary local CLI paths.
 
 ---
 
-## Q5. Drain stamp
+## Q5. Inbox-read marker
 
 `run/drained/<identity>` is an appropriate node-local primitive, but the proposed epoch-only semantic is insufficient for B6.
 
 1. **P0 — r1 §3.3 and §6.8, missing generation.**
 
-**Evidence:** The earlier B6 requirement includes `last-drained-generation`; r1 writes only `<epoch> <letters> <notices> <streams>`. Current drain supports selective and bounded modes: `bin/khala:4674-5017`.
+**Evidence:** The earlier B6 requirement includes `last-drained-generation`; r1 writes only `<epoch> <letters> <notices> <streams>`. Current inbox read supports selective and bounded modes: `bin/khala:4674-5017`.
 
-**Failure:** Pending ring generation `G` remains. `khala inbox --notices-only` consumes only an info notice and updates the epoch. A dashboard cannot tell that the recent drain did not touch `G`. A bounded partial drain has a similar ambiguity.
+**Failure:** Pending inbox notification generation `G` remains. `khala inbox --notices-only` consumes only an info alert and updates the epoch. A dashboard cannot tell that the recent inbox read did not touch `G`. A bounded partial inbox read has a similar ambiguity.
 
 **Smallest change:** Record at least:
 
@@ -206,23 +206,23 @@ drain 1 <at> <before-generation|-> <after-generation|-> \
 ```
 
 Publish the applicable full generation as `last-drained-generation` in the snapshot.
-2. **P1 — r1 §3.3, stamp consistency with the drain lock.**
+2. **P1 — r1 §3.3, marker consistency with the inbox read lock.**
 
-**Evidence:** The current drain holds `brain.lock.d` from `bin/khala:4816` through its mutations and releases it at approximately `5008`; the summary is printed afterward at `5014-5015`.
+**Evidence:** The current inbox read holds `brain.lock.d` from `bin/khala:4816` through its mutations and releases it at approximately `5008`; the summary is printed afterward at `5014-5015`.
 
-**Failure:** Implementing “immediately before the summary” literally places the stamp after lock release, allowing reconcile/new delivery to change the generation between drain completion and stamp creation.
+**Failure:** Implementing “immediately before the summary” literally places the marker after lock release, allowing reconcile/new delivery to change the generation between inbox read completion and marker creation.
 
-**Smallest change:** Compute the post-drain generation and atomically replace the stamp **before releasing** `brain.lock.d`, after all committed inbox/cursor mutations.
+**Smallest change:** Compute the post-read generation and atomically replace the marker **before releasing** `brain.lock.d`, after all committed inbox/cursor mutations.
 3. **P1 — r1 §3.3, partial failures.**
 
-**Evidence:** Current code can move letters successfully and later fail while preparing notices or advancing a stream cursor, returning nonzero after real mutations: `bin/khala:4838-5007`. r1 says no stamp on drain failure.
+**Evidence:** Current code can move messages successfully and later fail while preparing alerts or advancing a stream cursor, returning nonzero after real mutations: `bin/khala:4838-5007`. r1 says no marker on inbox read failure.
 
-**Failure:** Real consumption becomes invisible and B6 can falsely report that no drain occurred.
+**Failure:** Real consumption becomes invisible and B6 can falsely report that no inbox read occurred.
 
-**Smallest change:** If zero state changes committed, write no stamp. If any state change committed, write `status partial` with committed counts and before/after generation even when the command ultimately returns nonzero.
+**Smallest change:** If zero state changes committed, write no marker. If any state change committed, write `status partial` with committed counts and before/after generation even when the command ultimately returns nonzero.
 4. **P1 — r1 §3.3/§8, cheapest generation source.**
 
-**Evidence:** Bash has no current access to the conduit generation; it is calculated by Go’s `letterGeneration` at `link/conduit.go:744-758`. The doorbell carries it, but generic socket-initiated or manual drains do not receive the frame as an argument.
+**Evidence:** Bash has no current access to the notifier generation; it is calculated by Go’s `letterGeneration` at `link/conduit.go:744-758`. The inbox notification carries it, but generic socket-initiated or manual inbox reads do not receive the frame as an argument.
 
 **Smallest change:** Add a small read-only command such as:
 
@@ -230,10 +230,10 @@ Publish the applicable full generation as `last-drained-generation` in the snaps
 khala-link runtime pending-generation --identity <name>
 ```
 
-returning full generation and counts using the same `pending`/`letterGeneration` code. Invoke it before and after the drain while the brain lock is held. Do not duplicate SHA-256 generation semantics in Bash.
+returning full generation and counts using the same `pending`/`letterGeneration` code. Invoke it before and after the inbox read while the state lock is held. Do not duplicate SHA-256 generation semantics in Bash.
 5. **P1 — r1 §3.1/§3.3, “last drain” versus “last current-generation drain.”**
 
-**Evidence:** A drain epoch describes activity; it does not prove completion of the current generation.
+**Evidence:** An inbox read epoch describes activity; it does not prove completion of the current generation.
 
 **Smallest change:** Keep both `last-drain-at` and `last-drained-generation`. B6 clears/suppresses only from generation evidence or an empty pending set, not from a recent epoch alone.
 
@@ -254,17 +254,17 @@ The pending-field lag is acceptable for the proposed thresholds. The clean-shutd
 
 **Failure:** The empty snapshot may replicate while the replacement startup snapshot is delayed or lost, producing a fresh false “nobody listening” view during a routine restart.
 
-**Smallest change:** Add top-level `state running|stopping`. On clean shutdown write `state stopping` with no identities. Readers display/suppress it as transitional/unknown, not as authoritative non-listening. The next startup writes higher-generation `state running`.
+**Smallest change:** Add top-level `state running|stopping`. On clean shutdown write `state stopping` with no identities. Readers display/suppress it as transitional/unknown, not as authoritative unreachable. The next startup writes higher-generation `state running`.
 3. **P1 — r1 §3.1, startup ordering.**
 
-**Evidence:** Current conduit startup performs an initial scan in `conduit.run`; listener truth is populated from that scan. Writing “at start” before the initial verification/lease scan would emit another false empty snapshot.
+**Evidence:** Current notifier startup performs an initial scan in `conduit.run`; listener truth is populated from that scan. Writing “at start” before the initial verification/lease scan would emit another false empty snapshot.
 
 **Smallest change:** Define the startup write as occurring only after the first successful complete scan. If runtime loading fails, write no running snapshot.
 4. **P1 — r1 §3.1/§8, first-seen persistence.**
 
 **Evidence:** Current `conduitState` has no `firstSeen` field: `link/conduit.go:52-59`. It is deleted when nothing is pending and restored only from delivery journals: `link/conduit.go:397-399,926-983`. A registration’s `StartedAt` is session lifetime, not pending-generation first observation.
 
-**Failure:** A conduit restart can reset a 14-minute pending generation to age zero, or there may be no journal from which to restore it when no valid owner existed.
+**Failure:** A notifier restart can reset a 14-minute pending generation to age zero, or there may be no journal from which to restore it when no valid owner existed.
 
 **Smallest change:** Persist generation, generation-first-seen, successful-written-ring count, and last-written-ring in a bounded node-local sidecar. Do not derive pending first-seen from registration `StartedAt`.
 5. **P1 — r1 §3.1, written-ring count.**
@@ -274,9 +274,9 @@ The pending-field lag is acceptable for the proposed thresholds. The clean-shutd
 **Smallest change:** Count only journals with `status=written`, or persist a separate successful-write counter. Do not expose `attemptIndex` as written-ring count.
 6. **P1 — r1 §3.1, generation churn masking old pending work.**
 
-**Evidence:** Any newly arrived or partially drained ring letter changes the ID-set hash. A sole generation-first-seen field resets even if an older letter remains pending.
+**Evidence:** Any newly arrived or partially read inbox notification message changes the ID-set hash. A sole generation-first-seen field resets even if an older message remains pending.
 
-**Smallest change:** Add `oldest-ring-pending-at` independently of generation-first-seen, or persist per-letter recipient-local installed time. Keep generation-first-seen for once-per-generation notification deduplication.
+**Smallest change:** Add `oldest-ring-pending-at` independently of generation-first-seen, or persist per-message recipient-local installed time. Keep generation-first-seen for once-per-generation notification deduplication.
 
 ---
 
@@ -317,7 +317,7 @@ Good choices as written are: a mandatory high-entropy bearer, loopback default, 
 
 **Failure:** `id` alone does not identify `inbox/<recipient>/{new,cur}/<id>`. Searching and returning the first duplicate is nondeterministic.
 
-**Smallest change:** Either pass a separately validated `identity` plus `id`, or issue an opaque server-side letter key from `/api/fleet`. Search only trusted local identity directories, reject ambiguous duplicates, cap ID length to a filesystem-safe limit, and verify the opened file’s `Id:` equals its basename.
+**Smallest change:** Either pass a separately validated `identity` plus `id`, or issue an opaque server-side message key from `/api/fleet`. Search only trusted local identity directories, reject ambiguous duplicates, cap ID length to a filesystem-safe limit, and verify the opened file’s `Id:` equals its basename.
 7. **P1 — r1 §5.2/§5.5, DOM rendering.**
 
 **Evidence:** Subjects, bodies, focus, stance, sender text, and version strings are file-derived. The CSP does not prevent DOM XSS caused by assigning those strings to `innerHTML`. `sanitizePreview` is unsuitable as a general browser boundary because it pre-escapes `&<>` and will display double-escaped when safely rendered through `textContent`.
@@ -338,7 +338,7 @@ Also send `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
 
 **Evidence:** `runtimeRoot()` creates and chmods the runtime root and subdirectories: `link/runtime.go:122-192`. The dashboard needs runtime data but claims the observer writes nothing. Calling that helper is therefore a write even when no `$KHALA_HOME` file is created.
 
-**Smallest change:** Add a read-only runtime-root resolver that performs no creation or chmod. Dispatch `dashboard` before normal link logger/singleton setup in `link/main.go:34-42`; use stderr-only logging and no existing helper that creates state.
+**Smallest change:** Add a read-only runtime-root resolver that performs no creation or chmod. Dispatch `dashboard` before normal relay logger/singleton setup in `link/main.go:34-42`; use stderr-only logging and no existing helper that creates state.
 10. **P2 — r1 §5.1/§5.5, HTTP resource limits.**
 
 **Smallest change:** Set `ReadHeaderTimeout`, `ReadTimeout`, `IdleTimeout`, `MaxHeaderBytes`, bounded response sizes, and a modest concurrency limit. Return `405` with `Allow: GET, HEAD` for all unsupported methods. Apply `no-store` to static, API, and error responses.
@@ -359,8 +359,8 @@ The listed sites do not cover every acquisition path, and refusing reserved name
 **Evidence:**
   - CLI identity resolution covers explicit `--as`, `KHALA_SESSION`, and one-line `.khala-session`: `bin/khala:283-315`.
   - `cmd_bind` uses that resolver, but Go `runtime register/bind` independently accepts any `validNode` identity: `link/runtime.go:697-830`.
-  - Watcher declaration and `notify --as` call `valid_name` directly: `bin/khala:3245-3376,3800-3910`.
-  - `cmd_retire` can create a heartbeat and mind tombstone for any syntactically valid name: `bin/khala:4033-4084`.
+  - Watchdog declaration and `notify --as` call `valid_name` directly: `bin/khala:3245-3376,3800-3910`.
+  - `cmd_retire` can create a heartbeat and session status tombstone for any syntactically valid name: `bin/khala:4033-4084`.
   - Hooks and the channel server have independent regex validators: `plugin/hooks/lib.sh:5-8`, `plugin/channel/server.ts:10-30`.
 
   **Smallest change:** Introduce `valid_session_identity`, `valid_watcher_identity`, and an explicit principal-class policy in both shell and Go. Keep `valid_name` unchanged for node/stream/general syntax. Make Go runtime registration the final enforcement point.
@@ -368,21 +368,21 @@ The listed sites do not cover every acquisition path, and refusing reserved name
 
 **Evidence:** B’s agreed address is `khala-gateway@<gateway-node>` and session replies must be sent to it. The prior text states this explicitly in `review/gpt-pro-d17-review.md` §3 B2.
 
-**Failure:** If `khala send` rejects every reserved recipient name, B must relax the rule fleet-wide before any session can reply to the gateway.
+**Failure:** If `khala send` rejects every reserved recipient name, B must relax the rule cluster-wide before any session can reply to the gateway.
 
 **Smallest change:** “Reserved” must mean **not claimable by an ordinary session/watcher**, not globally invalid as `To:`. Define per-principal addressability:
   - `conduit`: metadata owner only, neither session-bindable nor generally addressable;
   - `khala-gateway`: gateway-bindable and addressable, never session/watcher-bindable;
   - `khala`: infrastructure sender only;
-  - `operator`: envelope type, not necessarily an identity.
+  - `operator`: message headers type, not necessarily an identity.
 3. **P0 — r1 §3.4, missing final gateway name.**
 
 **Evidence:** r1 reserves `gateway`; B specifies `khala-gateway`. Current `valid_name` accepts both.
 
 **Smallest change:** Reserve `khala-gateway` now. Retaining the bare `gateway` reservation is harmless but does not satisfy B. Also reserve `khala`, which current bounce generation uses as an infrastructure sender at `bin/khala:2263-2305`.
-4. **P1 — r1 §3.4, watcher owner.**
+4. **P1 — r1 §3.4, watchdog owner.**
 
-**Evidence:** `watcher declare --owner` accepts either a bare name or an address and does not apply a principal-class rule: `bin/khala:3830-3855`. A future gateway may legitimately own a watcher even though an ordinary session may not claim the gateway identity.
+**Evidence:** `watcher declare --owner` accepts either a bare name or an address and does not apply a principal-class rule: `bin/khala:3830-3855`. A future gateway may legitimately own a watchdog even though an ordinary session may not claim the gateway identity.
 
 **Smallest change:** Validate the owner as a reference to an allowed principal class, not with a blanket reserved-name rejection.
 5. **P1 — r1 §3.4, runtime `kind`.**
@@ -399,7 +399,7 @@ The listed sites do not cover every acquisition path, and refusing reserved name
 **Smallest change:** Update duplicate validators for early diagnostics, and make register-channel reject attachment to a principal that is not a session. The authoritative refusal remains in runtime registration.
 7. **P1 — r1 §3.4, cleanup paths.**
 
-**Evidence:** `runtime release` and watcher retirement remove or retire existing ownership and should remain capable of cleaning up legacy reserved identities: `link/runtime.go:1027-1125`; `bin/khala:3880-3910`.
+**Evidence:** `runtime release` and watchdog retirement remove or retire existing ownership and should remain capable of cleaning up legacy reserved identities: `link/runtime.go:1027-1125`; `bin/khala:3880-3910`.
 
 **Smallest change:** Apply reserved-name refusal to **creation/acquisition**, not release/retire cleanup. Add migration diagnostics for existing collisions.
 
@@ -409,7 +409,7 @@ The listed sites do not cover every acquisition path, and refusing reserved name
 
 There is no semantic conflict with the stated 0.8.2 changes if C starts after that merge. The current pinned commit still contains the five-line/one-second implementation, so this judgment is against the stated in-flight delta.
 
-1. **P1 — r1 §5.3/§9.4, parse both watcher formats.**
+1. **P1 — r1 §5.3/§9.4, parse both watchdog formats.**
 
 **Evidence:** Current `read_watcher_marker` requires exactly five newline-terminated lines and rejects a sixth: `bin/khala:383-435`. Old five-line markers can remain replicated after a 0.8.2 rollout because unchanged files are not rewritten and deletion is not propagated.
 
@@ -427,10 +427,10 @@ There is no semantic conflict with the stated 0.8.2 changes if C starts after th
 
 **Evidence:** Current `acquire_lock` sleeps one second at `bin/khala:493-557`; the proposed 0.8.2 change only adjusts retry sleep for non-reconcile callers.
 
-**Conclusion:** No C semantic conflict. Writing the drain stamp while the same brain lock remains held is compatible with the 0.25-second retry.
+**Conclusion:** No C semantic conflict. Writing the inbox-read marker while the same state lock remains held is compatible with the 0.25-second retry.
 
-**Smallest change:** Preserve the 0.8.2 implementation during the serialized merge and add a drain-stamp contention test.
-4. **P2 — r1 §3.2, watcher install guard.**
+**Smallest change:** Preserve the 0.8.2 implementation during the serialized merge and add a inbox-read marker contention test.
+4. **P2 — r1 §3.2, watchdog install guard.**
 
 **Evidence:** The Go `.watcher` generation guard reads only the first line through `watcherEpoch`: `link/install.go:516-534`. Adding line 6 does not alter its epoch comparison.
 
@@ -475,7 +475,7 @@ Repeated `component` records are preferable to a singular `conduit` field; B can
 
 **Evidence:** B6’s 15-minute threshold applies to authenticated operator/urgent input, while ordinary mail uses 60 minutes and info has no alert. The current `ring-count` cannot distinguish those classes.
 
-**Smallest change:** Publish separate counts for authenticated operator, urgent notice, ordinary ring mail, and info. Unsigned/invalid claimed operator input belongs in ordinary/untrusted, not authenticated operator.
+**Smallest change:** Publish separate counts for authenticated operator, urgent alert, ordinary inbox notification mail, and info. Unsigned/invalid claimed operator input belongs in ordinary/untrusted, not authenticated operator.
 4. **P1 — r1 §5.4, version the HTTP API now.**
 
 **Smallest change:** Use `/api/v1/fleet` and `/api/v1/letter`, or include a mandatory top-level `apiVersion: 1`. Define clients to ignore unknown JSON fields. Reserve `/api/v1/gateway` or a nullable top-level `gateway` object.
@@ -484,11 +484,11 @@ Repeated `component` records are preferable to a singular `conduit` field; B can
 **Smallest change:** Add nullable/empty fields now:
   - node: `components`, `capabilities`, `gateway`;
   - identity: `principalType`, `pendingByClass`, `oldestPendingAt`;
-  - letter: `type`, `authStatus`, `keyId`, `actor`, `origin`, `conversation`;
+  - message: `type`, `authStatus`, `keyId`, `actor`, `origin`, `conversation`;
   - gateway: inbound/outbound durable queue depth, last update offset, last API success, last 429, topic-map health.
 
   Keep raw `Origin-Ref`, Telegram IDs, signatures, and content behind the appropriate text/sensitive gate.
-6. **P1 — r1 §3.4/§8, reserve the envelope and delivery behavior.**
+6. **P1 — r1 §3.4/§8, reserve the message headers and delivery behavior.**
 
 **Evidence:** Current destination dispatch consumes only `message`, `notice|bounce`, and `ack`: `bin/khala:2244-2366`. `validate_spool_file` only checks filename/`Id`: `bin/khala:2090-2110`. A `Type: operator` object therefore remains indefinitely in `spool/for/<self>` and never reaches an inbox.
 
@@ -527,7 +527,7 @@ I agree with the on-demand decision.
 
 **Smallest change:** No service unit. Keep the 0.9 command on-demand and loopback-only. Structure its handler/read model for direct embedding by the 0.10 gateway.
 
-The conduit remains resident and produces the snapshots; the dashboard itself need not be resident merely to read them.
+The notifier remains resident and produces the snapshots; the dashboard itself need not be resident merely to read them.
 
 ---
 
@@ -554,9 +554,9 @@ The conduit remains resident and produces the snapshots; the dashboard itself ne
 **Evidence:** A remote internal epoch is itself clock-skewed. Native destination mtime is receiver installation time, while rsync preserves source mtime: `link/install.go:146-187,244-250`; `bin/khala:1803-1868`.
 
 **Correct claim:** Use a receiver-local validated `seen-at`; use writer `written-at` for same-writer duration calculations/diagnostics; use generation progress or an explicit bounded-skew assumption for liveness.
-4. **P0 — factsheet §4, watcher guard “end to end.”**
+4. **P0 — factsheet §4, watchdog guard “end to end.”**
 
-**Incorrect claim:** The watcher regression test proves the guard end-to-end.
+**Incorrect claim:** The watchdog regression test proves the guard end-to-end.
 
 **Evidence:** `link/install_test.go:411-449` invokes `installer.receive` directly. Fallback rsync at `bin/khala:1803-1868,2018-2030` bypasses the installer entirely.
 
@@ -584,13 +584,13 @@ The conduit remains resident and produces the snapshots; the dashboard itself ne
 **Correct claim:** Six files, 61 listed tests.
 8. **P2 — factsheet §12, `sanitizePreview` recommendation.**
 
-**Incorrect guidance:** It calls the doorbell’s pre-HTML-escaped `sanitizePreview` the natural helper for browser output.
+**Incorrect guidance:** It calls the inbox notification’s pre-HTML-escaped `sanitizePreview` the natural helper for browser output.
 
 **Evidence:** The helper replaces `&`, `<`, and `>` with entities at `link/conduit.go:725-742`. Safely rendering that JSON through `textContent` displays the entities literally; rendering it through `innerHTML` invites a fragile, context-dependent security boundary.
 
 **Correct guidance:** Preserve bounded plain text in the API and rely on JSON encoding plus `textContent`.
 
-I found no substantive error in the factsheet’s claims that `.ear` is accepted by the current link, that native installation uses replacement semantics, that rsync preserves mtime, that deletion is not propagated, or that no current drain-generation record exists.
+I found no substantive error in the factsheet’s claims that `.ear` is accepted by the current relay, that native installation uses replacement semantics, that rsync preserves mtime, that deletion is not propagated, or that no current inbox-read queue-digest record exists.
 
 ---
 
@@ -622,29 +622,29 @@ I found no substantive error in the factsheet’s claims that `.ear` is accepted
 **Smallest change:** Persist the writer’s last emitted generation in node-local runtime state and take the maximum of that state and any valid owned snapshot. Do not use a remote-replaceable presence file as the sole generation authority.
 4. **P1 — r1 §3.1, produce one coherent scan result.**
 
-**Evidence:** Registration verification, lease reclaim/reaping, pending enumeration, and ring state are updated across a conduit scan: `link/conduit.go:336-414`. Independently rereading each source while writing the snapshot can combine a new lease with old registration/pending data.
+**Evidence:** Registration verification, lease reclaim/reaping, pending enumeration, and inbox notification state are updated across a notifier scan: `link/conduit.go:336-414`. Independently rereading each source while writing the snapshot can combine a new lease with old registration/pending data.
 
 **Smallest change:** Have one completed scan build an immutable snapshot model and hand that model to the debounced writer. Do not assemble rows through an unrelated second set of filesystem reads.
 5. **P1 — r1 §5.3, absent snapshot is not offline.**
 
-**Evidence:** During rollout, an alive 0.8.x conduit produces no `.ear`. Truncation and invalid files also make an identity/node absent for reasons other than being offline.
+**Evidence:** During rollout, an alive 0.8.x notifier produces no `.ear`. Truncation and invalid files also make an identity/node absent for reasons other than being offline.
 
 **Smallest change:** Dashboard node state must distinguish `fresh`, `stopping`, `stale`, `invalid`, `warming`, `legacy/absent`, and `truncated`. Never label absent/legacy as offline or “nobody listening.”
 6. **P1 — r1 §3.1/§8, unbounded delivery-journal scanning.**
 
 **Evidence:** Nothing currently deletes `deliveries/<identity>/<instance>/*.json`; both `restoreState` and status scan journal directories: `link/conduit.go:926-983`, `link/runtime.go:1199-1225`.
 
-**Failure:** Reconstructing written counts/last rings from every historical journal on each minute snapshot becomes unbounded.
+**Failure:** Reconstructing written counts/last inbox notifications from every historical journal on each minute snapshot becomes unbounded.
 
 **Smallest change:** Persist compact per-generation counters/state and add a bounded journal-retention policy. The dashboard should read only current compact state or a bounded latest subset.
-7. **P1 — r1 §5.3/§5.5, message and mind size bounds.**
+7. **P1 — r1 §5.3/§5.5, message and session status size bounds.**
 
 **Evidence:** `messageIDPattern` and several file-derived strings have no API-specific length bounds. Dashboard text mode may read full bodies.
 
-**Smallest change:** Set explicit per-endpoint limits for IDs, headers, mind values, individual bodies, aggregate responses, and number of listed rows. Return a truncation marker rather than allocating unbounded data.
+**Smallest change:** Set explicit per-endpoint limits for IDs, headers, session status values, individual bodies, aggregate responses, and number of listed rows. Return a truncation marker rather than allocating unbounded data.
 8. **P2 — r1 §3.1, component version semantics.**
 
-**Evidence:** Current `implVersion` is `"0.5.0"` at `link/main.go:22`, while the Khala release is 0.8.1. r1 proposes a separate `linkVersion`, but does not define whether this means release version, protocol implementation version, or ear schema version.
+**Evidence:** Current `implVersion` is `"0.5.0"` at `link/main.go:22`, while the Khala release is 0.8.1. r1 proposes a separate `linkVersion`, but does not define whether this means release version, protocol implementation version, or listener snapshot schema version.
 
 **Smallest change:** Publish them separately, for example `component conduit release=0.9.0 adapter=1 ears=1`, and add a release-build test that the advertised release version is injected correctly.
 9. **P2 — r1 §3.1, deterministic mailbox output.**

@@ -30,19 +30,19 @@ func dashboardFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	now := time.Now().Unix()
-	ear := validEarsFixture("alpha", now)
-	ear = strings.Replace(ear, "written-at 1788402001", fmt.Sprintf("written-at %d", now), 1)
+	snapshotRow := validListenerSnapshotFixture("alpha", now)
+	snapshotRow = strings.Replace(snapshotRow, "written-at 1788402001", fmt.Sprintf("written-at %d", now), 1)
 	files := map[string][]byte{
 		"presence/ink@alpha":                         []byte(fmt.Sprintf("%d\n", now)),
 		"presence/old@beta":                          []byte(fmt.Sprintf("%d\n", now)),
 		"presence/guard@alpha.watcher":               []byte("1700000000\n60\nink@alpha\n1700000010\nactive\n1700000000\n"),
 		"presence/legacy@alpha.watcher":              []byte("1700000000\n60\nink@alpha\n1700000010\nactive\n"),
-		"presence/conduit@alpha.ear":                 []byte(ear),
+		"presence/conduit@alpha.ear":                 []byte(snapshotRow),
 		"presence/conduit@gamma.ear":                 []byte("broken\n"),
-		"minds/alpha/ink/1700000000.1":               []byte(mindFixture("ink", "alpha")),
-		"streams/ops/alpha/1700000000.1.1.ink@alpha": letterFixtureBytes("1700000000.1.1.ink@alpha", "ink@alpha", "entry", "</script> stream", "<img onerror=stream>\n"),
+		"minds/alpha/ink/1700000000.1":               []byte(statusFixture("ink", "alpha")),
+		"streams/ops/alpha/1700000000.1.1.ink@alpha": messageFixtureBytes("1700000000.1.1.ink@alpha", "ink@alpha", "entry", "</script> stream", "<img onerror=stream>\n"),
 		"join/ink/ops":                               []byte("joined 0\n"),
-		"inbox/ink/new/1700000001.1.1.sender@alpha":  letterFixtureBytes("1700000001.1.1.sender@alpha", "sender@alpha", "message", "</script> letter", "<img onerror=letter>\n\xff"),
+		"inbox/ink/new/1700000001.1.1.sender@alpha":  messageFixtureBytes("1700000001.1.1.sender@alpha", "sender@alpha", "message", "</script> letter", "<img onerror=letter>\n\xff"),
 	}
 	for name, data := range files {
 		if err := os.WriteFile(filepath.Join(home, name), data, 0600); err != nil {
@@ -52,13 +52,13 @@ func dashboardFixture(t *testing.T) string {
 	return home
 }
 
-func mindFixture(identity, node string) string {
+func statusFixture(identity, node string) string {
 	return "Generation: 1700000000.1\nSession: " + identity + "\nNode: " + node + "\nState: active\n" +
 		"Model: opus\nEffort: high\nRole: builder\nCharge: implementation\nFocus: </script> focus\nStance: \"stance\" ‮\n" +
 		"Declared-State: 1700000000\nDeclared-Model: 1700000000\nDeclared-Effort: 1700000000\nDeclared-Role: 1700000000\nDeclared-Charge: 1700000000\nDeclared-Focus: 1700000000\nDeclared-Stance: 1700000000\n\n"
 }
 
-func letterFixtureBytes(id, from, typ, subject, body string) []byte {
+func messageFixtureBytes(id, from, typ, subject, body string) []byte {
 	return []byte("Khala: 0.1\nId: " + id + "\nFrom: " + from + "\nTo: ink@alpha\nDate: 2026-09-03T00:00:00Z\nType: " + typ + "\nSubject: " + subject + "\n\n" + body)
 }
 
@@ -159,12 +159,12 @@ func TestDashboardFleetR3SchemaFreshnessPendingStateAndNoText(t *testing.T) {
 	if res.Code != http.StatusOK {
 		t.Fatalf("fleet status=%d body=%s", res.Code, res.Body.String())
 	}
-	var fleet map[string]any
-	if err := json.Unmarshal(res.Body.Bytes(), &fleet); err != nil {
+	var cluster map[string]any
+	if err := json.Unmarshal(res.Body.Bytes(), &cluster); err != nil {
 		t.Fatalf("fleet JSON: %v\n%s", err, res.Body.String())
 	}
-	if fleet["apiVersion"] != float64(1) {
-		t.Fatalf("apiVersion=%v", fleet["apiVersion"])
+	if cluster["apiVersion"] != float64(1) {
+		t.Fatalf("apiVersion=%v", cluster["apiVersion"])
 	}
 	lower := strings.ToLower(res.Body.String())
 	for _, forbidden := range []string{"\"subject\"", "\"body\"", "\"focus\"", "\"stance\"", "peer-sentinel", "onerror=letter"} {
@@ -172,7 +172,7 @@ func TestDashboardFleetR3SchemaFreshnessPendingStateAndNoText(t *testing.T) {
 			t.Errorf("--no-text response contains %q", forbidden)
 		}
 	}
-	nodes := fleet["nodes"].([]any)
+	nodes := cluster["nodes"].([]any)
 	states := make(map[string]string)
 	for _, raw := range nodes {
 		node := raw.(map[string]any)
@@ -185,7 +185,7 @@ func TestDashboardFleetR3SchemaFreshnessPendingStateAndNoText(t *testing.T) {
 	if states["alpha"] != "fresh" || states["beta"] != "absent" || states["gamma"] != "invalid" {
 		t.Fatalf("node states=%v", states)
 	}
-	sessions := fleet["sessions"].([]any)
+	sessions := cluster["sessions"].([]any)
 	if len(sessions) != 2 {
 		t.Fatalf("sessions=%v", sessions)
 	}
@@ -193,12 +193,12 @@ func TestDashboardFleetR3SchemaFreshnessPendingStateAndNoText(t *testing.T) {
 	if ink["address"] != "ink@alpha" || ink["principalType"] != "session" || ink["pendingState"] != "seen-but-left" {
 		t.Fatalf("ink session=%v", ink)
 	}
-	watchers := fleet["watchers"].([]any)
+	watchdogs := cluster["watchers"].([]any)
 	var legacy map[string]any
-	for _, raw := range watchers {
-		watcher := raw.(map[string]any)
-		if watcher["name"] == "legacy" {
-			legacy = watcher
+	for _, raw := range watchdogs {
+		watchdog := raw.(map[string]any)
+		if watchdog["name"] == "legacy" {
+			legacy = watchdog
 		}
 	}
 	if legacy == nil || legacy["since"] != nil {
@@ -212,29 +212,29 @@ func TestDashboardFleetR3SchemaFreshnessPendingStateAndNoText(t *testing.T) {
 func TestDashboardFreshnessClampsIntervalAndPendingStateOrder(t *testing.T) {
 	home := dashboardFixture(t)
 	now := time.Now().Unix()
-	stale := strings.Replace(validEarsFixture("delta", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now-1300), 1)
+	stale := strings.Replace(validListenerSnapshotFixture("delta", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now-1300), 1)
 	stale = strings.Replace(stale, "interval 60", "interval 86400", 1)
-	ahead := strings.Replace(validEarsFixture("epsilon", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now+61), 1)
-	stopping := strings.Replace(validEarsFixture("zeta", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now), 1)
+	ahead := strings.Replace(validListenerSnapshotFixture("epsilon", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now+61), 1)
+	stopping := strings.Replace(validListenerSnapshotFixture("zeta", 1), "written-at 1788402001", fmt.Sprintf("written-at %d", now), 1)
 	stopping = strings.Replace(stopping, "state running", "state stopping", 1)
 	for node, data := range map[string]string{"delta": stale, "epsilon": ahead, "zeta": stopping} {
 		if err := os.WriteFile(filepath.Join(home, "presence", "conduit@"+node+".ear"), []byte(data), 0600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	server := &dashboardServer{home: home, warned: make(map[string]bool), generations: make(map[string]int64)}
-	ears := server.readEarSnapshots(time.Unix(now, 0))
-	if ears["delta"].state != "stale" || ears["epsilon"].state != "stale" || ears["epsilon"].skew != 61 || ears["zeta"].state != "stopping" {
-		t.Fatalf("freshness=%+v", ears)
+	server := &dashboardServer{home: home, warned: make(map[string]bool), snapshotSequences: make(map[string]int64)}
+	snapshotSet := server.readListenerSnapshots(time.Unix(now, 0))
+	if snapshotSet["delta"].state != "stale" || snapshotSet["epsilon"].state != "stale" || snapshotSet["epsilon"].skew != 61 || snapshotSet["zeta"].state != "stopping" {
+		t.Fatalf("freshness=%+v", snapshotSet)
 	}
 	for _, test := range []struct {
-		identity earsIdentity
+		identity listenerIdentity
 		want     string
 	}{
-		{earsIdentity{}, "empty"},
-		{earsIdentity{PendingRing: 1, Generation: testGeneration, LastDrainBefore: testGeneration, LastDrainAfter: testGeneration}, "seen-but-left"},
-		{earsIdentity{PendingRing: 1, Generation: testGeneration, LastDrainBefore: "-", LastDrainAfter: testGeneration}, "no-new-since-drain"},
-		{earsIdentity{PendingRing: 1, Generation: testGeneration, LastDrainBefore: "-", LastDrainAfter: "-"}, "new-since-drain"},
+		{listenerIdentity{}, "empty"},
+		{listenerIdentity{PendingRing: 1, Generation: testQueueDigest, LastDrainBefore: testQueueDigest, LastDrainAfter: testQueueDigest}, "seen-but-left"},
+		{listenerIdentity{PendingRing: 1, Generation: testQueueDigest, LastDrainBefore: "-", LastDrainAfter: testQueueDigest}, "no-new-since-drain"},
+		{listenerIdentity{PendingRing: 1, Generation: testQueueDigest, LastDrainBefore: "-", LastDrainAfter: "-"}, "new-since-drain"},
 	} {
 		if got := pendingState(test.identity); got != test.want {
 			t.Errorf("pendingState(%+v)=%q want=%q", test.identity, got, test.want)
@@ -252,15 +252,15 @@ func TestDashboardTextPreservesDataAndValidatesLetterIdentityAndID(t *testing.T)
 	if res.Code != http.StatusOK {
 		t.Fatalf("fleet status=%d body=%s", res.Code, res.Body.String())
 	}
-	var fleet dashboardFleet
-	if err := json.Unmarshal(res.Body.Bytes(), &fleet); err != nil {
+	var cluster dashboardCluster
+	if err := json.Unmarshal(res.Body.Bytes(), &cluster); err != nil {
 		t.Fatal(err)
 	}
-	if len(fleet.Sessions) == 0 || fleet.Sessions[0].Focus != "</script> focus" || fleet.Sessions[0].Stance != "\"stance\" ‮" {
-		t.Errorf("mind strings changed: %+v", fleet.Sessions)
+	if len(cluster.Sessions) == 0 || cluster.Sessions[0].Focus != "</script> focus" || cluster.Sessions[0].Stance != "\"stance\" ‮" {
+		t.Errorf("mind strings changed: %+v", cluster.Sessions)
 	}
-	if len(fleet.Streams) == 0 || len(fleet.Streams[0].Recent) == 0 || fleet.Streams[0].Recent[0].Body != "<img onerror=stream>\n" {
-		t.Errorf("stream string changed: %+v", fleet.Streams)
+	if len(cluster.Streams) == 0 || len(cluster.Streams[0].Recent) == 0 || cluster.Streams[0].Recent[0].Body != "<img onerror=stream>\n" {
+		t.Errorf("stream string changed: %+v", cluster.Streams)
 	}
 	id := "1700000001.1.1.sender@alpha"
 	for _, target := range []string{
@@ -278,7 +278,7 @@ func TestDashboardTextPreservesDataAndValidatesLetterIdentityAndID(t *testing.T)
 		t.Fatalf("letter status=%d body=%q", valid.Code, valid.Body.String())
 	}
 	path := filepath.Join(home, "inbox", "ink", "new", id)
-	if err := os.WriteFile(path, letterFixtureBytes("1700000099.1.1.sender@alpha", "sender@alpha", "message", "wrong", "wrong"), 0600); err != nil {
+	if err := os.WriteFile(path, messageFixtureBytes("1700000099.1.1.sender@alpha", "sender@alpha", "message", "wrong", "wrong"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	if got := dashboardRequest(t, handler, http.MethodGet, "/api/v1/letter?identity=ink&id="+id, "token"); got.Code != http.StatusNotFound {

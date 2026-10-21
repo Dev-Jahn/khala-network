@@ -3,13 +3,14 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
-GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO=${GO_BINARY-$(command -v go)}
 GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
 RIG=$ROOT/.link-test.$$
 BIN=$RIG/khala-link
 PIDS=
 LAST_PID=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_pid in $PIDS; do
@@ -124,10 +125,10 @@ dial_watched_count() {
 }
 
 mkdir -p -- "$RIG" "$GO_TMP" "$GO_CACHE"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 if [ ! -x "$GO" ]; then
-    fail 0 "Go toolchain missing at $GO"
+    fail 0 "Go toolchain missing${GO:+ at $GO}; set GO_BINARY or put go on PATH"
 fi
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
@@ -151,7 +152,7 @@ for init_pair in "alpha:$A" "beta:$B" "b200:$HUB" "gamma:$C" "delta:$D" "sigma:$
         >"$RIG/init-$init_node.out" 2>"$RIG/init-$init_node.err" || fail 0 "init $init_node failed"
 done
 KHALA_HOME="$STALLED_HUB" "$KHALA" init b200 \
-    >"$RIG/init-stalled-hub.out" 2>"$RIG/init-stalled-hub.err" || fail 0 "init stalled hub failed"
+    >"$RIG/init-stalled-hub.out" 2>"$RIG/init-stalled-hub.err" || fail 0 "init stalled upstream failed"
 write_config "$A" alpha "$HUB"
 write_config "$B" beta "$HUB"
 write_config "$C" gamma "$HUB"
@@ -161,13 +162,13 @@ write_config "$W" omega "$RIG/unreachable-mailbox"
 
 start_local_link "$HUB"
 HUB_PID=$LAST_PID
-wait_file "$HUB/run/link.status" 5 || fail 0 "hub reconcile singleton did not start"
+wait_file "$HUB/run/link.status" 5 || fail 0 "upstream reconcile singleton did not start"
 start_link "$A" alpha
 A_PID=$LAST_PID
 start_link "$B" beta
 B_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 0 "alpha link did not handshake"
-wait_file "$B/run/link.fresh" 5 || fail 0 "beta link did not handshake"
+wait_file "$A/run/link.fresh" 5 || fail 0 "alpha relay did not handshake"
+wait_file "$B/run/link.fresh" 5 || fail 0 "beta relay did not handshake"
 sleep 1
 
 start_ns=$(date +%s%N)
@@ -176,7 +177,7 @@ wait_file "$B/inbox/receiver/new/$AB_ID" 3 || fail 1 "A to B did not arrive"
 end_ns=$(date +%s%N)
 AB_MS=$(( (end_ns - start_ns) / 1000000 ))
 [ "$AB_MS" -le 2000 ] || fail 1 "A to B latency ${AB_MS}ms"
-pass 1 "A→B arrived through the hub in ${AB_MS}ms"
+pass 1 "A→B arrived through the upstream in ${AB_MS}ms"
 wait_file "$A/outbox/acked/$AB_ID" 5 || fail 1 "A to B ack did not settle before reverse latency measurement"
 
 start_ns=$(date +%s%N)
@@ -185,10 +186,10 @@ wait_file "$A/inbox/receiver/new/$BA_ID" 3 || fail 2 "B to A did not arrive"
 end_ns=$(date +%s%N)
 BA_MS=$(( (end_ns - start_ns) / 1000000 ))
 [ "$BA_MS" -le 2000 ] || fail 2 "B to A latency ${BA_MS}ms"
-pass 2 "B→A used the same live links in ${BA_MS}ms"
+pass 2 "B→A used the same live relays in ${BA_MS}ms"
 
-[ -f "$B/inbox/receiver/new/$AB_ID" ] || fail 3 "hub relay result missing"
-pass 3 "hub relay delivered without either spoke dialing the other"
+[ -f "$B/inbox/receiver/new/$AB_ID" ] || fail 3 "upstream relay result missing"
+pass 3 "upstream relay delivered without either downstream node dialing the other"
 
 KHALA_HOME="$A" "$KHALA" watch --session ear --interval 30 --max-wait 20 \
     >"$A/ear.out" 2>"$A/ear.err" &
@@ -196,14 +197,14 @@ EAR_PID=$!
 PIDS="$PIDS $EAR_PID"
 wait_file "$B/presence/ear@alpha.watching" 10 || fail 4 "watching presence did not fan out"
 KHALA_HOME="$A" KHALA_SESSION=fixture "$KHALA" send ear@alpha -m 'close ear normally' \
-    >"$A/ear-send.out" 2>"$A/ear-send.err" || fail 4 "ear wake fixture send failed"
-wait "$EAR_PID" || fail 4 "ear did not exit normally after wake"
-pass 4 "A watching marker rode hub presence fan-out to B"
+    >"$A/ear-send.out" 2>"$A/ear-send.err" || fail 4 "watch wake fixture send failed"
+wait "$EAR_PID" || fail 4 "watch process did not exit normally after wake"
+pass 4 "A watching marker rode upstream presence fan-out to B"
 
 start_link "$C" gamma
 C_PID=$LAST_PID
 HEALTHY_STARTED=$(date +%s)
-wait_file "$C/run/link.fresh" 5 || fail 4 "healthy-idle link did not handshake"
+wait_file "$C/run/link.fresh" 5 || fail 4 "healthy-idle relay did not handshake"
 (
     while kill -0 "$C_PID" 2>/dev/null; do
         monitor_now=$(date +%s)
@@ -233,15 +234,15 @@ start_link "$A" alpha
 A_PID=$LAST_PID
 start_link "$B" beta
 B_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 5 "alpha link did not restart"
-wait_file "$B/run/link.fresh" 5 || fail 5 "beta link did not restart"
+wait_file "$A/run/link.fresh" 5 || fail 5 "alpha relay did not restart"
+wait_file "$B/run/link.fresh" 5 || fail 5 "beta relay did not restart"
 wait_file "$A/outbox/acked/$DOWN_ID" 5 || fail 5 "restart did not converge offline backlog ack"
-pass 5 "links-down rsync delivery and link restart converged without a manual poke"
+pass 5 "relays-down rsync delivery and relay restart converged without a manual poke"
 
 stop_link "$A_PID"
 start_link "$A" alpha KHALA_LINK_TEST_DROP_EVENTS=1
 A_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 6 "drop-events link did not start"
+wait_file "$A/run/link.fresh" 5 || fail 6 "drop-events relay did not start"
 DROP_ID=$(KHALA_HOME="$A" KHALA_SESSION=drop "$KHALA" send drop@beta -m 'scan heals drop') || fail 6 "drop send failed"
 wait_file "$B/inbox/drop/new/$DROP_ID" 10 || fail 6 "periodic scan did not heal dropped events"
 pass 6 "dropped notifications converged within one 1s test sweep"
@@ -249,7 +250,7 @@ pass 6 "dropped notifications converged within one 1s test sweep"
 stop_link "$A_PID"
 start_link "$A" alpha KHALA_LINK_TEST_OVERFLOW_ON_EVENT=1
 A_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 7 "overflow link did not start"
+wait_file "$A/run/link.fresh" 5 || fail 7 "overflow relay did not start"
 OVERFLOW_ID=$(KHALA_HOME="$A" KHALA_SESSION=overflow "$KHALA" send overflow@beta -m 'overflow rescan') || fail 7 "overflow send failed"
 wait_file "$B/inbox/overflow/new/$OVERFLOW_ID" 8 || fail 7 "overflow rescan did not converge"
 wait_log 'test overflow hook; full eligible-view rescan' "$A/log/link.log" 3 || fail 7 "overflow rescan was not logged"
@@ -258,14 +259,14 @@ pass 7 "overflow hook forced a full eligible-view rescan and converged"
 stop_link "$A_PID"
 start_link "$A" alpha KHALA_LINK_TEST_DATA_INSTALL_DELAY=3s
 A_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 8 "mid-DATA fixture link did not start"
+wait_file "$A/run/link.fresh" 5 || fail 8 "mid-DATA fixture relay binary did not start"
 MID_ID=$(KHALA_HOME="$A" KHALA_SESSION=middata "$KHALA" send middata@b200 -m 'kill during durable tmp window') || fail 8 "mid-DATA send failed"
 mid_deadline=$(( $(date +%s) + 4 ))
 while [ -z "$(find "$HUB/tmp" -name 'link.*' ! -name 'link.committed' -type f -print -quit)" ] && \
     [ "$(date +%s)" -lt "$mid_deadline" ]; do sleep 0.05; done
 SERVE_PID=$(pgrep -P "$A_PID" | sed -n '1p')
-[ -n "$SERVE_PID" ] || fail 8 "could not identify direct carrier child"
-kill -9 "$SERVE_PID" 2>/dev/null || fail 8 "could not kill carrier child"
+[ -n "$SERVE_PID" ] || fail 8 "could not identify direct transport child"
+kill -9 "$SERVE_PID" 2>/dev/null || fail 8 "could not kill transport child"
 stop_link "$A_PID"
 [ ! -e "$HUB/spool/for/b200/$MID_ID" ] || fail 8 "partial object appeared in watched spool"
 [ -n "$(find "$HUB/tmp" -name 'link.*' ! -name 'link.committed' -type f -print -quit)" ] || fail 8 "no tmp debris demonstrated the interrupted install"
@@ -292,7 +293,7 @@ while [ -z "$(find "$B/spool/quarantine" -name "$CONFLICT_NAME.*" -type f -print
     [ "$(date +%s)" -lt "$conflict_deadline" ]; do sleep 0.05; done
 cmp -s "$B/tmp/conflict.original" "$B/spool/for/beta/$CONFLICT_NAME" || fail 10 "conflict overwrote original"
 [ -n "$(find "$B/spool/quarantine" -name "$CONFLICT_NAME.*" -type f -print -quit 2>/dev/null)" ] || fail 10 "conflict was not quarantined"
-[ -f "$HUB/spool/for/beta/$CONFLICT_NAME" ] || fail 10 "hub source was removed without STORED"
+[ -f "$HUB/spool/for/beta/$CONFLICT_NAME" ] || fail 10 "upstream source was removed without STORED"
 if ! wait_log 'same path has a different digest' "$B/log/link.log" 3 && \
     ! grep -q 'IMMUTABLE_CONFLICT' "$HUB/log/link.log" 2>/dev/null; then
     fail 10 "conflict was not loud"
@@ -302,12 +303,12 @@ pass 10 "different digest quarantined loudly and preserved the original byte-for
 stop_link "$B_PID"
 start_link "$B" beta KHALA_LINK_TEST_STORED_DELAY=2s
 B_PID=$LAST_PID
-wait_file "$B/run/link.fresh" 5 || fail 11 "delayed-STORED link did not start"
+wait_file "$B/run/link.fresh" 5 || fail 11 "delayed-STORED relay did not start"
 DELAY_NAME=delayed.sender@alpha
 printf '%s\n' 'delay stored proof' > "$HUB/spool/for/beta/$DELAY_NAME"
 sleep 0.5
-[ -f "$HUB/spool/for/beta/$DELAY_NAME" ] || fail 11 "hub transit was removed before delayed STORED"
-wait_absent "$HUB/spool/for/beta/$DELAY_NAME" 5 || fail 11 "hub transit remained after STORED"
+[ -f "$HUB/spool/for/beta/$DELAY_NAME" ] || fail 11 "upstream transit was removed before delayed STORED"
+wait_absent "$HUB/spool/for/beta/$DELAY_NAME" 5 || fail 11 "upstream transit remained after STORED"
 [ "$(rg -n 'return os.Remove\(path\)' "$ROOT/link"/*.go | wc -l | tr -d ' ')" -eq 1 ] || fail 11 "unlink audit found more than one production call site"
 DIAL_KEEP_NAME=dial-keeps.sender@alpha
 mkdir -p "$A/spool/for/gamma"
@@ -323,7 +324,7 @@ stop_link "$B_PID"
 rm -f -- "$B/run/link.fresh"
 start_link "$B" beta
 B_PID=$LAST_PID
-wait_file "$B/run/link.fresh" 5 || fail 11 "normal beta link did not restart after delay test"
+wait_file "$B/run/link.fresh" 5 || fail 11 "normal beta relay did not restart after delay test"
 
 RACE_ID=$(KHALA_HOME="$A" KHALA_SESSION=race "$KHALA" send race@beta -m 'link and rsync race') || fail 12 "race send failed"
 KHALA_HOME="$A" "$KHALA" sync >"$A/race-sync.out" 2>"$A/race-sync.err" &
@@ -335,15 +336,15 @@ wait "$RACE_SYNC_B" || :
 wait_file "$B/inbox/race/new/$RACE_ID" 5 || fail 12 "racing delivery missing"
 [ "$(grep -c " $RACE_ID$" "$B/log/delivered")" -eq 1 ] || fail 12 "racing delivery duplicated dedup row"
 wait_file "$A/outbox/acked/$RACE_ID" 6 || fail 12 "racing ack did not settle"
-pass 12 "link+rsync race produced one delivery and one dedup row, then settled"
+pass 12 "relay+rsync race produced one delivery and one dedup row, then settled"
 
 first_child=$(pgrep -P "$A_PID" | sed -n '1p')
-[ -n "$first_child" ] || fail 13 "first carrier child missing"
-kill -TERM "$first_child" 2>/dev/null || fail 13 "could not stop first carrier"
+[ -n "$first_child" ] || fail 13 "first transport child missing"
+kill -TERM "$first_child" 2>/dev/null || fail 13 "could not stop first transport"
 sleep 2
 second_child=$(pgrep -P "$A_PID" | sed -n '1p')
-[ -n "$second_child" ] || fail 13 "carrier did not reconnect"
-kill -TERM "$second_child" 2>/dev/null || fail 13 "could not stop second carrier"
+[ -n "$second_child" ] || fail 13 "transport did not reconnect"
+kill -TERM "$second_child" 2>/dev/null || fail 13 "could not stop second transport"
 # Wait for BOTH reconnect lines: the first kill's line pre-exists, so a bare
 # pattern wait races the second line's arrival (observed flake under load).
 reconnect_lines=0
@@ -357,20 +358,20 @@ done
 [ "$reconnect_lines" -ge 2 ] || fail 13 "second reconnect line missing after ${reconnect_waited}s"
 delay_count=$(sed -n 's/.*reconnect attempt=[0-9][0-9]* delay=\([^ ]*\).*/\1/p' "$A/log/link.log" | sort -u | wc -l | tr -d ' ')
 [ "$delay_count" -ge 2 ] || fail 13 "jitter delays did not show spread"
-pass 13 "carrier deaths re-dialed with at least two distinct full-jitter delays"
+pass 13 "transport deaths re-dialed with at least two distinct full-jitter delays"
 
 start_link "$D" delta KHALA_LINK_TEST_SERVE_HOME="$STALLED_HUB" KHALA_LINK_TEST_SUPPRESS_PONG=1
 D_PID=$LAST_PID
 wait_file "$D/run/link.fresh" 5 || fail 14 "stalled fixture did not handshake"
 D_FIRST_CHILD=$(pgrep -P "$D_PID" | sed -n '1p')
-[ -n "$D_FIRST_CHILD" ] || fail 14 "stalled fixture carrier child was unavailable"
+[ -n "$D_FIRST_CHILD" ] || fail 14 "stalled fixture transport child was unavailable"
 sleep 13
 stalled_now=$(date +%s)
 stalled_mtime=$(stat -c %Y "$D/run/link.fresh")
 [ "$((stalled_now - stalled_mtime))" -ge 12 ] || fail 14 "stalled marker stayed fresh without protocol progress"
 wait_log 'no inbound protocol frame for 20s' "$D/log/link.log" 12 || fail 14 "dial did not declare dead within 20s"
-wait_log 'reconnect attempt=' "$D/log/link.log" 3 || fail 14 "dead carrier did not enter jittered re-dial"
-if kill -0 "$D_FIRST_CHILD" 2>/dev/null; then fail 14 "dial did not kill and reap its stalled carrier child"; fi
+wait_log 'reconnect attempt=' "$D/log/link.log" 3 || fail 14 "dead transport did not enter jittered re-dial"
+if kill -0 "$D_FIRST_CHILD" 2>/dev/null; then fail 14 "dial did not kill and reap its stalled transport child"; fi
 healthy_elapsed=$(( $(date +%s) - HEALTHY_STARTED ))
 if [ "$healthy_elapsed" -lt 65 ]; then sleep "$((65 - healthy_elapsed))"; fi
 kill -0 "$C_PID" 2>/dev/null || fail 14 "healthy idle dial died"
@@ -411,7 +412,7 @@ if ! env KHALA_HOME="$S" KHALA_BRAIN="$KHALA" KHALA_LINK_TEST_SERVE_HOME="$HUB" 
     KHALA_LINK_TEST_SERVE_NODE=b200 "$BIN" >"$S/second.out" 2>"$S/second.err"; then
     fail 16 "second dial was not idempotent"
 fi
-grep -qx 'khala-link: dial already running' "$S/second.out" || fail 16 "second dial notice differed"
+grep -qx 'khala-link: dial already running' "$S/second.out" || fail 16 "second dial alert differed"
 env KHALA_HOME="$S" KHALA_BRAIN="$KHALA" KHALA_LINK_TEST_SERVE_HOME="$HUB" \
     KHALA_LINK_TEST_SERVE_NODE=b200 "$BIN" restart >"$S/restart.out" 2>"$S/restart.err" &
 S_RESTART_PID=$!
@@ -436,8 +437,8 @@ start_link "$A" alpha KHALA_LINK_TEST_DATA_INSTALL_DELAY=3s
 A_PID=$LAST_PID
 start_link "$C" gamma KHALA_LINK_TEST_DATA_INSTALL_DELAY=3s
 C_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 17 "writer-identity alpha link did not start"
-wait_file "$C/run/link.fresh" 5 || fail 17 "writer-identity gamma link did not start"
+wait_file "$A/run/link.fresh" 5 || fail 17 "writer-identity alpha relay did not start"
+wait_file "$C/run/link.fresh" 5 || fail 17 "writer-identity gamma relay did not start"
 KHALA_HOME="$A" KHALA_SESSION=writer-a "$KHALA" send writer-a@gamma -m 'A serve writer' \
     >"$A/writer-ac.id" 2>"$A/writer-ac.err" &
 WRITER_AC_SEND_PID=$!
@@ -470,7 +471,7 @@ WRITER_C_PID=${WRITER_C_TMP##*.}
 case $WRITER_A_PID:$WRITER_C_PID in
     *[!0-9:]*|:*|*:) fail 17 "serve tmp names omitted numeric writer identities" ;;
 esac
-[ "$WRITER_A_PID" != "$WRITER_C_PID" ] || fail 17 "two spoke arrivals used the same serve writer identity"
+[ "$WRITER_A_PID" != "$WRITER_C_PID" ] || fail 17 "two downstream node arrivals used the same serve writer identity"
 wait_file "$C/inbox/writer-a/new/$WRITER_AC_ID" 10 || fail 17 "A writer object did not reach C"
 wait_file "$A/inbox/writer-c/new/$WRITER_CA_ID" 10 || fail 17 "C writer object did not reach A"
 stop_link "$A_PID"
@@ -480,8 +481,8 @@ start_link "$A" alpha
 A_PID=$LAST_PID
 start_link "$C" gamma
 C_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 17 "alpha link did not return after writer audit"
-wait_file "$C/run/link.fresh" 5 || fail 17 "gamma link did not return after writer audit"
+wait_file "$A/run/link.fresh" 5 || fail 17 "alpha relay did not return after writer audit"
+wait_file "$C/run/link.fresh" 5 || fail 17 "gamma relay did not return after writer audit"
 for burst_n in 1 2 3 4 5; do
     KHALA_HOME="$A" KHALA_SESSION=burst "$KHALA" send "burst$burst_n@gamma" -m "burst $burst_n" \
         >>"$A/burst.ids" 2>>"$A/burst.err" || fail 17 "burst send $burst_n failed"
@@ -511,7 +512,7 @@ if env -u KHALA_BRAIN KHALA_HOME="$MISSING" "$BIN" --serve --peer alpha \
     >"$RIG/no-brain.out" 2>"$RIG/no-brain.err"; then
     fail 18 "binary started without KHALA_BRAIN"
 fi
-grep -q 'KHALA_BRAIN is missing or empty' "$RIG/no-brain.err" || fail 18 "missing brain error omitted variable name"
+grep -q 'KHALA_BRAIN is missing or empty' "$RIG/no-brain.err" || fail 18 "missing core CLI error omitted variable name"
 mkdir -p "$MISSING/bin"
 cp "$BIN" "$MISSING/bin/khala-link"
 env KHALA_HOME="$MISSING" KHALA_LINK_TEST_SERVE_HOME="$HUB" \
@@ -548,7 +549,7 @@ for suite in local-roundtrip exchange-roundtrip hardening concurrency watch; do
     grep -q '^RESULT: PASS$' "$RIG/$suite.out" || fail 19 "$suite omitted RESULT: PASS"
 done
 pass 19 "all five existing bash suites passed unchanged"
-pass 20 "full direct-carrier rig showed zero sockets owned by khala-link"
+pass 20 "full direct-transport rig showed zero sockets owned by khala-link"
 
 printf 'LATENCY A_TO_B_MS=%s B_TO_A_MS=%s\n' "$AB_MS" "$BA_MS"
 printf 'RESULT: PASS\n'

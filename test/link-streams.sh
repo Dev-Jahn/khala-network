@@ -3,13 +3,14 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
-GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO=${GO_BINARY-$(command -v go)}
 GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
 RIG=$ROOT/.link-streams-test.$$
 BIN=$RIG/khala-link
 PIDS=
 LAST_PID=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_pid in $PIDS; do
@@ -172,9 +173,9 @@ write_entry() {
 }
 
 mkdir -p -- "$RIG" "$GO_TMP" "$GO_CACHE"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
-[ -x "$GO" ] || fail 0 "Go toolchain missing at $GO"
+[ -x "$GO" ] || fail 0 "Go toolchain missing${GO:+ at $GO}; set GO_BINARY or put go on PATH"
 if ! (cd "$ROOT/link" && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" test ./... && GOTMPDIR="$GO_TMP" GOCACHE="$GO_CACHE" CGO_ENABLED=0 \
     "$GO" build -trimpath -ldflags '-X main.implVersion=0.4.0-test' -o "$BIN" .) \
@@ -219,39 +220,39 @@ wait_file "$HARD_HUB/streams/bounded/hardalpha/$HARD_FRESH_ID" 5 ||
 wait_absent "$HARD_A/streams/bounded/hardalpha/$HARD_OLD_ID" 5 ||
     fail H1 "startup reconcile did not prune expired owner entry"
 [ ! -e "$HARD_HUB/streams/bounded/hardalpha/$HARD_OLD_ID" ] ||
-    fail H1 "expired owner entry reached the hub live tree"
+    fail H1 "expired owner entry reached the upstream live tree"
 if grep -Fq "$HARD_OLD_ID" "$HARD_HUB/log/link.log" 2>/dev/null; then
-    fail H1 "hub wire endpoint observed an expired OFFER"
+    fail H1 "upstream wire endpoint observed an expired OFFER"
 fi
 pass H1 "link-first startup reconciled before offering; expired OFFER count was zero"
 
 HARD_CHILD=$(carrier_child "$HARD_PID")
-[ -n "$HARD_CHILD" ] || fail H2 "initial carrier child missing"
+[ -n "$HARD_CHILD" ] || fail H2 "initial transport child missing"
 hard_round=1
 while [ "$hard_round" -le 3 ]; do
-    kill -KILL "$HARD_CHILD" 2>/dev/null || fail H2 "could not kill carrier round $hard_round"
+    kill -KILL "$HARD_CHILD" 2>/dev/null || fail H2 "could not kill transport round $hard_round"
     HARD_REPLAY_ID=$(write_entry "$HARD_A" bounded hardalpha ancient "$HARD_OLD_EPOCH" 'must never be reoffered') ||
         fail H2 "expired reinjection failed in round $hard_round"
     [ "$HARD_REPLAY_ID" = "$HARD_OLD_ID" ] || fail H2 "reinjection changed fixture Id"
     # Full jitter at the third short-lived reconnect has an 8s cap.
     HARD_CHILD=$(wait_new_child "$HARD_PID" "$HARD_CHILD" 10) ||
-        fail H2 "carrier did not redial in round $hard_round"
+        fail H2 "transport did not redial in round $hard_round"
     wait_absent "$HARD_A/streams/bounded/hardalpha/$HARD_OLD_ID" 5 ||
         fail H2 "expired entry survived redial reconcile in round $hard_round"
     [ ! -e "$HARD_HUB/streams/bounded/hardalpha/$HARD_OLD_ID" ] ||
-        fail H2 "expired entry reached hub in round $hard_round"
+        fail H2 "expired entry reached upstream in round $hard_round"
     hard_round=$((hard_round + 1))
 done
 HARD_LOG_COUNT=$(grep -Fh "$HARD_OLD_ID" "$HARD_A/log/link.log" "$HARD_HUB/log/link.log" 2>/dev/null | wc -l | tr -d ' ')
 [ "$HARD_LOG_COUNT" -le 1 ] || fail H2 "expired item logged $HARD_LOG_COUNT times across three redials"
 stop_link "$HARD_PID"
-pass H2 "three carrier redials produced zero expired OFFERs and at most one skip log"
+pass H2 "three transport redials produced zero expired OFFERs and at most one skip log"
 
 start_link "$A" alpha "$HUB"
 A_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail 8a "alpha link did not handshake"
+wait_file "$A/run/link.fresh" 5 || fail 8a "alpha relay did not handshake"
 A_CHILD_BEFORE=$(carrier_child "$A_PID")
-[ -n "$A_CHILD_BEFORE" ] || fail 8a "alpha carrier child missing"
+[ -n "$A_CHILD_BEFORE" ] || fail 8a "alpha transport child missing"
 start_ns=$(date +%s%N)
 PIPE_ID=$(KHALA_HOME="$A" KHALA_SESSION=speaker "$KHALA" say pipe -m 'pipe stream') ||
     fail 8a "say failed"
@@ -260,12 +261,12 @@ end_ns=$(date +%s%N)
 PIPE_MS=$(( (end_ns - start_ns) / 1000000 ))
 [ "$PIPE_MS" -le 2000 ] || fail 8a "pipe latency ${PIPE_MS}ms"
 A_CHILD_AFTER=$(carrier_child "$A_PID")
-[ "$A_CHILD_BEFORE" = "$A_CHILD_AFTER" ] || fail 8a "carrier reconnected during delivery"
+[ "$A_CHILD_BEFORE" = "$A_CHILD_AFTER" ] || fail 8a "transport reconnected during delivery"
 pass 8a "A say reached the pipe receiver in ${PIPE_MS}ms without reconnect"
 
 start_link "$B" beta "$HUB"
 B_PID=$LAST_PID
-wait_file "$B/run/link.fresh" 5 || fail 8b "beta link did not handshake"
+wait_file "$B/run/link.fresh" 5 || fail 8b "beta relay did not handshake"
 start_ns=$(date +%s%N)
 THREE_ID=$(KHALA_HOME="$A" KHALA_SESSION=speaker "$KHALA" say threehop -m 'through hub') ||
     fail 8b "three-hop say failed"
@@ -273,13 +274,13 @@ wait_file "$B/streams/threehop/alpha/$THREE_ID" 4 || fail 8b "A shard did not fa
 end_ns=$(date +%s%N)
 THREE_MS=$(( (end_ns - start_ns) / 1000000 ))
 [ "$THREE_MS" -le 3000 ] || fail 8b "three-hop latency ${THREE_MS}ms"
-[ -f "$HUB/streams/threehop/alpha/$THREE_ID" ] || fail 8b "hub deleted a stream after beta STORED it"
+[ -f "$HUB/streams/threehop/alpha/$THREE_ID" ] || fail 8b "upstream deleted a stream after beta STORED it"
 HUB_ID=$(KHALA_HOME="$HUB" KHALA_SESSION=hubvoice "$KHALA" say threehop -m 'hub shard') ||
-    fail 8b "hub say failed"
-wait_file "$B/streams/threehop/b200/$HUB_ID" 4 || fail 8b "hub shard did not fan out"
-grep -q '^peer b200 ' "$B/config" || fail 8b "beta does not point only at the hub"
+    fail 8b "upstream say failed"
+wait_file "$B/streams/threehop/b200/$HUB_ID" 4 || fail 8b "upstream shard did not fan out"
+grep -q '^peer b200 ' "$B/config" || fail 8b "beta does not point only at the upstream"
 grep -q '^peer alpha ' "$B/config" && fail 8b "beta was configured to dial alpha"
-pass 8b "hub retained and fanned out alpha and b200 shards to beta in ${THREE_MS}ms"
+pass 8b "upstream retained and fanned out alpha and b200 shards to beta in ${THREE_MS}ms"
 
 stop_link "$A_PID"
 rm -f -- "$HUB/streams/threehop/alpha/$THREE_ID"
@@ -292,7 +293,7 @@ pass L1 "dial offered only its own shard; installed alpha projection did not ech
 
 start_link "$A" alpha "$HUB"
 A_PID=$LAST_PID
-wait_file "$A/run/link.fresh" 5 || fail L2 "alpha link did not restart"
+wait_file "$A/run/link.fresh" 5 || fail L2 "alpha relay did not restart"
 KHALA_HOME="$B" KHALA_SESSION=future-reader "$KHALA" inbox --drain >/dev/null ||
     fail L2 "reader heartbeat failed"
 KHALA_HOME="$B" KHALA_SESSION=future-reader "$KHALA" join future --from-start >/dev/null ||
@@ -308,14 +309,14 @@ FUTURE_ID=$(write_entry "$A" future alpha timewarp "$FUTURE_EPOCH" 'must quarant
 FUTURE_DEAD_LOCAL=$A/spool/dead/stream.future.alpha.$FUTURE_ID
 FUTURE_DEAD_HUB=$HUB/spool/dead/stream.future.alpha.$FUTURE_ID
 wait_either_file "$FUTURE_DEAD_LOCAL" "$FUTURE_DEAD_HUB" 4 ||
-    fail L2 "future link entry did not use brain quarantine encoding"
+    fail L2 "future relay entry did not use core CLI quarantine encoding"
 if wait "$FUTURE_WATCH_PID"; then
-    fail L2 "future link entry woke a joined reader"
+    fail L2 "future relay entry woke a joined reader"
 else
     FUTURE_WATCH_STATUS=$?
 fi
 [ "$FUTURE_WATCH_STATUS" -eq 3 ] || fail L2 "future watch exited $FUTURE_WATCH_STATUS"
-[ ! -e "$HUB/streams/future/alpha/$FUTURE_ID" ] || fail L2 "future entry polluted hub live tree"
+[ ! -e "$HUB/streams/future/alpha/$FUTURE_ID" ] || fail L2 "future entry polluted upstream live tree"
 [ ! -e "$B/streams/future/alpha/$FUTURE_ID" ] || fail L2 "future entry fanned out to beta"
 if [ -f "$FUTURE_DEAD_LOCAL" ]; then
     grep -Fq "$FUTURE_ID" "$A/log/link.log" || fail L2 "source quarantine was not logged loudly"
@@ -343,18 +344,18 @@ wait_file "$B/streams/race/alpha/$RACE_ID" 5 || fail 10 "racing stream delivery 
 cmp -s "$A/streams/race/alpha/$RACE_ID" "$B/streams/race/alpha/$RACE_ID" ||
     fail 10 "race changed stream bytes"
 KHALA_HOME="$B" KHALA_SESSION=race-reader "$KHALA" inbox --drain \
-    >"$B/race-first.out" 2>"$B/race-first.err" || fail 10 "first race drain failed"
+    >"$B/race-first.out" 2>"$B/race-first.err" || fail 10 "first race inbox read failed"
 [ "$(grep -Fxc -- "--- stream race $RACE_ID ---" "$B/race-first.out")" -eq 1 ] ||
-    fail 10 "first drain count was not one"
+    fail 10 "first inbox read count was not one"
 KHALA_HOME="$B" KHALA_SESSION=race-reader "$KHALA" inbox --drain \
-    >"$B/race-second.out" 2>"$B/race-second.err" || fail 10 "second race drain failed"
+    >"$B/race-second.out" 2>"$B/race-second.err" || fail 10 "second race inbox read failed"
 [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$B/race-second.out")" -eq 0 ] ||
     fail 10 "race entry redelivered after cursor advance"
-pass 10 "link+rsync race left one byte-identical file and one cursor drain"
+pass 10 "relay+rsync race left one byte-identical file and one cursor inbox read"
 
 start_link "$OLD_A" oldalpha "$OLD_HUB" KHALA_LINK_TEST_SERVE_MINOR=0
 OLD_A_PID=$LAST_PID
-wait_file "$OLD_A/run/link.fresh" 5 || fail 8c "minor-0 link did not handshake"
+wait_file "$OLD_A/run/link.fresh" 5 || fail 8c "minor-0 relay did not handshake"
 MAIL_ID=$(KHALA_HOME="$OLD_A" KHALA_SESSION=legacy "$KHALA" send legacy@b200 -m 'legacy mail') ||
     fail 8c "mail send failed"
 wait_file "$OLD_HUB/inbox/legacy/new/$MAIL_ID" 4 || fail 8c "mail did not propagate over minor 0"

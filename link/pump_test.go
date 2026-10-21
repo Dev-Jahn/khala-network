@@ -20,7 +20,7 @@ func TestProtocolMajorMismatchSendsFatalErrorAndBye(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
-	p := &pump{
+	p := &relayLoop{
 		self: "alpha", role: "dial", maxObject: 1 << 20,
 		reader: bufio.NewReader(local), writer: newFrameWriter(local),
 		logger: log.New(io.Discard, "", 0),
@@ -79,7 +79,7 @@ func TestMindOfferRequiresMinorTwo(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wire bytes.Buffer
-	p := &pump{
+	p := &relayLoop{
 		role: "dial", minor: 1, retainDays: 30, maxObject: 1 << 20,
 		logger: log.New(io.Discard, "", 0), writer: newFrameWriter(&wire),
 		origins: newOriginSet(), known: make(map[string]string), rejected: make(map[string]string),
@@ -146,7 +146,7 @@ func TestDialSpoolCopyLifetimeAfterStored(t *testing.T) {
 			local, remote := net.Pipe()
 			defer local.Close()
 			defer remote.Close()
-			p := &pump{
+			p := &relayLoop{
 				home: home, role: "dial", maxObject: 1 << 20,
 				writer: newFrameWriter(local), logger: log.New(io.Discard, "", 0),
 				responses: make(chan frame, 2), origins: newOriginSet(),
@@ -240,18 +240,18 @@ func TestMindInstallTriggersBrainWithoutTouchingFreshMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	data := []byte("mind bytes")
-	o := testMindOffer("alpha", "worker", fmt.Sprintf("%d.0", time.Now().Unix()), data)
+	o := testStatusOffer("alpha", "worker", fmt.Sprintf("%d.0", time.Now().Unix()), data)
 	var wire bytes.Buffer
-	p := &pump{
+	p := &relayLoop{
 		home: home, role: "dial", writer: newFrameWriter(&wire), logger: log.New(io.Discard, "", 0),
-		origins: newOriginSet(), brain: &brain{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
+		origins: newOriginSet(), coreCLI: &coreCLI{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
 	}
 	ins := &installer{home: home, role: "dial", peer: "beta", retainDays: 30, logger: p.logger}
 	var active atomic.Bool
 	active.Store(true)
 	p.installIncoming(ins, o, data, &active)
 	select {
-	case <-p.brain.dirty:
+	case <-p.coreCLI.dirty:
 	default:
 		t.Fatal("mind install did not trigger brain reconcile")
 	}
@@ -279,18 +279,18 @@ func TestFutureMindQuarantineDoesNotTriggerBrainOrTouchFreshMarker(t *testing.T)
 	}
 	data := []byte("future mind bytes")
 	generation := fmt.Sprintf("%d.0", time.Now().Unix()+86401)
-	o := testMindOffer("alpha", "worker", generation, data)
+	o := testStatusOffer("alpha", "worker", generation, data)
 	var wire bytes.Buffer
-	p := &pump{
+	p := &relayLoop{
 		home: home, role: "dial", writer: newFrameWriter(&wire), logger: log.New(io.Discard, "", 0),
-		origins: newOriginSet(), brain: &brain{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
+		origins: newOriginSet(), coreCLI: &coreCLI{dirty: make(chan struct{}, 1)}, asyncErr: make(chan error, 1),
 	}
 	ins := &installer{home: home, role: "dial", peer: "beta", retainDays: 30, logger: p.logger}
 	var active atomic.Bool
 	active.Store(true)
 	p.installIncoming(ins, o, data, &active)
 	select {
-	case <-p.brain.dirty:
+	case <-p.coreCLI.dirty:
 		t.Fatal("future mind quarantine triggered brain reconcile")
 	default:
 	}
@@ -318,7 +318,7 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 	defer remote.Close()
 	result := make(chan error, 1)
 	go func() {
-		_, err := runPump(context.Background(), readWriter{Reader: local, Writer: local},
+		_, err := runRelayLoop(context.Background(), readWriter{Reader: local, Writer: local},
 			home, "serve", "b200", "", "/bin/true", nil, 1<<20, 30, time.Hour, newLogOnceSet(),
 			log.New(io.Discard, "", 0))
 		result <- err
@@ -350,11 +350,11 @@ func TestServeDefaultQuietTimeout(t *testing.T) {
 
 func TestPumpLeavesReconcileToNodeSingleton(t *testing.T) {
 	home := testKhalaHome(t)
-	brainPath := filepath.Join(home, "fake-brain")
-	brainScript := `#!/bin/sh
+	coreCLIPath := filepath.Join(home, "fake-brain")
+	coreCLIScript := `#!/bin/sh
 : > "$KHALA_HOME/brain-ran"
 `
-	if err := os.WriteFile(brainPath, []byte(brainScript), 0700); err != nil {
+	if err := os.WriteFile(coreCLIPath, []byte(coreCLIScript), 0700); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -364,8 +364,8 @@ func TestPumpLeavesReconcileToNodeSingleton(t *testing.T) {
 	defer remote.Close()
 	result := make(chan error, 1)
 	go func() {
-		_, err := runPump(ctx, readWriter{Reader: local, Writer: local}, home, "dial", "b200", "alpha",
-			brainPath, nil, 1<<20, 30, time.Hour, newLogOnceSet(), log.New(io.Discard, "", 0))
+		_, err := runRelayLoop(ctx, readWriter{Reader: local, Writer: local}, home, "dial", "b200", "alpha",
+			coreCLIPath, nil, 1<<20, 30, time.Hour, newLogOnceSet(), log.New(io.Discard, "", 0))
 		result <- err
 	}()
 	remoteReader := bufio.NewReader(remote)
@@ -398,12 +398,12 @@ func TestInboundInstallDoesNotBlockOppositeDirectionResponses(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
-	p := &pump{
+	p := &relayLoop{
 		home: home, role: "dial", self: "alpha", maxObject: 1 << 20,
 		reader: bufio.NewReader(local), writer: newFrameWriter(local),
 		logger: log.New(io.Discard, "", 0), responses: make(chan frame, 1),
 		origins: newOriginSet(), asyncErr: make(chan error, 1),
-		brain: &brain{dirty: make(chan struct{}, 1)},
+		coreCLI: &coreCLI{dirty: make(chan struct{}, 1)},
 	}
 	p.activeOut.Store(true)
 	result := make(chan error, 1)
@@ -439,7 +439,7 @@ func TestInboundInstallDoesNotBlockOppositeDirectionResponses(t *testing.T) {
 		t.Fatalf("STORED frame=%v err=%v", f.typ, err)
 	}
 	select {
-	case <-p.brain.dirty:
+	case <-p.coreCLI.dirty:
 	case <-time.After(time.Second):
 		t.Fatal("install completion did not trigger the brain")
 	}
@@ -463,7 +463,7 @@ func TestExpiredOutboundStreamProducesNoOfferAndLogsOnce(t *testing.T) {
 	}
 	var wire bytes.Buffer
 	var logs bytes.Buffer
-	p := &pump{
+	p := &relayLoop{
 		role: "dial", minor: streamMinor, retainDays: 30, maxObject: 1 << 20,
 		logger: log.New(&logs, "", 0), writer: newFrameWriter(&wire),
 		expiredOfferLogs: newLogOnceSet(), origins: newOriginSet(),
@@ -488,13 +488,13 @@ func TestInboundExpiredOfferIsRecoverableWithoutDataOrBrainTrigger(t *testing.T)
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
-	p := &pump{
+	p := &relayLoop{
 		home: home, role: "serve", self: "b200", peer: "alpha", minor: streamMinor,
 		retainDays: 30, maxObject: 1 << 20,
 		reader: bufio.NewReader(local), writer: newFrameWriter(local),
 		logger: log.New(io.Discard, "", 0), responses: make(chan frame, 1),
 		origins: newOriginSet(), asyncErr: make(chan error, 1),
-		brain: &brain{dirty: make(chan struct{}, 1)},
+		coreCLI: &coreCLI{dirty: make(chan struct{}, 1)},
 	}
 	result := make(chan error, 1)
 	go func() { result <- p.readLoop(context.Background()) }()
@@ -517,7 +517,7 @@ func TestInboundExpiredOfferIsRecoverableWithoutDataOrBrainTrigger(t *testing.T)
 		t.Fatalf("expired offer installed: %v", err)
 	}
 	select {
-	case <-p.brain.dirty:
+	case <-p.coreCLI.dirty:
 		t.Fatal("expired offer triggered the brain")
 	default:
 	}
@@ -533,7 +533,7 @@ func TestUnknownFrameSendsFatalErrorAndBye(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
-	p := &pump{
+	p := &relayLoop{
 		role: "dial", self: "alpha", maxObject: 1 << 20,
 		reader: bufio.NewReader(local), writer: newFrameWriter(local),
 		logger: log.New(io.Discard, "", 0), responses: make(chan frame, 1),

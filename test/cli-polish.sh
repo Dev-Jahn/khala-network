@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 RIG=$HOME/.khala-cli-polish-$$
 FAILURES=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -93,12 +94,12 @@ property_2() {
         send reader@alpha -s S -m M) || die "short send failed"
     p2_long=$(KHALA_HOME=$p2_home KHALA_SESSION=sender "$KHALA" \
         send reader@alpha --subject S --message M) || die "long send failed"
-    p2_short_file=$(letter_path "$p2_home" "$p2_short") || die "short letter missing"
-    p2_long_file=$(letter_path "$p2_home" "$p2_long") || die "long letter missing"
+    p2_short_file=$(letter_path "$p2_home" "$p2_short") || die "short message missing"
+    p2_long_file=$(letter_path "$p2_home" "$p2_long") || die "long message missing"
     sed '/^Id: /d; /^Date: /d; /^Expires: /d' "$p2_short_file" > "$RIG/p2-short.normalized"
     sed '/^Id: /d; /^Date: /d; /^Expires: /d' "$p2_long_file" > "$RIG/p2-long.normalized"
     cmp -s "$RIG/p2-short.normalized" "$RIG/p2-long.normalized" ||
-        die "long send aliases changed letter bytes"
+        die "long send aliases changed message bytes"
     p2_say=$(KHALA_HOME=$p2_home KHALA_SESSION=sender "$KHALA" \
         say --subject SS --body BB) || die "say long aliases failed"
     p2_say_file=$p2_home/streams/khala/alpha/$p2_say
@@ -134,7 +135,7 @@ property_3() {
     init_home "$p3_home"
     p3_id=$(KHALA_HOME=$p3_home KHALA_SESSION=sender "$KHALA" send reader@alpha \
         --subject reply --reply-to "$p3_ref" --message body) || die "reply send failed"
-    p3_file=$(letter_path "$p3_home" "$p3_id") || die "reply letter missing"
+    p3_file=$(letter_path "$p3_home" "$p3_id") || die "reply message missing"
     [ "$(grep -c "^In-Reply-To: $p3_ref$" "$p3_file")" -eq 1 ] ||
         die "In-Reply-To is not present exactly once"
     p3_subject_line=$(grep -n '^Subject: reply$' "$p3_file" | cut -d: -f1)
@@ -143,9 +144,9 @@ property_3() {
         die "In-Reply-To is not immediately after Subject"
     KHALA_HOME=$p3_home "$KHALA" reconcile >/dev/null || die "reply reconcile failed"
     KHALA_HOME=$p3_home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        > "$RIG/p3-drain.out" || die "reply drain failed"
+        > "$RIG/p3-drain.out" || die "reply inbox read failed"
     grep -qx "In-Reply-To: $p3_ref" "$RIG/p3-drain.out" ||
-        die "drain omitted In-Reply-To"
+        die "inbox read omitted In-Reply-To"
     KHALA_HOME=$p3_home KHALA_SESSION=reader "$KHALA" inbox read "$p3_id" \
         > "$RIG/p3-read.out" || die "reply read failed"
     grep -qx "In-Reply-To: $p3_ref" "$RIG/p3-read.out" ||
@@ -169,13 +170,13 @@ property_4() {
     KHALA_HOME=$p4_home KHALA_SESSION=reader "$KHALA" inbox --drain 2>"$RIG/p4.err" |
         head -3 > "$RIG/p4-head.out"
     [ "$(count_files "$p4_home/inbox/reader/new")" -eq 0 ] ||
-        die "SIGPIPE left letters in new"
+        die "SIGPIPE left messages in new"
     [ "$(count_files "$p4_home/inbox/reader/cur")" -eq 8 ] ||
-        die "SIGPIPE did not move all eight letters to cur"
+        die "SIGPIPE did not move all eight messages to cur"
     KHALA_HOME=$p4_home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        > "$RIG/p4-second.out" || die "second drain failed"
+        > "$RIG/p4-second.out" || die "second inbox read failed"
     [ "$(grep -cv '^drained: letters 0, notices 0, streams 0$' "$RIG/p4-second.out")" -eq 0 ] ||
-        die "second drain redelivered letters"
+        die "second inbox read redelivered messages"
 }
 
 property_5() {
@@ -196,26 +197,26 @@ property_5() {
     KHALA_HOME=$p5_home KHALA_SESSION=reader "$KHALA" inbox list \
         > "$RIG/p5-list.out" || die "inbox list failed"
     {
-        printf '%s\tone@alpha\tnew one\t2000-01-01T00:00:00Z\n' "$p5_new_1"
-        printf '%s\ttwo@alpha\tnew two\t2000-01-02T00:00:00Z\n' "$p5_new_2"
-        printf '%s\tthree@alpha\tcur one\t2000-01-03T00:00:00Z\n' "$p5_cur_1"
-        printf '%s\tfour@alpha\tcur two\t2000-01-04T00:00:00Z\n' "$p5_cur_2"
+        printf '%s\tone@alpha\tnew one\t2000-01-01T00:00:00Z\tunread\n' "$p5_new_1"
+        printf '%s\ttwo@alpha\tnew two\t2000-01-02T00:00:00Z\tunread\n' "$p5_new_2"
+        printf '%s\tthree@alpha\tcur one\t2000-01-03T00:00:00Z\tread\n' "$p5_cur_1"
+        printf '%s\tfour@alpha\tcur two\t2000-01-04T00:00:00Z\tread\n' "$p5_cur_2"
     } > "$RIG/p5-expected.out"
     cmp -s "$RIG/p5-expected.out" "$RIG/p5-list.out" ||
-        die "inbox list fields or new/cur order differ"
+        die "inbox list fields, read state or new/cur order differ"
     p5_before_new=$(count_files "$p5_home/inbox/reader/new")
     p5_before_cur=$(count_files "$p5_home/inbox/reader/cur")
     KHALA_HOME=$p5_home KHALA_SESSION=reader "$KHALA" inbox read "$p5_cur_1" \
         > "$RIG/p5-read-cur.out" || die "read from cur failed"
     cmp -s "$p5_home/inbox/reader/cur/$p5_cur_1" "$RIG/p5-read-cur.out" ||
-        die "read from cur changed letter bytes"
+        die "read from cur changed message bytes"
     KHALA_HOME=$p5_home KHALA_SESSION=reader "$KHALA" inbox read "$p5_new_1" \
         > "$RIG/p5-read-new.out" || die "read from new failed"
     cmp -s "$p5_home/inbox/reader/new/$p5_new_1" "$RIG/p5-read-new.out" ||
-        die "read from new changed letter bytes"
+        die "read from new changed message bytes"
     [ "$(count_files "$p5_home/inbox/reader/new")" -eq "$p5_before_new" ] &&
         [ "$(count_files "$p5_home/inbox/reader/cur")" -eq "$p5_before_cur" ] ||
-        die "inbox read moved a letter"
+        die "inbox read moved a message"
 }
 
 property_6() {
@@ -226,14 +227,14 @@ property_6() {
     KHALA_HOME=$p6_home KHALA_SESSION=reader "$KHALA" join khala --from-start >/dev/null ||
         die "join failed"
     p6_letter=$(KHALA_HOME=$p6_home KHALA_SESSION=sender "$KHALA" \
-        send reader@alpha -m letter) || die "letter send failed"
-    KHALA_HOME=$p6_home "$KHALA" reconcile >/dev/null || die "letter reconcile failed"
+        send reader@alpha -m letter) || die "message send failed"
+    KHALA_HOME=$p6_home "$KHALA" reconcile >/dev/null || die "message reconcile failed"
     p6_stream=$(KHALA_HOME=$p6_home KHALA_SESSION=speaker "$KHALA" \
         say -m stream) || die "stream say failed"
     KHALA_HOME=$p6_home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        > "$RIG/p6-drain.out" || die "mixed drain failed"
+        > "$RIG/p6-drain.out" || die "mixed inbox read failed"
     grep -Fqx -- "--- letter $p6_letter ---" "$RIG/p6-drain.out" ||
-        die "letter delimiter differs"
+        die "message delimiter differs"
     grep -Fqx -- "--- stream khala $p6_stream ---" "$RIG/p6-drain.out" ||
         die "stream delimiter differs"
 }
@@ -242,8 +243,8 @@ property_7() {
     p7_home=$RIG/p7-home
     init_home "$p7_home"
     p7_letter=$(KHALA_HOME=$p7_home KHALA_SESSION=sender "$KHALA" \
-        send mail-reader@alpha -m wake) || die "watch letter send failed"
-    KHALA_HOME=$p7_home "$KHALA" reconcile >/dev/null || die "watch letter reconcile failed"
+        send mail-reader@alpha -m wake) || die "watch message send failed"
+    KHALA_HOME=$p7_home "$KHALA" reconcile >/dev/null || die "watch message reconcile failed"
     KHALA_HOME=$p7_home "$KHALA" watch --session mail-reader --interval 1 --max-wait 2 \
         > "$RIG/p7-mail.out" || die "delivery watch failed"
     [ "$(sed -n '1p' "$RIG/p7-mail.out")" = 'wake: delivery' ] ||
@@ -274,14 +275,14 @@ run_property() {
 }
 
 mkdir -p "$RIG" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property 1 'every known subcommand has successful focused help'
 run_property 2 'send and say long aliases preserve content and errors name spellings'
 run_property 3 'reply metadata is validated, positioned, and displayed'
-run_property 4 'SIGPIPE cannot redeliver already selected letters'
-run_property 5 'inbox list and read expose letters without moving them'
-run_property 6 'letter and stream drain delimiters are distinct'
+run_property 4 'SIGPIPE cannot redeliver already selected messages'
+run_property 5 'inbox list and read expose messages without moving them'
+run_property 6 'message and stream inbox read delimiters are distinct'
 run_property 7 'watch reason is the first line for delivery and stream wakes'
 
 if [ -n "$FAILURES" ]; then

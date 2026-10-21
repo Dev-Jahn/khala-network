@@ -95,8 +95,8 @@ func TestLoadConfigEarsSwitch(t *testing.T) {
 			if test.wantErr != (err != nil) {
 				t.Fatalf("loadConfig err=%v wantErr=%t", err, test.wantErr)
 			}
-			if err == nil && got.earsEnabled != test.enabled {
-				t.Fatalf("earsEnabled=%t want=%t", got.earsEnabled, test.enabled)
+			if err == nil && got.listenerEnabled != test.enabled {
+				t.Fatalf("earsEnabled=%t want=%t", got.listenerEnabled, test.enabled)
 			}
 		})
 	}

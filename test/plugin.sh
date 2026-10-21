@@ -6,10 +6,11 @@ KHALA=$ROOT/bin/khala
 START=$ROOT/plugin/hooks/session-start.sh
 STOP=$ROOT/plugin/hooks/stop.sh
 END=$ROOT/plugin/hooks/session-end.sh
-GO=${GO:-/NHNHOME/jahn/go-toolchain/bin/go}
+GO=${GO:-$(command -v go)}
 RIG=$ROOT/.plugin-test-$$
 SHIM=$RIG/shim
 LINK_BIN=$RIG/khala-link
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
@@ -45,12 +46,22 @@ pass() {
     printf 'ok %s — %s\n' "$1" "$2"
 }
 
+# Permission bits in octal: GNU stat -c, else BSD/macOS stat -f.
+file_mode() {
+    plugin_mode=$(stat -c %a "$1" 2>/dev/null) || plugin_mode=
+    if [ -n "$plugin_mode" ]; then
+        printf '%s\n' "$plugin_mode"
+        return 0
+    fi
+    stat -f %Lp "$1" 2>/dev/null
+}
+
 init_home() {
     init_target=$1
     KHALA_HOME=$init_target "$KHALA" init alpha >/dev/null 2>"$RIG/init.err" || \
         fail setup "khala init failed: $(tr '\n' ' ' < "$RIG/init.err")"
     mkdir -p "$init_target/bin" || fail setup "could not create fixture bin"
-    cp "$LINK_BIN" "$init_target/bin/khala-link" || fail setup "could not install fixture link"
+    cp "$LINK_BIN" "$init_target/bin/khala-link" || fail setup "could not install fixture relay binary"
 }
 
 make_project() {
@@ -128,7 +139,7 @@ mkdir -p "$FAKE_HOME/.local/bin" || fail setup "could not create fake home"
 cp "$KHALA" "$FAKE_HOME/.local/bin/khala" || fail setup "could not seed fake CLI"
 chmod 755 "$FAKE_HOME/.local/bin/khala"
 printf 'khala-plugin\n' > "$FAKE_HOME/.local/bin/.khala.plugin-receipt"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 # Python is a test-rig-only JSON parser; the plugin runtime has no Python dependency.
 uv run --no-project python -c 'import json,sys; json.load(open(sys.argv[1]))' \
@@ -149,7 +160,7 @@ PY
 cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || \
     fail 1 "plugin/bin/khala drifted from bin/khala"
 # CC auto-loads hooks/hooks.json; a manifest "hooks" key naming it again is a
-# duplicate that fails the whole plugin load (fleet-observed, 2026-08-13).
+# duplicate that fails the whole plugin load (observed in the cluster, 2026-08-13).
 grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && \
     fail 1 "plugin.json references hooks (auto-loaded path must not be repeated)"
 pass 1 "plugin/channel manifests are valid, no duplicate hooks ref, bundled CLI matches bin/khala"
@@ -176,14 +187,14 @@ make_project "$DRAIN_PROJECT" drain-session
 stage_letter "$DRAIN_HOME" drain-session first-body
 stage_letter "$DRAIN_HOME" drain-session second-body
 run_start_without_env "$DRAIN_HOME" "$DRAIN_PROJECT" "$RIG/drain.out" || \
-    fail 3 "drain SessionStart exited nonzero"
+    fail 3 "inbox read SessionStart exited nonzero"
 grep -q 'first-body' "$RIG/drain.out" || fail 3 "first body missing"
 grep -q 'second-body' "$RIG/drain.out" || fail 3 "second body missing"
 [ "$(count_files "$DRAIN_HOME/inbox/drain-session/new")" -eq 0 ] || \
-    fail 3 "new inbox is not empty after drain"
+    fail 3 "new inbox is not empty after inbox read"
 [ "$(count_files "$DRAIN_HOME/inbox/drain-session/cur")" -eq 2 ] || \
-    fail 3 "two letters did not reach cur"
-pass 3 "SessionStart reconciles and drains two staged letters"
+    fail 3 "two messages did not reach cur"
+pass 3 "SessionStart reconciles and reads two staged messages"
 
 CAP_HOME=$RIG/cap-home
 CAP_PROJECT=$RIG/cap-session
@@ -196,10 +207,10 @@ while [ "$cap_i" -le 25 ]; do
 done
 run_start_without_env "$CAP_HOME" "$CAP_PROJECT" "$RIG/cap.out" || \
     fail 4 "cap SessionStart exited nonzero"
-[ "$(grep -c '^--- .* ---$' "$RIG/cap.out")" -eq 20 ] || fail 4 "drain did not stop at 20"
+[ "$(grep -c '^--- .* ---$' "$RIG/cap.out")" -eq 20 ] || fail 4 "inbox read did not stop at 20"
 grep -q '^5건 더 (' "$RIG/cap.out" || fail 4 "remaining-letter summary did not reach stdout"
 [ "$(count_files "$CAP_HOME/inbox/cap-session/new")" -eq 5 ] || \
-    fail 4 "cap did not leave five letters new"
+    fail 4 "cap did not leave five messages new"
 pass 4 "khala's 20-letter cap and remainder summary reach hook output"
 
 PRE_HOME=$RIG/precedence-home
@@ -254,7 +265,7 @@ LINK_PROJECT=$RIG/link-session
 init_home "$LINK_HOME"
 make_project "$LINK_PROJECT" link-session
 run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/node-first.out" || fail 7 "first node ensure failed"
-grep -q 'node ensure started conduit,link' "$RIG/node-first.out" || fail 7 "conduit/link start line missing"
+grep -q 'node ensure started conduit,link' "$RIG/node-first.out" || fail 7 "notifier/relay start line missing"
 grep -q 'crossSessionInbound.*accept' "$RIG/node-first.out.err" || fail 7 "accept setting instruction missing"
 [ ! -e "$FAKE_HOME/.claude/settings.json" ] || fail 7 "hook edited user settings"
 node_wait=0
@@ -264,18 +275,121 @@ while ! KHALA_RUNTIME_DIR=$LINK_HOME/runtime-root KHALA_TEST_BOOT_ID=plugin-test
     sleep 0.05
     node_wait=$((node_wait + 1))
 done
-[ "$node_wait" -lt 40 ] || fail 7 "conduit did not outlive SessionStart"
+[ "$node_wait" -lt 40 ] || fail 7 "notifier did not outlive SessionStart"
 node_wait=0
 while [ ! -f "$LINK_HOME/run/link.status" ] && [ "$node_wait" -lt 40 ]; do
     sleep 0.05
     node_wait=$((node_wait + 1))
 done
-[ "$node_wait" -lt 40 ] || fail 7 "link did not outlive SessionStart"
+[ "$node_wait" -lt 40 ] || fail 7 "relay did not outlive SessionStart"
 node_link_pid=$(sed -n 's/^pid \([0-9][0-9]*\)$/\1/p' "$LINK_HOME/run/link.status")
-kill -0 "$node_link_pid" 2>/dev/null || fail 7 "link status pid is not live"
+kill -0 "$node_link_pid" 2>/dev/null || fail 7 "relay status pid is not live"
+node_conduit_pid=$(sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p' "$LINK_HOME/runtime-root/conduit.status.json")
+node_own_group=$(ps -o pgid= -p "$$" | tr -d ' ')
+for node_pid in "$node_conduit_pid" "$node_link_pid"; do
+    node_group=$(ps -o pgid= -p "$node_pid" | tr -d ' ')
+    [ -n "$node_group" ] && [ "$node_group" != "$node_own_group" ] || \
+        fail 7 "daemon $node_pid was not detached into its own session"
+done
 run_start_without_env "$LINK_HOME" "$LINK_PROJECT" "$RIG/node-second.out" || fail 7 "second node ensure failed"
 grep -q 'node ensure started' "$RIG/node-second.out" && fail 7 "idempotent ensure started a duplicate"
-pass 7 "node ensure starts detached conduit/link processes and is idempotent"
+pass 7 "node ensure starts detached notifier/relay processes in their own sessions and is idempotent"
+
+# The service-manager choice under `auto`. Real systemctl/launchctl calls would
+# act on this host's own user services, so every call here lands on a
+# recording shim that shadows systemctl, launchctl, setsid and uname on PATH.
+MANAGER_SHIM=$RIG/manager-shim
+mkdir -p "$MANAGER_SHIM" || fail 7b "could not create manager shims"
+for manager_tool in systemctl launchctl setsid uname; do
+    cat > "$MANAGER_SHIM/$manager_tool" <<'EOF'
+#!/bin/sh
+manager_tool=$(basename "$0")
+printf '%s %s\n' "$manager_tool" "$*" >> "$KHALA_TEST_MANAGER_LOG"
+case "$manager_tool ${1-}" in
+    'systemctl --user') [ "${2-}" != show-environment ] || [ "$KHALA_TEST_USER_BUS" = 1 ] ;;
+    'launchctl bootstrap') exit "$KHALA_TEST_BOOTSTRAP_STATUS" ;;
+    'uname -s') printf '%s\n' "$KHALA_TEST_UNAME" ;;
+esac
+EOF
+    chmod 755 "$MANAGER_SHIM/$manager_tool" || fail 7b "could not create the $manager_tool shim"
+done
+SELECT_HOME=$RIG/select-home
+init_home "$SELECT_HOME"
+# select_manager CASE KHALA_SERVICE_MANAGER USER_BUS UNAME BOOTSTRAP_STATUS: one
+# `node ensure` in its own HOME; the shim calls land in $RIG/select-CASE.log.
+select_manager() {
+    mkdir -p "$RIG/select-$1-home" || fail 7b "could not create the $1 HOME"
+    : > "$RIG/select-$1.log"
+    HOME=$RIG/select-$1-home KHALA_HOME=$SELECT_HOME KHALA_RUNTIME_DIR=$SELECT_HOME/runtime-root \
+        KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_SERVICE_MANAGER=$2 \
+        KHALA_TEST_MANAGER_LOG=$RIG/select-$1.log KHALA_TEST_USER_BUS=$3 KHALA_TEST_UNAME=$4 \
+        KHALA_TEST_BOOTSTRAP_STATUS=$5 PATH=$MANAGER_SHIM:/usr/bin:/bin \
+        "$KHALA" node ensure > "$RIG/select-$1.out" 2> "$RIG/select-$1.err"
+}
+# Detached starts reach the setsid shim in the background, after ensure returns.
+wait_select_log() {
+    select_wait=0
+    while [ "$(wc -l < "$RIG/select-$1.log" | tr -d ' ')" -lt "$2" ] && [ "$select_wait" -lt 40 ]; do
+        sleep 0.05
+        select_wait=$((select_wait + 1))
+    done
+}
+select_uid=$(id -u)
+select_agents=$RIG/select-launchd-home/Library/LaunchAgents
+
+select_manager systemd auto 1 Linux 0 || fail 7b "systemd ensure failed: $(cat "$RIG/select-systemd.err")"
+printf '%s\n' 'systemctl --user show-environment' 'systemctl --user daemon-reload' \
+    'systemctl --user enable --now khala-conduit.service' \
+    'systemctl --user enable --now khala-link.service' > "$RIG/select-systemd.expected"
+cmp -s "$RIG/select-systemd.expected" "$RIG/select-systemd.log" || \
+    fail 7b "a live user bus did not select systemd: $(cat "$RIG/select-systemd.log")"
+[ -f "$RIG/select-systemd-home/.config/systemd/user/khala-conduit.service" ] && \
+    [ -f "$RIG/select-systemd-home/.config/systemd/user/khala-link.service" ] || \
+    fail 7b "systemd units were not written"
+grep -q 'node ensure started conduit,link' "$RIG/select-systemd.out" || fail 7b "systemd start line missing"
+
+select_manager launchd auto 0 Darwin 0 || fail 7b "launchd ensure failed: $(cat "$RIG/select-launchd.err")"
+printf '%s\n' 'systemctl --user show-environment' 'uname -s' \
+    "launchctl bootstrap gui/$select_uid $select_agents/dev.khala.conduit.plist" \
+    "launchctl bootstrap gui/$select_uid $select_agents/dev.khala.link.plist" > "$RIG/select-launchd.expected"
+cmp -s "$RIG/select-launchd.expected" "$RIG/select-launchd.log" || \
+    fail 7b "Darwin without a user bus did not select launchd: $(cat "$RIG/select-launchd.log")"
+[ -f "$select_agents/dev.khala.conduit.plist" ] && [ -f "$select_agents/dev.khala.link.plist" ] || \
+    fail 7b "LaunchAgents were not written"
+
+# A label that is already loaded refuses bootstrap; ensure restarts it instead.
+select_agents=$RIG/select-loaded-home/Library/LaunchAgents
+select_manager loaded auto 0 Darwin 5 || fail 7b "loaded-label ensure failed: $(cat "$RIG/select-loaded.err")"
+printf '%s\n' 'systemctl --user show-environment' 'uname -s' \
+    "launchctl bootstrap gui/$select_uid $select_agents/dev.khala.conduit.plist" \
+    "launchctl kickstart -k gui/$select_uid/dev.khala.conduit" \
+    "launchctl bootstrap gui/$select_uid $select_agents/dev.khala.link.plist" \
+    "launchctl kickstart -k gui/$select_uid/dev.khala.link" > "$RIG/select-loaded.expected"
+cmp -s "$RIG/select-loaded.expected" "$RIG/select-loaded.log" || \
+    fail 7b "a loaded label was not kickstarted: $(cat "$RIG/select-loaded.log")"
+
+select_manager detached auto 0 Linux 0 || fail 7b "detached ensure failed: $(cat "$RIG/select-detached.err")"
+wait_select_log detached 4
+{
+    printf '%s\n' 'systemctl --user show-environment' 'uname -s'
+    printf 'setsid sh -c KHALA_HOME=$1; export KHALA_HOME; "$2" %s </dev/null >>"$3" 2>&1 & sh %s %s %s\n' \
+        conduit "$SELECT_HOME" "$SELECT_HOME/bin/khala-link" "$SELECT_HOME/log/conduit.log" \
+        link "$SELECT_HOME" "$KHALA" "$SELECT_HOME/log/link.log"
+} | sort > "$RIG/select-detached.expected"
+sort "$RIG/select-detached.log" | cmp -s "$RIG/select-detached.expected" - || \
+    fail 7b "no user bus and no launchd did not detach both daemons: $(cat "$RIG/select-detached.log")"
+
+# An explicit choice is taken as given: no probe, even where both would answer.
+select_manager explicit detached 1 Darwin 0 || fail 7b "explicit ensure failed: $(cat "$RIG/select-explicit.err")"
+wait_select_log explicit 2
+[ "$(grep -c '^setsid sh -c ' "$RIG/select-explicit.log")" -eq 2 ] && \
+    ! grep -qv '^setsid ' "$RIG/select-explicit.log" || \
+    fail 7b "explicit detached still probed or used a manager: $(cat "$RIG/select-explicit.log")"
+
+select_manager unknown launchctl 1 Darwin 0 && fail 7b "an unknown KHALA_SERVICE_MANAGER was accepted"
+grep -q 'KHALA_SERVICE_MANAGER' "$RIG/select-unknown.err" || fail 7b "unknown-manager refusal was unclear"
+[ ! -s "$RIG/select-unknown.log" ] || fail 7b "an unknown manager still ran: $(cat "$RIG/select-unknown.log")"
+pass 7b "auto picks systemd, else launchd (kickstarting a loaded label), else detached; explicit skips the probe; unknown is refused"
 
 STOP_HOME=$RIG/stop-home
 STOP_PROJECT=$RIG/stop-session
@@ -288,13 +402,13 @@ HOME=$FAKE_HOME KHALA_HOME=$STOP_HOME CLAUDE_PROJECT_DIR=$STOP_PROJECT KHALA_SES
     > "$RIG/stop-active.out" 2> "$RIG/stop-active.err" || fail 8 "active Stop exited nonzero"
 [ ! -s "$RIG/stop-active.out" ] && [ ! -s "$RIG/stop-active.err" ] || \
     fail 8 "recursive Stop was not silent"
-[ ! -e "$STOP_HOME/run/turns/stop-session" ] || fail 8 "recursive Stop wrote a turn stamp"
+[ ! -e "$STOP_HOME/run/turns/stop-session" ] || fail 8 "recursive Stop wrote a turn marker"
 run_stop_without_env "$STOP_HOME" "$NO_ID_PROJECT" '{"stop_hook_active":false}' "$RIG/stop-no-id.out" || \
     fail 8 "no-identity Stop exited nonzero"
 [ ! -s "$RIG/stop-no-id.out" ] && [ ! -s "$RIG/stop-no-id.out.err" ] || \
     fail 8 "basename-only Stop was not silent"
 [ ! -d "$STOP_HOME/run/turns" ] || \
-    [ -z "$(find "$STOP_HOME/run/turns" -type f -print -quit)" ] || fail 8 "no-identity Stop wrote a turn stamp"
+    [ -z "$(find "$STOP_HOME/run/turns" -type f -print -quit)" ] || fail 8 "no-identity Stop wrote a turn marker"
 mkdir -p "$STOP_HOME/run/watch.stop-session.lock.d"
 stop_now=$(date +%s) || fail 8 "could not read Stop epoch"
 printf '%s\npid 5252 watch\n30\n' "$stop_now" > "$STOP_HOME/run/watch.stop-session.lock.d/owner"
@@ -307,13 +421,13 @@ stop_finished=$(date +%s%N) || fail 8 "could not read Stop finish time"
 stop_elapsed_ms=$(((stop_finished - stop_started) / 1000000))
 [ "$stop_elapsed_ms" -lt 1000 ] || fail 8 "Stop took ${stop_elapsed_ms}ms, want <1000ms"
 STOP_STAMP=$STOP_HOME/run/turns/stop-session
-[ -f "$STOP_STAMP" ] && [ ! -L "$STOP_STAMP" ] || fail 8 "valid Stop did not write a regular turn stamp"
+[ -f "$STOP_STAMP" ] && [ ! -L "$STOP_STAMP" ] || fail 8 "valid Stop did not write a regular turn marker"
 stop_first=$(sed -n 's/^turn 1 \([0-9][0-9]*\)$/\1/p' "$STOP_STAMP")
 [ -n "$stop_first" ] && [ "$(wc -l < "$STOP_STAMP" | tr -d ' ')" -eq 1 ] || \
-    fail 8 "turn stamp grammar differs: $(tr '\n' ' ' < "$STOP_STAMP")"
-[ "$(stat -c %a "$STOP_STAMP")" = 600 ] || fail 8 "turn stamp mode is not 0600"
-[ "$(stat -c %a "$STOP_HOME/run")" = 700 ] || fail 8 "run mode is not 0700"
-[ "$(stat -c %a "$STOP_HOME/run/turns")" = 700 ] || fail 8 "turns mode is not 0700"
+    fail 8 "turn marker grammar differs: $(tr '\n' ' ' < "$STOP_STAMP")"
+[ "$(file_mode "$STOP_STAMP")" = 600 ] || fail 8 "turn marker mode is not 0600"
+[ "$(file_mode "$STOP_HOME/run")" = 700 ] || fail 8 "run mode is not 0700"
+[ "$(file_mode "$STOP_HOME/run/turns")" = 700 ] || fail 8 "turns mode is not 0700"
 while [ "$(date +%s)" -le "$stop_first" ]; do
     sleep 0.05
 done
@@ -323,7 +437,7 @@ run_stop_without_env "$STOP_HOME" "$STOP_PROJECT" '{"stop_hook_active":false}' "
     fail 8 "second Stop was not silent"
 stop_second=$(sed -n 's/^turn 1 \([0-9][0-9]*\)$/\1/p' "$STOP_STAMP")
 [ "$stop_second" -gt "$stop_first" ] || fail 8 "second Stop did not overwrite with a newer epoch"
-pass 8 "Stop stamps the resolved identity in ${stop_elapsed_ms}ms and suppresses recursive/unresolved writes"
+pass 8 "Stop writes a turn marker for the resolved identity in ${stop_elapsed_ms}ms and suppresses recursive/unresolved writes"
 
 END_HOME=$RIG/end-home
 END_PROJECT=$RIG/end-session
@@ -359,8 +473,8 @@ HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME KHALA_RUNTIME_DIR=$COLLIDE_HOME/runtime
 grep -q 'you are not the receiver of collide' "$RIG/collide-other.out" || \
     fail 10 "non-receiver warning missing"
 [ "$(count_files "$COLLIDE_HOME/inbox/collide/new")" -eq 1 ] || \
-    fail 10 "non-owner hook drained a letter"
-pass 10 "duplicate identity warns loudly and non-owner drain moves nothing"
+    fail 10 "non-owner hook read a message"
+pass 10 "duplicate identity warns loudly and non-owner inbox read moves nothing"
 
 for audit_script in "$ROOT/plugin/hooks/lib.sh" "$START" "$STOP" "$END"; do
     bash -n "$audit_script" || fail 11 "bash syntax failed: $audit_script"
@@ -481,7 +595,7 @@ run_start_home "$CLI_LINK" "$RIG/cli-symlink-same.out" || fail 13 "identical-sym
 grep -q 'CLI' "$RIG/cli-symlink-same.out" && fail 13 "identical symlink still warned"
 pass 13 "CLI self-install: fresh installs, receipted forward updates only, manual copies and symlinks stay untouched"
 
-# An outer driver (minds T1) that has already run every legacy suite once can
+# An outer driver (minds.sh T1) that has already run every legacy suite once can
 # skip this recursive re-run; nested duplicate load flaked three distinct
 # suites on loaded hosts without ever reproducing standalone.
 if [ "${PLUGIN_SKIP_REGRESSION-}" = 1 ]; then
@@ -499,15 +613,15 @@ for regression_suite in local-roundtrip exchange-roundtrip hardening concurrency
     grep -q '^RESULT: PASS$' "$RIG/$regression_suite.out" || \
         fail 12 "$regression_suite omitted RESULT: PASS"
 done
-if [ -x "$HOME/go-toolchain/bin/go" ]; then
-    if ! bash "$ROOT/test/link.sh" > "$RIG/link.out" 2>&1; then
+if [ -x "$GO" ]; then
+    if ! GO_BINARY=$GO bash "$ROOT/test/link.sh" > "$RIG/link.out" 2>&1; then
         cat "$RIG/link.out"
-        fail 12 "link failed"
+        fail 12 "link.sh failed"
     fi
     cat "$RIG/link.out"
-    grep -q '^RESULT: PASS$' "$RIG/link.out" || fail 12 "link omitted RESULT: PASS"
+    grep -q '^RESULT: PASS$' "$RIG/link.out" || fail 12 "link.sh omitted RESULT: PASS"
 else
-    printf 'SKIP link — Go toolchain missing at %s/go-toolchain/bin/go\n' "$HOME"
+    printf 'SKIP link — Go toolchain is not an executable path: %s\n' "$GO"
 fi
 pass 12 "all available existing suites pass unchanged"
 

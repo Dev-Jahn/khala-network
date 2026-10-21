@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
 RIG=$HOME/.khala-ears-test-$$
 FAILURES=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -94,14 +95,14 @@ property_c1() {
     KHALA_HOME=$home "$KHALA" presence --watchers >"$RIG/c1-watchers.out" \
         2>"$RIG/c1-watchers.err" || die "presence --watchers failed"
     KHALA_HOME=$home "$KHALA" watcher list >"$RIG/c1-watcher-list.out" \
-        2>"$RIG/c1-watcher-list.err" || die "watcher list failed"
+        2>"$RIG/c1-watcher-list.err" || die "watchdog list failed"
     KHALA_HOME=$home "$KHALA" minds >"$RIG/c1-minds.out" \
-        2>"$RIG/c1-minds.err" || die "minds failed"
+        2>"$RIG/c1-minds.err" || die "status board failed"
     KHALA_HOME=$home "$KHALA" reconcile >"$RIG/c1-reconcile.out" \
         2>"$RIG/c1-reconcile.err" || die "reconcile failed"
 
     grep -q '^conduit@' "$RIG/c1-presence.out" && die ".ear leaked into presence"
-    grep -q '^conduit@' "$RIG/c1-minds.out" && die ".ear leaked into minds"
+    grep -q '^conduit@' "$RIG/c1-minds.out" && die ".ear leaked into status board"
     grep -q $'^extra@alpha\t.*\tyes$' "$RIG/c1-presence.out" ||
         die "unknown identity key was not accepted"
     for bad in bad huge lines missing duplicate long mismatch; do
@@ -109,7 +110,7 @@ property_c1() {
         warning_once "$RIG/c1-minds.err" "$home/presence/conduit@$bad.ear" || return 1
     done
     [ ! -s "$RIG/c1-watchers.err" ] || die "watchers-only read .ear files"
-    [ ! -s "$RIG/c1-watcher-list.err" ] || die "watcher list read .ear files"
+    [ ! -s "$RIG/c1-watcher-list.err" ] || die "watchdog list read .ear files"
     ! grep -Fq 'foo@beta.ear' "$RIG/c1-presence.err" || die "wrong basename warned"
     [ ! -s "$RIG/c1-reconcile.err" ] ||
         die "reconcile parsed or rejected .ear: $(tr '\n' ' ' < "$RIG/c1-reconcile.err")"
@@ -141,7 +142,7 @@ property_c2() {
     KHALA_HOME=$home "$KHALA" presence >"$RIG/c2-presence.out" \
         2>"$RIG/c2-presence.err" || die "presence failed"
     KHALA_HOME=$home "$KHALA" minds >"$RIG/c2-minds.out" \
-        2>"$RIG/c2-minds.err" || die "minds failed"
+        2>"$RIG/c2-minds.err" || die "status board failed"
     for output in "$RIG/c2-presence.out" "$RIG/c2-minds.out"; do
         grep -q $'^socket@alpha\t.*\tyes\t\|^socket@alpha\t.*\tyes$' "$output" ||
             die "fresh socket route is not watching in $output"
@@ -154,13 +155,13 @@ property_c2() {
         grep -q $'^unknown@partial\t.*\t?\t\|^unknown@partial\t.*\t?$' "$output" ||
             die "truncated missing identity is not unknown in $output"
         grep -q $'^stale@gamma\t.*\t-\t\|^stale@gamma\t.*\t-$' "$output" ||
-            die "stale ear is watching in $output"
+            die "stale listener snapshot is watching in $output"
         grep -q $'^future@delta\t.*\t-\t\|^future@delta\t.*\t-$' "$output" ||
-            die "clock-ahead ear is watching in $output"
+            die "clock-ahead listener snapshot is watching in $output"
         grep -q $'^stop@omega\t.*\t-\t\|^stop@omega\t.*\t-$' "$output" ||
-            die "stopping ear is watching in $output"
+            die "stopping listener snapshot is watching in $output"
         grep -q $'^clamp@sigma\t.*\t-\t\|^clamp@sigma\t.*\t-$' "$output" ||
-            die "interval 86400 was not clamped: 2h-old ear is watching in $output"
+            die "interval 86400 was not clamped: 2h-old listener snapshot is watching in $output"
     done
     grep -Fq '.ear = 노드 conduit이 듣는 중' "$RIG/c2-presence.out" ||
         die "presence legend lacks the .ear clause"
@@ -189,10 +190,10 @@ property_c2() {
         "$KHALA" presence >"$RIG/c2-hot.out" 2>"$RIG/c2-hot.err" ||
         die "instrumented presence failed"
     [ "$(grep -c '^stat ' "$RIG/c2-forks")" -eq 0 ] ||
-        die "ear reading forked stat"
+        die "listener snapshot reading forked stat"
     [ "$(grep -c '^wc ' "$RIG/c2-forks")" -eq 0 ] ||
-        die "ear identity parsing forked wc"
-    ! grep -Fq '.ear' "$RIG/c2-forks" || die "ear reading added an external command"
+        die "listener snapshot identity parsing forked wc"
+    ! grep -Fq '.ear' "$RIG/c2-forks" || die "listener snapshot reading added an external command"
     sed 's/^retention-interval 0$/retention-interval 300/' "$hot/config" \
         > "$hot/tmp/config.c2"
     mv "$hot/tmp/config.c2" "$hot/config"
@@ -202,7 +203,7 @@ property_c2() {
         "$KHALA" reconcile >"$RIG/c2-reconcile.out" 2>"$RIG/c2-reconcile.err" ||
         die "instrumented non-retention reconcile failed"
     ! grep -Fq '.ear' "$RIG/c2-forks" ||
-        die "non-retention reconcile statted an ear snapshot"
+        die "non-retention reconcile statted a listener snapshot"
 }
 
 property_c3() {
@@ -218,9 +219,9 @@ property_c3() {
     touch -d 'next hour' "$fresh" || die "fresh touch failed"
     KHALA_HOME=$home "$KHALA" reconcile >"$RIG/c3.out" 2>"$RIG/c3.err" ||
         die "retention reconcile failed"
-    [ ! -e "$old" ] || die "aged ear survived retain 0"
-    [ -f "$fresh" ] || die "fresh ear was pruned"
-    ! grep -Fq "$old" "$RIG/c3.err" || die "malformed ear became a sync_error"
+    [ ! -e "$old" ] || die "aged listener snapshot survived retain 0"
+    [ -f "$fresh" ] || die "fresh listener snapshot was pruned"
+    ! grep -Fq "$old" "$RIG/c3.err" || die "malformed listener snapshot became a sync_error"
 }
 
 write_letter() {
@@ -246,23 +247,23 @@ assert_stamp_matches_summary() {
     summary=$(sed -n 's/^drained: letters \([0-9][0-9]*\), notices \([0-9][0-9]*\), streams \([0-9][0-9]*\)$/\1 \2 \3/p' "$output")
     IFS=' ' read -r stamp_magic stamp_version stamp_epoch stamp_before stamp_after \
         stamp_ring stamp_info stamp_streams stamp_status stamp_extra < "$stamp"
-    [ -n "$summary" ] || die "drain summary missing"
+    [ -n "$summary" ] || die "inbox read summary missing"
     IFS=' ' read -r summary_letters summary_notices summary_streams <<EOF
 $summary
 EOF
-    [ "$stamp_ring" -ge "$summary_letters" ] || die "stamp ring count omits letters"
+    [ "$stamp_ring" -ge "$summary_letters" ] || die "inbox-read marker ring count omits messages"
     [ "$((stamp_ring - summary_letters + stamp_info))" -eq "$summary_notices" ] ||
-        die "stamp ring/info counts do not match notice summary"
-    [ "$stamp_streams" = "$summary_streams" ] || die "stamp stream count differs"
-    [ "$stamp_magic $stamp_version" = 'drain 1' ] || die "stamp preamble invalid"
-    case "$stamp_epoch" in ''|*[!0-9]*) die "stamp epoch invalid" ;; esac
+        die "inbox-read marker ring/info counts do not match alert summary"
+    [ "$stamp_streams" = "$summary_streams" ] || die "inbox-read marker stream count differs"
+    [ "$stamp_magic $stamp_version" = 'drain 1' ] || die "inbox-read marker preamble invalid"
+    case "$stamp_epoch" in ''|*[!0-9]*) die "inbox-read marker epoch invalid" ;; esac
     case "$stamp_before:$stamp_after" in
         -:-|[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]:*) ;;
-        *) die "stamp generation invalid" ;;
+        *) die "inbox-read marker generation invalid" ;;
     esac
-    case "$stamp_status" in ok|partial) ;; *) die "stamp status invalid" ;; esac
-    [ -z "${stamp_extra-}" ] || die "stamp has extra tokens"
-    [ "$(wc -l < "$stamp" | tr -d ' ')" -eq 1 ] || die "stamp is not one line"
+    case "$stamp_status" in ok|partial) ;; *) die "inbox-read marker status invalid" ;; esac
+    [ -z "${stamp_extra-}" ] || die "inbox-read marker has extra tokens"
+    [ "$(wc -l < "$stamp" | tr -d ' ')" -eq 1 ] || die "inbox-read marker is not one line"
 }
 
 property_c4() {
@@ -271,45 +272,45 @@ property_c4() {
     stamp=$home/run/drained/reader
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox list >/dev/null ||
         die "list failed"
-    [ ! -e "$stamp" ] || die "list created stamp"
+    [ ! -e "$stamp" ] || die "list created inbox-read marker"
     write_letter "$home/inbox/reader/new/1.1.1.sender@beta" \
-        1.1.1.sender@beta message || die "letter fixture failed"
+        1.1.1.sender@beta message || die "message fixture failed"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain --mail-only \
-        >"$RIG/c4-mail.out" 2>"$RIG/c4-mail.err" || die "mail-only drain failed"
+        >"$RIG/c4-mail.out" 2>"$RIG/c4-mail.err" || die "mail-only inbox read failed"
     assert_stamp_matches_summary "$stamp" "$RIG/c4-mail.out" || return 1
-    grep -Eq '^drain 1 [0-9]+ - - 1 0 0 ok$' "$stamp" || die "mail-only stamp differs"
+    grep -Eq '^drain 1 [0-9]+ - - 1 0 0 ok$' "$stamp" || die "mail-only inbox-read marker differs"
     stamp_before=$(stat -c %Y "$stamp")
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox read 1.1.1.sender@beta >/dev/null ||
         die "read failed"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox list >/dev/null ||
         die "second list failed"
-    [ "$(stat -c %Y "$stamp")" = "$stamp_before" ] || die "read/list touched stamp"
+    [ "$(stat -c %Y "$stamp")" = "$stamp_before" ] || die "read/list touched inbox-read marker"
 
     write_letter "$home/inbox/reader/new/2.1.1.sender@beta" \
-        2.1.1.sender@beta notice || die "notice fixture failed"
+        2.1.1.sender@beta notice || die "alert fixture failed"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain --notices-only \
-        >"$RIG/c4-notice.out" 2>"$RIG/c4-notice.err" || die "notices-only drain failed"
+        >"$RIG/c4-notice.out" 2>"$RIG/c4-notice.err" || die "notices-only inbox read failed"
     assert_stamp_matches_summary "$stamp" "$RIG/c4-notice.out" || return 1
-    grep -Eq '^drain 1 [0-9]+ - - 0 1 0 ok$' "$stamp" || die "notices-only stamp differs"
+    grep -Eq '^drain 1 [0-9]+ - - 0 1 0 ok$' "$stamp" || die "notices-only inbox-read marker differs"
 
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/c4-empty.out" 2>"$RIG/c4-empty.err" || die "empty drain failed"
+        >"$RIG/c4-empty.out" 2>"$RIG/c4-empty.err" || die "empty inbox read failed"
     assert_stamp_matches_summary "$stamp" "$RIG/c4-empty.out" || return 1
-    grep -Eq '^drain 1 [0-9]+ - - 0 0 0 ok$' "$stamp" || die "empty drain differs"
+    grep -Eq '^drain 1 [0-9]+ - - 0 0 0 ok$' "$stamp" || die "empty inbox read differs"
 
     generation=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     mkdir -p "$home/bin"
     printf '%s\n' '#!/bin/sh' "printf '$generation 2 1\\n'" > "$home/bin/khala-link"
     chmod 755 "$home/bin/khala-link"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/c4-generation.out" 2>"$RIG/c4-generation.err" || die "generation drain failed"
+        >"$RIG/c4-generation.out" 2>"$RIG/c4-generation.err" || die "generation inbox read failed"
     grep -Eq "^drain 1 [0-9]+ $generation $generation 0 0 0 ok$" "$stamp" ||
         die "pending generation was not stamped"
     [ ! -s "$RIG/c4-generation.err" ] || die "generation query warned"
     printf '%s\n' '#!/bin/sh' 'exit 64' > "$home/bin/khala-link"
     chmod 755 "$home/bin/khala-link"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/c4-old.out" 2>"$RIG/c4-old.err" || die "old binary drain failed"
+        >"$RIG/c4-old.out" 2>"$RIG/c4-old.err" || die "old binary inbox read failed"
     grep -Eq '^drain 1 [0-9]+ - - 0 0 0 ok$' "$stamp" || die "old binary did not yield dash generations"
     [ ! -s "$RIG/c4-old.err" ] || die "old binary warning was noisy"
     rm -f "$home/bin/khala-link"
@@ -323,9 +324,9 @@ property_c4() {
     chmod 755 "$shim/sleep"
     if PATH=$shim:/usr/bin:/bin KHALA_HOME=$home KHALA_SESSION=reader \
         "$KHALA" inbox --drain >"$RIG/c4-lock.out" 2>"$RIG/c4-lock.err"; then
-        die "locked drain succeeded"
+        die "locked inbox read succeeded"
     fi
-    [ "$(cat "$stamp")" = 'drain 1 1 - - 2 3 4 ok' ] || die "failed drain changed stamp"
+    [ "$(cat "$stamp")" = 'drain 1 1 - - 2 3 4 ok' ] || die "failed inbox read changed inbox-read marker"
 
     rm -f "$home/run/brain.lock.d/owner"
     rmdir "$home/run/brain.lock.d" || die "lock fixture cleanup failed"
@@ -347,10 +348,10 @@ property_c4() {
     if MV_COUNT=$RIG/c4-mv-count PATH=$partial_shim:/usr/bin:/bin KHALA_HOME=$home \
         KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/c4-partial.out" \
         2>"$RIG/c4-partial.err"; then
-        die "partially failed drain succeeded"
+        die "partially failed inbox read succeeded"
     fi
     grep -Eq '^drain 1 [0-9]+ - - 1 0 0 partial$' "$stamp" ||
-        die "partial drain did not stamp committed counts"
+        die "partial inbox read did not record committed counts"
     partial_moved=0
     for partial_file in "$home"/inbox/reader/cur/[34].*; do
         [ -f "$partial_file" ] || continue
@@ -362,8 +363,8 @@ property_c4() {
 property_c5() {
     spoke=$RIG/c5-alpha
     mailbox=$RIG/c5-b200
-    init_home "$spoke" alpha || die "spoke init failed"
-    init_home "$mailbox" b200 || die "mailbox init failed"
+    init_home "$spoke" alpha || die "downstream node init failed"
+    init_home "$mailbox" b200 || die "upstream init failed"
     {
         printf 'self alpha\n'
         printf 'peer alpha %s\n' "$spoke"
@@ -377,7 +378,7 @@ property_c5() {
     KHALA_HOME=$spoke "$KHALA" sync >"$RIG/c5.out" 2>"$RIG/c5.err" ||
         die "local-path exchange failed: $(tr '\n' ' ' < "$RIG/c5.err")"
     cmp -s "$spoke/presence/conduit@alpha.ear" \
-        "$mailbox/presence/conduit@alpha.ear" || die "ear was not pushed by rsync fallback"
+        "$mailbox/presence/conduit@alpha.ear" || die "listener snapshot was not pushed by rsync fallback"
 
     incoming=$mailbox/presence/conduit@beta.ear
     existing=$spoke/presence/conduit@beta.ear
@@ -420,7 +421,7 @@ property_c5() {
         [ -f "$quarantine_file" ] || continue
         quarantine_count=$((quarantine_count + 1))
     done
-    [ "$quarantine_count" -le 8 ] || die "ear quarantine retained more than eight files"
+    [ "$quarantine_count" -le 8 ] || die "listener snapshot quarantine retained more than eight files"
 
     write_ear "$incoming" beta 21 "$now" 60 running yes
     install_started=$(date +%s)
@@ -484,7 +485,7 @@ property_c6() {
 
     printf '%s\n1\nhuman@alpha\n0\nactive\n%s\n' "$(date +%s)" "$(date +%s)" \
         > "$home/presence/operator@alpha.watcher"
-    KHALA_HOME=$home "$KHALA" watcher retire operator >/dev/null || die "reserved watcher cleanup failed"
+    KHALA_HOME=$home "$KHALA" watcher retire operator >/dev/null || die "reserved watchdog cleanup failed"
     KHALA_HOME=$home "$KHALA" retire conduit >/dev/null || die "reserved session cleanup failed"
 
     now=$(date +%s) || die "date failed"
@@ -532,14 +533,14 @@ property_c7() {
     } > "$home/spool/for/alpha/$id"
     KHALA_HOME=$home "$KHALA" reconcile >"$RIG/c7-reconcile.out" \
         2>"$RIG/c7-reconcile.err" || die "operator reconcile failed"
-    [ -f "$home/inbox/reader/new/$id" ] || die "operator envelope was not delivered"
+    [ -f "$home/inbox/reader/new/$id" ] || die "operator message was not delivered"
     set -- "$home"/spool/for/beta/*
-    [ -f "$1" ] || die "operator envelope did not create ack"
+    [ -f "$1" ] || die "operator message did not create ack"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        >"$RIG/c7-drain.out" 2>"$RIG/c7-drain.err" || die "operator drain failed"
-    [ -f "$home/inbox/reader/cur/$id" ] || die "operator envelope was not drained"
+        >"$RIG/c7-drain.out" 2>"$RIG/c7-drain.err" || die "operator inbox read failed"
+    [ -f "$home/inbox/reader/cur/$id" ] || die "operator message was not read"
     grep -Fq 'Type: operator' "$RIG/c7-drain.out" || die "operator Type was not printed"
-    [ "$(grep -c '^Auth: ' "$RIG/c7-drain.out")" -eq 1 ] || die "operator drain output lacks exactly one Auth line"
+    [ "$(grep -c '^Auth: ' "$RIG/c7-drain.out")" -eq 1 ] || die "operator inbox read output lacks exactly one Auth line"
     grep -Fqx 'Auth: unverified' "$RIG/c7-drain.out" || die "operator Auth line is not unverified"
     awk 'BEGIN{h=1} /^--- letter /{h=1;next} h && /^$/{h=0} h && /^Auth: /{found=1} END{exit found?0:1}' \
         "$RIG/c7-drain.out" || die "Auth line is not inside the header block"
@@ -554,11 +555,11 @@ property_c7() {
     fi
     [ "$(grep -c '^khala: .*Auth 헤더' "$RIG/c7-forged.err")" -eq 1 ] ||
         die "incoming Auth header did not yield one sync_error"
-    [ ! -f "$home/inbox/reader/new/$forged" ] || die "forged Auth envelope was delivered"
+    [ ! -f "$home/inbox/reader/new/$forged" ] || die "forged Auth message was delivered"
     set -- "$home"/spool/dead/*"$forged"*
-    [ -f "$1" ] || die "forged Auth envelope was not quarantined"
+    [ -f "$1" ] || die "forged Auth message was not quarantined"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/c7-drain2.out" 2>/dev/null || :
-    grep -Fq 'forged body' "$RIG/c7-drain2.out" && die "forged Auth envelope reached drain output"
+    grep -Fq 'forged body' "$RIG/c7-drain2.out" && die "forged Auth message reached inbox read output"
 
     n=3
     for lookalike in 'Auth:verified abc' 'auth: verified abc' 'Auth : verified abc'; do
@@ -587,9 +588,9 @@ property_c7() {
     fi
     [ "$(grep -c '^khala: .*중복 제어 헤더' "$RIG/c7-duplicate.err")" -eq 1 ] ||
         die "duplicate control headers did not yield one sync_error"
-    [ ! -f "$home/inbox/reader/new/$duplicate" ] || die "duplicate envelope was delivered"
+    [ ! -f "$home/inbox/reader/new/$duplicate" ] || die "duplicate header block was delivered"
     set -- "$home"/spool/dead/*"$duplicate"*
-    [ -f "$1" ] || die "duplicate envelope was not quarantined"
+    [ -f "$1" ] || die "duplicate header block was not quarantined"
 }
 
 property_c8() {
@@ -629,13 +630,13 @@ run_property() {
 }
 
 mkdir -p "$RIG" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property C1 '.ear files are isolated, bounded, and forward-compatible' property_c1
-run_property C2 'WATCHING unions fresh direct watches with fresh conduit routes' property_c2
+run_property C2 'WATCHING unions fresh direct watches with fresh notifier routes' property_c2
 run_property C3 '.ear retention uses only mtime and never parses snapshots' property_c3
-run_property C4 'drains atomically stamp epoch and summary counts only after lock success' property_c4
-run_property C5 'rsync fallback pushes the local-node .ear snapshot' property_c5
+run_property C4 'reads the inbox and atomically records epoch and summary counts only after lock success' property_c4
+run_property C5 'rsync fallback pushes the local-node listener snapshot' property_c5
 run_property C6 'reserved identities are refused by writers and hidden by readers' property_c6
 run_property C7 'operator envelopes deliver and duplicate control headers quarantine' property_c7
 run_property C8 'dashboard execs khala-link with verbatim arguments' property_c8

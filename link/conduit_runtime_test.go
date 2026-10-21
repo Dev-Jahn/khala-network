@@ -39,19 +39,19 @@ func (b *lockedLogBuffer) String() string {
 	return b.b.String()
 }
 
-type conduitFixture struct {
+type notifierFixture struct {
 	t          *testing.T
 	home       string
 	runtime    string
 	registry   string
 	bootID     string
 	logs       *lockedLogBuffer
-	conduit    *conduit
+	notifier   *notifier
 	listeners  []net.Listener
 	deliveries map[string]*atomic.Int64
 }
 
-func newConduitFixture(t *testing.T) *conduitFixture {
+func newNotifierFixture(t *testing.T) *notifierFixture {
 	t.Helper()
 	root, err := os.MkdirTemp(os.Getenv("HOME"), ".kct-")
 	if err != nil {
@@ -77,19 +77,22 @@ func newConduitFixture(t *testing.T) *conduitFixture {
 	t.Setenv("KHALA_RUNTIME_DIR", runtimeRoot)
 	t.Setenv("KHALA_TEST_BOOT_ID", "test-boot")
 	t.Setenv("KHALA_HOME", home)
+	// A suite run from inside a codex lane must not look like one.
+	t.Setenv("CODEX_THREAD_ID", "")
+	t.Setenv("KHALA_PARENT", "")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		t.Fatal(err)
 	}
 	logs := &lockedLogBuffer{}
-	f := &conduitFixture{
+	f := &notifierFixture{
 		t: t, home: home, runtime: runtimeRoot, registry: registry, bootID: "test-boot",
 		logs: logs, deliveries: make(map[string]*atomic.Int64),
 	}
-	f.conduit = &conduit{
+	f.notifier = &notifier{
 		home: home, runtime: runtimeRoot, bootID: f.bootID, self: "alpha",
 		logger: log.New(logs, "", 0), scanEvery: 10 * time.Second,
-		backoff: []time.Duration{time.Second}, degradeAt: 3, states: make(map[string]*conduitState),
+		backoff: []time.Duration{time.Second}, degradeAt: 3, states: make(map[string]*notifierState),
 		verificationReasons: make(map[string]string),
 		watcher:             watcher, watchedDir: make(map[string]struct{}),
 	}
@@ -106,8 +109,8 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms,80ms")
 	for _, route := range []string{"socket", "channel", "channel+socket"} {
 		t.Run(route, func(t *testing.T) {
-			f := newConduitFixture(t)
-			f.conduit.backoff = []time.Duration{time.Millisecond}
+			f := newNotifierFixture(t)
+			f.notifier.backoff = []time.Duration{time.Millisecond}
 			reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 			f.writeLease("ink", &reg, "owned", 3)
 			var channelDeliveries *atomic.Int64
@@ -118,18 +121,18 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 			lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
 
 			started := time.Now()
-			lettersStaged := 0
+			messagesStaged := 0
 			for time.Since(started) < 210*time.Millisecond {
-				lettersStaged++
-				id := fmt.Sprintf("1700000000.1.%d.sender@alpha", lettersStaged)
-				f.stageEnvelope("ink", id, "From: sender@alpha\nType: message\nSubject: coalesced\n\nbody\n")
-				f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+				messagesStaged++
+				id := fmt.Sprintf("1700000000.1.%d.sender@alpha", messagesStaged)
+				f.stageMessageData("ink", id, "From: sender@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+				f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 				time.Sleep(4 * time.Millisecond)
 			}
 
-			// The upper bound is the property under test: however many letters arrived, only
+			// The upper bound is the property under test: however many messages arrived, only
 			// the schedule may write frames. The lower bound only proves the schedule keeps
-			// going while nothing drains, so keep scanning (as the conduit loop would) until it
+			// going without an inbox read, so keep scanning (as the notifier loop would) until it
 			// has: under host load the 4 ms sleeps stretch and the 210 ms window alone may end
 			// before the fourth ladder step is due (measured 2026-09-07, 1 in 5 runs).
 			count := func() int64 {
@@ -140,7 +143,7 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 			}
 			var written int64
 			if !waitForTest(2*time.Second, func() bool {
-				f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+				f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 				written = count()
 				return written >= 5
 			}) {
@@ -149,7 +152,7 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 			written = count()
 			if written > 6 {
-				t.Fatalf("%d letters over 20 first-intervals wrote %d %s frames; want at most 6 from the schedule", lettersStaged, written, route)
+				t.Fatalf("%d letters over 20 first-intervals wrote %d %s frames; want at most 6 from the schedule", messagesStaged, written, route)
 			}
 			if route == "channel" {
 				if socket := f.deliveries[reg.InstanceID].Load(); socket != 0 {
@@ -169,14 +172,14 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 }
 
 func TestConduitScanHotPathCost(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	for i := 0; i < 40; i++ {
 		identity := fmt.Sprintf("scan%02d", i)
 		instance := fmt.Sprintf("instance%02d", i)
 		reg := f.addRegistration(identity, instance, "interactive", false, time.Now().Add(-time.Hour), 3)
 		f.writeLease(identity, &reg, "owned", 3)
 		if i < 10 {
-			f.stageEnvelope(identity, fmt.Sprintf("1700000000.1.%d.sender@alpha", i+1), "From: sender@alpha\nType: message\nSubject: scan\n\nbody\n")
+			f.stageMessageData(identity, fmt.Sprintf("1700000000.1.%d.sender@alpha", i+1), "From: sender@alpha\nType: message\nSubject: scan\n\nbody\n")
 		}
 	}
 	journalDir := filepath.Join(f.runtime, "deliveries", "scan00", "instance00")
@@ -194,18 +197,18 @@ func TestConduitScanHotPathCost(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	durations := make([]time.Duration, 101)
 	for i := range durations {
 		started := time.Now()
-		f.conduit.scan()
+		f.notifier.scan()
 		durations[i] = time.Since(started)
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	t.Logf("median scan: %s (40 identities, 10 pending, one with 200 journals)", durations[len(durations)/2])
 }
 
-func (f *conduitFixture) addRegistration(identity, instance, kind string, receiveOptIn bool, startedAt time.Time, epoch uint64) sessionRegistration {
+func (f *notifierFixture) addRegistration(identity, instance, kind string, receiveOptIn bool, startedAt time.Time, epoch uint64) sessionRegistration {
 	f.t.Helper()
 	socketPath := filepath.Join(f.runtime, instance+".sock")
 	listener, err := net.Listen("unix", socketPath)
@@ -251,7 +254,7 @@ func (f *conduitFixture) addRegistration(identity, instance, kind string, receiv
 	return reg
 }
 
-func (f *conduitFixture) addChannel(reg *sessionRegistration) *atomic.Int64 {
+func (f *notifierFixture) addChannel(reg *sessionRegistration) *atomic.Int64 {
 	f.t.Helper()
 	channelPath := filepath.Join(f.runtime, "channels", reg.InstanceID+".sock")
 	channel, err := net.Listen("unix", channelPath)
@@ -278,7 +281,7 @@ func (f *conduitFixture) addChannel(reg *sessionRegistration) *atomic.Int64 {
 	return deliveries
 }
 
-func (f *conduitFixture) writeLease(identity string, reg *sessionRegistration, state string, epoch uint64) {
+func (f *notifierFixture) writeLease(identity string, reg *sessionRegistration, state string, epoch uint64) {
 	f.t.Helper()
 	lease := identityLease{
 		BootID: f.bootID, Identity: identity, Epoch: epoch,
@@ -295,7 +298,7 @@ func (f *conduitFixture) writeLease(identity string, reg *sessionRegistration, s
 	}
 }
 
-func (f *conduitFixture) stageLetter(identity string) {
+func (f *notifierFixture) stageMessage(identity string) {
 	f.t.Helper()
 	dir := filepath.Join(f.home, "inbox", identity, "new")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -307,7 +310,7 @@ func (f *conduitFixture) stageLetter(identity string) {
 	}
 }
 
-func (f *conduitFixture) stageEnvelope(identity, id, content string) string {
+func (f *notifierFixture) stageMessageData(identity, id, content string) string {
 	f.t.Helper()
 	dir := filepath.Join(f.home, "inbox", identity, "new")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -340,85 +343,85 @@ func waitForTest(timeout time.Duration, condition func() bool) bool {
 	return condition()
 }
 
-func (f *conduitFixture) writeDrainStamp(identity string, at int64) {
-	f.writeDrainStampWithGenerations(identity, at, "-", "-")
+func (f *notifierFixture) writeInboxReadMarker(identity string, at int64) {
+	f.writeInboxReadMarkerWithDigests(identity, at, "-", "-")
 }
 
-func (f *conduitFixture) writeDrainStampWithGenerations(identity string, at int64, before, after string) {
+func (f *notifierFixture) writeInboxReadMarkerWithDigests(identity string, at int64, before, after string) {
 	f.t.Helper()
 	dir := filepath.Join(f.home, "run", "drained")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		f.t.Fatal(err)
 	}
-	stamp := fmt.Sprintf("drain 1 %d %s %s 0 0 0 ok\n", at, before, after)
-	if err := os.WriteFile(filepath.Join(dir, identity), []byte(stamp), 0600); err != nil {
+	readMarker := fmt.Sprintf("drain 1 %d %s %s 0 0 0 ok\n", at, before, after)
+	if err := os.WriteFile(filepath.Join(dir, identity), []byte(readMarker), 0600); err != nil {
 		f.t.Fatal(err)
 	}
 }
 
-func (f *conduitFixture) writeTurnStamp(identity string, at int64) {
+func (f *notifierFixture) writeTurnMarker(identity string, at int64) {
 	f.t.Helper()
 	dir := filepath.Join(f.home, "run", "turns")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		f.t.Fatal(err)
 	}
-	stamp := fmt.Sprintf("turn 1 %d\n", at)
-	if err := os.WriteFile(filepath.Join(dir, identity), []byte(stamp), 0600); err != nil {
+	readMarker := fmt.Sprintf("turn 1 %d\n", at)
+	if err := os.WriteFile(filepath.Join(dir, identity), []byte(readMarker), 0600); err != nil {
 		f.t.Fatal(err)
 	}
 }
 
 func TestConduitRewriteSchedule(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "")
-	for ring, want := range []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 320 * time.Minute} {
-		if got := conduitRewrittenAfter(ring + 1); got != want {
-			t.Fatalf("production ring %d delay=%s want %s", ring+1, got, want)
+	for notifiable, want := range []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, 80 * time.Minute, 160 * time.Minute, 320 * time.Minute, 320 * time.Minute} {
+		if got := notificationRetryAfter(notifiable + 1); got != want {
+			t.Fatalf("production ring %d delay=%s want %s", notifiable+1, got, want)
 		}
 	}
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "7ms")
-	for _, ring := range []int{1, 2, 20} {
-		if got := conduitRewrittenAfter(ring); got != 7*time.Millisecond {
-			t.Fatalf("single override ring %d delay=%s", ring, got)
+	for _, notifiable := range []int{1, 2, 20} {
+		if got := notificationRetryAfter(notifiable); got != 7*time.Millisecond {
+			t.Fatalf("single override ring %d delay=%s", notifiable, got)
 		}
 	}
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "5ms, 10ms, 20ms")
-	for ring, want := range []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond} {
-		if got := conduitRewrittenAfter(ring + 1); got != want {
-			t.Fatalf("list override ring %d delay=%s want %s", ring+1, got, want)
+	for notifiable, want := range []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond, 20 * time.Millisecond} {
+		if got := notificationRetryAfter(notifiable + 1); got != want {
+			t.Fatalf("list override ring %d delay=%s want %s", notifiable+1, got, want)
 		}
 	}
 }
 
 func TestConduitDrainResetsOutstandingLadder(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	drainAt := time.Now().Unix() + 60
-	f.writeDrainStamp("ink", drainAt)
-	f.stageEnvelope("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
+	inboxReadAt := time.Now().Unix() + 60
+	f.writeInboxReadMarker("ink", inboxReadAt)
+	f.stageMessageData("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame was not immediate")
 	}
-	f.conduit.statesMu.Lock()
-	firstDelay := f.conduit.states["ink"].nextAttempt.Sub(f.conduit.states["ink"].lastWritten)
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-	f.conduit.statesMu.Unlock()
+	f.notifier.statesMu.Lock()
+	firstDelay := f.notifier.states["ink"].nextAttempt.Sub(f.notifier.states["ink"].lastWritten)
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.notifier.statesMu.Unlock()
 	if firstDelay != 10*time.Millisecond {
 		t.Fatalf("first outstanding delay=%s want 10ms", firstDelay)
 	}
 
-	f.stageEnvelope("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
-	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	f.stageMessageData("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+	f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
 		t.Fatal("scheduled coalesced frame was not written")
 	}
-	f.conduit.statesMu.Lock()
-	secondDelay := f.conduit.states["ink"].nextAttempt.Sub(f.conduit.states["ink"].lastWritten)
-	f.conduit.statesMu.Unlock()
+	f.notifier.statesMu.Lock()
+	secondDelay := f.notifier.states["ink"].nextAttempt.Sub(f.notifier.states["ink"].lastWritten)
+	f.notifier.statesMu.Unlock()
 	if secondDelay != 20*time.Millisecond {
 		t.Fatalf("second outstanding delay=%s want 20ms", secondDelay)
 	}
@@ -437,90 +440,90 @@ func TestConduitDrainResetsOutstandingLadder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	generationBeforeDrain := letterGeneration(f.conduit.pending("ink"))
-	f.writeDrainStampWithGenerations("ink", drainAt, generationBeforeDrain, "-")
-	f.stageEnvelope("ink", "1700000000.1.3.sender@alpha", "From: carol@alpha\nType: message\nSubject: after-drain\n\nbody\n")
+	digestBeforeInboxRead := queueDigest(f.notifier.pending("ink"))
+	f.writeInboxReadMarkerWithDigests("ink", inboxReadAt, digestBeforeInboxRead, "-")
+	f.stageMessageData("ink", "1700000000.1.3.sender@alpha", "From: carol@alpha\nType: message\nSubject: after-drain\n\nbody\n")
 	if !waitForTest(time.Second, func() bool {
-		f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+		f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 		return f.deliveries[reg.InstanceID].Load() == 3
 	}) {
 		t.Fatal("generation after drain did not ring within the failure-backoff spacing")
 	}
-	f.conduit.statesMu.Lock()
-	reset := *f.conduit.states["ink"]
-	f.conduit.statesMu.Unlock()
-	if reset.outstandingRings != 1 || reset.nextAttempt.Sub(reset.lastWritten) != 10*time.Millisecond {
+	f.notifier.statesMu.Lock()
+	reset := *f.notifier.states["ink"]
+	f.notifier.statesMu.Unlock()
+	if reset.outstandingNotifications != 1 || reset.nextAttempt.Sub(reset.lastWritten) != 10*time.Millisecond {
 		t.Fatalf("drain did not reset ladder: state=%+v", reset)
 	}
 }
 
 func TestConduitTurnStampGatesEachRering(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.writeTurnStamp("ink", time.Now().Unix()-60)
-	f.stageLetter("ink")
+	f.writeTurnMarker("ink", time.Now().Unix()-60)
+	f.stageMessage("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	messages := f.notifier.pending("ink")
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame was not immediate")
 	}
 
 	for i := 0; i < 4; i++ {
-		f.conduit.statesMu.Lock()
-		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-		f.conduit.statesMu.Unlock()
-		f.conduit.maybeRing("ink", lease, reg, letters)
+		f.notifier.statesMu.Lock()
+		f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.notifier.statesMu.Unlock()
+		f.notifier.maybeNotify("ink", lease, reg, messages)
 	}
 	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
 		t.Fatalf("parked session received %d frames, want 1", got)
 	}
 
-	f.conduit.statesMu.Lock()
-	firstWritten := f.conduit.states["ink"].outstandingWritten
-	f.conduit.statesMu.Unlock()
-	f.writeTurnStamp("ink", firstWritten.Unix())
+	f.notifier.statesMu.Lock()
+	firstWritten := f.notifier.states["ink"].outstandingWritten
+	f.notifier.statesMu.Unlock()
+	f.writeTurnMarker("ink", firstWritten.Unix())
 	if !waitForTest(time.Until(time.Unix(firstWritten.Unix()+1, 0))+time.Second, func() bool {
 		return time.Now().Unix() > firstWritten.Unix()
 	}) {
 		t.Fatal("clock did not advance past first frame second")
 	}
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(time.Hour)
-	f.conduit.statesMu.Unlock()
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(time.Hour)
+	f.notifier.statesMu.Unlock()
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
 		t.Fatalf("turn bypassed the ladder deadline: got %d frames", got)
 	}
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-	f.conduit.statesMu.Unlock()
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.notifier.statesMu.Unlock()
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
 		t.Fatal("turn after first frame did not allow the scheduled re-ring")
 	}
 
 	for i := 0; i < 3; i++ {
-		f.conduit.statesMu.Lock()
-		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-		f.conduit.statesMu.Unlock()
-		f.conduit.maybeRing("ink", lease, reg, letters)
+		f.notifier.statesMu.Lock()
+		f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.notifier.statesMu.Unlock()
+		f.notifier.maybeNotify("ink", lease, reg, messages)
 	}
 	if got := f.deliveries[reg.InstanceID].Load(); got != 2 {
 		t.Fatalf("stale turn stamp allowed %d frames, want 2", got)
 	}
 
-	f.conduit.statesMu.Lock()
-	secondWritten := f.conduit.states["ink"].outstandingWritten
-	f.conduit.statesMu.Unlock()
-	f.writeTurnStamp("ink", secondWritten.Unix())
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-	f.conduit.statesMu.Unlock()
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.statesMu.Lock()
+	secondWritten := f.notifier.states["ink"].outstandingWritten
+	f.notifier.statesMu.Unlock()
+	f.writeTurnMarker("ink", secondWritten.Unix())
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.notifier.statesMu.Unlock()
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 3 }) {
 		t.Fatal("new turn after second frame did not allow the next scheduled re-ring")
 	}
@@ -528,34 +531,34 @@ func TestConduitTurnStampGatesEachRering(t *testing.T) {
 
 func TestConduitMalformedTurnStampFailsOpenOnce(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.writeTurnStamp("ink", time.Now().Unix())
+	f.writeTurnMarker("ink", time.Now().Unix())
 	turnPath := filepath.Join(f.home, "run", "turns", "ink")
 	if err := os.WriteFile(turnPath, []byte("not a turn stamp\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	messages := f.notifier.pending("ink")
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame was not immediate")
 	}
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(time.Hour)
-	f.conduit.statesMu.Unlock()
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(time.Hour)
+	f.notifier.statesMu.Unlock()
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if strings.Contains(f.logs.String(), "malformed turn stamp ignored: ink") {
 		t.Fatalf("turn stamp was read before the ladder deadline; logs=%s", f.logs.String())
 	}
 	for i := 0; i < 2; i++ {
-		f.conduit.statesMu.Lock()
-		f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-		f.conduit.statesMu.Unlock()
-		f.conduit.maybeRing("ink", lease, reg, letters)
+		f.notifier.statesMu.Lock()
+		f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+		f.notifier.statesMu.Unlock()
+		f.notifier.maybeNotify("ink", lease, reg, messages)
 	}
 	if got := f.deliveries[reg.InstanceID].Load(); got != 3 {
 		t.Fatalf("malformed stamp did not fail open to ladder: got %d frames", got)
@@ -566,7 +569,7 @@ func TestConduitMalformedTurnStampFailsOpenOnce(t *testing.T) {
 }
 
 func TestConduitTurnStampRefusesSymlink(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	dir := filepath.Join(f.home, "run", "turns")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -579,8 +582,8 @@ func TestConduitTurnStampRefusesSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2; i++ {
-		if stamp := f.conduit.readTurnStamp("ink"); stamp.Present {
-			t.Fatalf("symlink turn stamp was accepted: %+v", stamp)
+		if readMarker := f.notifier.readTurnMarker("ink"); readMarker.Present {
+			t.Fatalf("symlink turn stamp was accepted: %+v", readMarker)
 		}
 	}
 	if got := strings.Count(f.logs.String(), "malformed turn stamp ignored: ink"); got != 1 {
@@ -590,37 +593,37 @@ func TestConduitTurnStampRefusesSymlink(t *testing.T) {
 
 func TestConduitRestartRestoresTurnGate(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.writeTurnStamp("ink", time.Now().Unix()-60)
-	f.stageLetter("ink")
+	f.writeTurnMarker("ink", time.Now().Unix()-60)
+	f.stageMessage("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	messages := f.notifier.pending("ink")
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame missing")
 	}
 
-	restarted := &conduit{
-		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.conduit.self,
-		logger: f.conduit.logger, backoff: f.conduit.backoff, degradeAt: 3,
-		states: make(map[string]*conduitState), drainedWarned: make(map[string]bool),
+	restarted := &notifier{
+		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.notifier.self,
+		logger: f.notifier.logger, backoff: f.notifier.backoff, degradeAt: 3,
+		states: make(map[string]*notifierState), inboxReadWarned: make(map[string]bool),
 	}
-	restored := restarted.restoreState("ink", reg.InstanceID, letterGeneration(letters))
+	restored := restarted.restoreState("ink", reg.InstanceID, queueDigest(messages))
 	restored.targetInstance = reg.InstanceID
 	restored.targetPID = reg.PID
 	restored.targetPIDStart = reg.PIDStart
 	restored.nextAttempt = time.Now().Add(-time.Millisecond)
 	restarted.states["ink"] = restored
-	restarted.maybeRing("ink", lease, reg, letters)
+	restarted.maybeNotify("ink", lease, reg, messages)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 1 {
 		t.Fatalf("restart bypassed old turn gate: got %d frames", got)
 	}
 
-	f.writeTurnStamp("ink", restored.outstandingWritten.Unix())
-	restarted.maybeRing("ink", lease, reg, letters)
+	f.writeTurnMarker("ink", restored.outstandingWritten.Unix())
+	restarted.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
 		t.Fatal("new turn after restart did not allow scheduled re-ring")
 	}
@@ -628,36 +631,36 @@ func TestConduitRestartRestoresTurnGate(t *testing.T) {
 
 func TestConduitRestartPreservesOutstandingLadder(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "100ms,200ms,400ms")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	messages := f.notifier.pending("ink")
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame missing")
 	}
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
-	f.conduit.statesMu.Unlock()
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"].nextAttempt = time.Now().Add(-time.Millisecond)
+	f.notifier.statesMu.Unlock()
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 2 }) {
 		t.Fatal("second frame missing")
 	}
 
-	restarted := &conduit{
-		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.conduit.self,
-		logger: f.conduit.logger, backoff: f.conduit.backoff, degradeAt: 3,
-		states: make(map[string]*conduitState), drainedWarned: make(map[string]bool),
+	restarted := &notifier{
+		home: f.home, runtime: f.runtime, bootID: f.bootID, self: f.notifier.self,
+		logger: f.notifier.logger, backoff: f.notifier.backoff, degradeAt: 3,
+		states: make(map[string]*notifierState), inboxReadWarned: make(map[string]bool),
 	}
-	restored := restarted.restoreState("ink", reg.InstanceID, letterGeneration(letters))
-	if restored.outstandingRings != 2 || restored.nextAttempt.Sub(restored.lastWritten) != 200*time.Millisecond {
+	restored := restarted.restoreState("ink", reg.InstanceID, queueDigest(messages))
+	if restored.outstandingNotifications != 2 || restored.nextAttempt.Sub(restored.lastWritten) != 200*time.Millisecond {
 		t.Fatalf("restart state=%+v; want two outstanding writes and 200ms deadline", restored)
 	}
 	restarted.states["ink"] = restored
-	restarted.maybeRing("ink", lease, reg, letters)
+	restarted.maybeNotify("ink", lease, reg, messages)
 	time.Sleep(5 * time.Millisecond)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 2 {
 		t.Fatalf("restart duplicated outstanding frame immediately: got %d frames", got)
@@ -666,17 +669,17 @@ func TestConduitRestartPreservesOutstandingLadder(t *testing.T) {
 
 func TestConduitOutstandingStateDoesNotCrossProcesses(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "30s,60s")
-	f := newConduitFixture(t)
-	f.conduit.backoff = []time.Duration{time.Millisecond}
+	f := newNotifierFixture(t)
+	f.notifier.backoff = []time.Duration{time.Millisecond}
 	owner := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-2*time.Hour), 3)
 	claimant := f.addRegistration("ink", "claimant", "interactive", false, time.Now().Add(-time.Hour), 4)
 	claimant.PID = owner.PID + 100000
 	claimant.PIDStart = f.bootID + ":claimant-process"
 	f.writeLease("ink", &owner, "owned", 3)
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 	ownerLease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
-	f.conduit.maybeRing("ink", ownerLease, owner, letters)
+	messages := f.notifier.pending("ink")
+	f.notifier.maybeNotify("ink", ownerLease, owner, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[owner.InstanceID].Load() == 1 }) {
 		t.Fatal("owner frame missing")
 	}
@@ -684,68 +687,68 @@ func TestConduitOutstandingStateDoesNotCrossProcesses(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	f.writeLease("ink", &claimant, "owned", 4)
 	claimantLease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.conduit.maybeRing("ink", claimantLease, claimant, letters)
+	f.notifier.maybeNotify("ink", claimantLease, claimant, messages)
 	if !waitForTest(100*time.Millisecond, func() bool { return f.deliveries[claimant.InstanceID].Load() == 1 }) {
 		t.Fatalf("new process received %d frames; want its first frame immediately", f.deliveries[claimant.InstanceID].Load())
 	}
-	f.conduit.statesMu.Lock()
-	state := *f.conduit.states["ink"]
-	f.conduit.statesMu.Unlock()
-	if state.outstandingRings != 1 || state.nextAttempt.Sub(state.lastWritten) != 30*time.Second {
+	f.notifier.statesMu.Lock()
+	state := *f.notifier.states["ink"]
+	f.notifier.statesMu.Unlock()
+	if state.outstandingNotifications != 1 || state.nextAttempt.Sub(state.lastWritten) != 30*time.Second {
 		t.Fatalf("new process inherited the owner's ladder: state=%+v", state)
 	}
 	if got := f.deliveries[owner.InstanceID].Load(); got != 1 {
 		t.Fatalf("old process received %d frames after lease moved, want 1", got)
 	}
-	restored := f.conduit.restoreState("ink", claimant.InstanceID, letterGeneration(letters))
-	if restored.outstandingRings != 1 || restored.nextAttempt.Sub(restored.outstandingWritten) != 30*time.Second {
+	restored := f.notifier.restoreState("ink", claimant.InstanceID, queueDigest(messages))
+	if restored.outstandingNotifications != 1 || restored.nextAttempt.Sub(restored.outstandingWritten) != 30*time.Second {
 		t.Fatalf("restore included another instance's journals: state=%+v", restored)
 	}
 }
 
 func TestConduitCoalescingKeepsEarAlarmSignature(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "30s")
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	if err := os.MkdirAll(filepath.Join(f.runtime, "ears"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageEnvelope("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
+	f.stageMessageData("ink", "1700000000.1.1.sender@alpha", "From: alice@alpha\nType: message\nSubject: first\n\nbody\n")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
+	f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("first frame missing")
 	}
-	f.stageEnvelope("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
-	f.conduit.maybeRing("ink", lease, reg, f.conduit.pending("ink"))
-	row, err := f.conduit.buildEarIdentity("ink", []sessionRegistration{reg}, lease)
+	f.stageMessageData("ink", "1700000000.1.2.sender@alpha", "From: bob@alpha\nType: message\nSubject: coalesced\n\nbody\n")
+	f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
+	row, err := f.notifier.buildListenerIdentity("ink", []sessionRegistration{reg}, lease)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.Generation != letterGeneration(f.conduit.pending("ink")) || row.WrittenRings != 0 || row.LastWritten == 0 || row.LastDrain != 0 {
+	if row.Generation != queueDigest(f.notifier.pending("ink")) || row.WrittenRings != 0 || row.LastWritten == 0 || row.LastDrain != 0 {
 		t.Fatalf("coalescing ear signature=%+v", row)
 	}
 }
 
 func TestNoticeClassificationShapesSocketAndChannelDoorbells(t *testing.T) {
-	f := newConduitFixture(t)
-	f.stageEnvelope("ink", "1.mail", "From: alice@alpha\nType: message\nSubject: hello\nPriority: later\n\nbody\n")
-	f.stageEnvelope("ink", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
-	f.stageEnvelope("ink", "3.urgent", "From: gpu@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
-	f.stageEnvelope("ink", "4.malformed", "From: disk@alpha\nType: notice\nUrgency: banana\nSubject: full\n\nbody\n")
-	f.stageEnvelope("ink", "5.missing-urgency", "From: clock@alpha\nType: notice\nSubject: late\n\nbody\n")
-	f.stageEnvelope("ink", "6.unknown", "From: legacy@alpha\nType: future\nSubject: old\n\nbody\n")
-	f.stageEnvelope("ink", "7.body-control", "From: body@alpha\nSubject: envelope wins\n\nType: notice\nUrgency: info\n")
+	f := newNotifierFixture(t)
+	f.stageMessageData("ink", "1.mail", "From: alice@alpha\nType: message\nSubject: hello\nPriority: later\n\nbody\n")
+	f.stageMessageData("ink", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	f.stageMessageData("ink", "3.urgent", "From: gpu@alpha\nType: notice\nUrgency: urgent\nSubject: hot\n\nbody\n")
+	f.stageMessageData("ink", "4.malformed", "From: disk@alpha\nType: notice\nUrgency: banana\nSubject: full\n\nbody\n")
+	f.stageMessageData("ink", "5.missing-urgency", "From: clock@alpha\nType: notice\nSubject: late\n\nbody\n")
+	f.stageMessageData("ink", "6.unknown", "From: legacy@alpha\nType: future\nSubject: old\n\nbody\n")
+	f.stageMessageData("ink", "7.body-control", "From: body@alpha\nSubject: envelope wins\n\nType: notice\nUrgency: info\n")
 
-	letters := f.conduit.pending("ink")
-	ringIDs := []pendingLetter{{id: "1.mail"}, {id: "3.urgent"}, {id: "4.malformed"}, {id: "5.missing-urgency"}, {id: "6.unknown"}, {id: "7.body-control"}}
-	wantGeneration := letterGeneration(ringIDs)
-	if got := letterGeneration(letters); got != wantGeneration {
+	messages := f.notifier.pending("ink")
+	notifiableIDs := []pendingMessage{{id: "1.mail"}, {id: "3.urgent"}, {id: "4.malformed"}, {id: "5.missing-urgency"}, {id: "6.unknown"}, {id: "7.body-control"}}
+	wantGeneration := queueDigest(notifiableIDs)
+	if got := queueDigest(messages); got != wantGeneration {
 		t.Fatalf("generation=%s want ring-set generation %s", got, wantGeneration)
 	}
 
-	frame := f.conduit.frame("ink", wantGeneration, "attempt-1", 2, letters)
+	frame := f.notifier.frame("ink", wantGeneration, "attempt-1", 2, messages)
 	message := frame["message"].(map[string]string)["content"]
 	wantFrame := "KHALA-CONDUIT/1\n" +
 		"recipient: ink@alpha\n" +
@@ -766,7 +769,7 @@ func TestNoticeClassificationShapesSocketAndChannelDoorbells(t *testing.T) {
 		t.Fatalf("socket priority=%v want next", got)
 	}
 
-	request := f.conduit.channelRequest(wantGeneration, "attempt-1", 2, letters)
+	request := f.notifier.channelRequest(wantGeneration, "attempt-1", 2, messages)
 	meta := request["meta"].(map[string]string)
 	for key, want := range map[string]string{
 		"pending": "3", "notices": "4", "urgent": "3", "generation": wantGeneration, "retry": "2",
@@ -788,31 +791,31 @@ func TestNoticeClassificationShapesSocketAndChannelDoorbells(t *testing.T) {
 }
 
 func TestInfoNoticeDoesNotAffectGenerationOrPriorityAndNeverRingsAlone(t *testing.T) {
-	f := newConduitFixture(t)
-	f.stageEnvelope("mixed", "1.mail", "From: alice@alpha\nType: message\nPriority: later\nSubject: wait\n\nbody\n")
-	f.stageEnvelope("mixed", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
-	letters := f.conduit.pending("mixed")
-	if got, want := letterGeneration(letters), letterGeneration([]pendingLetter{{id: "1.mail"}}); got != want {
+	f := newNotifierFixture(t)
+	f.stageMessageData("mixed", "1.mail", "From: alice@alpha\nType: message\nPriority: later\nSubject: wait\n\nbody\n")
+	f.stageMessageData("mixed", "2.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	messages := f.notifier.pending("mixed")
+	if got, want := queueDigest(messages), queueDigest([]pendingMessage{{id: "1.mail"}}); got != want {
 		t.Fatalf("info notice changed generation: got %s want %s", got, want)
 	}
-	if got := doorbellPriority(letters); got != "later" {
+	if got := notificationPriority(messages); got != "later" {
 		t.Fatalf("info notice changed priority to %q, want later", got)
 	}
 
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageEnvelope("ink", "1.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
-	f.conduit.statesMu.Lock()
-	f.conduit.states["ink"] = &conduitState{generation: "stale"}
-	f.conduit.statesMu.Unlock()
-	f.conduit.scan()
+	f.stageMessageData("ink", "1.info", "From: monitor@alpha\nType: notice\nUrgency: info\nSubject: quiet\n\nbody\n")
+	f.notifier.statesMu.Lock()
+	f.notifier.states["ink"] = &notifierState{pendingDigest: "stale"}
+	f.notifier.statesMu.Unlock()
+	f.notifier.scan()
 	time.Sleep(100 * time.Millisecond)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
 		t.Fatalf("info-only inbox rang %d times, want 0", got)
 	}
-	f.conduit.statesMu.Lock()
-	_, stateExists := f.conduit.states["ink"]
-	f.conduit.statesMu.Unlock()
+	f.notifier.statesMu.Lock()
+	_, stateExists := f.notifier.states["ink"]
+	f.notifier.statesMu.Unlock()
 	if stateExists {
 		t.Fatal("info-only inbox retained ring state")
 	}
@@ -822,29 +825,29 @@ func TestInfoNoticeDoesNotAffectGenerationOrPriorityAndNeverRingsAlone(t *testin
 }
 
 func TestPendingGenerationUsesConduitEnumeration(t *testing.T) {
-	f := newConduitFixture(t)
-	f.stageEnvelope("ink", "1.mail", "Type: message\n\nbody\n")
-	f.stageEnvelope("ink", "2.info", "Type: notice\nUrgency: info\n\nbody\n")
-	f.stageEnvelope("ink", "3.urgent", "Type: notice\nUrgency: urgent\n\nbody\n")
-	generation, ring, info := pendingGeneration(f.home, "ink")
-	want := letterGeneration(f.conduit.pending("ink"))
-	if generation != want || ring != 2 || info != 1 {
-		t.Fatalf("pending-generation=(%s,%d,%d), want (%s,2,1)", generation, ring, info, want)
+	f := newNotifierFixture(t)
+	f.stageMessageData("ink", "1.mail", "Type: message\n\nbody\n")
+	f.stageMessageData("ink", "2.info", "Type: notice\nUrgency: info\n\nbody\n")
+	f.stageMessageData("ink", "3.urgent", "Type: notice\nUrgency: urgent\n\nbody\n")
+	pendingDigest, notifiable, info := pendingQueueDigest(f.home, "ink")
+	want := queueDigest(f.notifier.pending("ink"))
+	if pendingDigest != want || notifiable != 2 || info != 1 {
+		t.Fatalf("pending-generation=(%s,%d,%d), want (%s,2,1)", pendingDigest, notifiable, info, want)
 	}
-	if generation, ring, info := pendingGeneration(f.home, "unknown"); generation != "-" || ring != 0 || info != 0 {
-		t.Fatalf("unknown=(%s,%d,%d)", generation, ring, info)
+	if pendingDigest, notifiable, info := pendingQueueDigest(f.home, "unknown"); pendingDigest != "-" || notifiable != 0 || info != 0 {
+		t.Fatalf("unknown=(%s,%d,%d)", pendingDigest, notifiable, info)
 	}
-	if got := letterGeneration(nil); got != "-" {
+	if got := queueDigest(nil); got != "-" {
 		t.Fatalf("empty generation=%q", got)
 	}
-	frame := f.conduit.frame("ink", generation, "attempt", 0, f.conduit.pending("ink"))
+	frame := f.notifier.frame("ink", pendingDigest, "attempt", 0, f.notifier.pending("ink"))
 	content := frame["message"].(map[string]string)["content"]
-	if !strings.Contains(content, "generation: "+generation+"\n") {
+	if !strings.Contains(content, "generation: "+pendingDigest+"\n") {
 		t.Fatalf("doorbell generation differs: %s", content)
 	}
 	missingRuntime := filepath.Join(f.runtime, "must-not-exist")
 	t.Setenv("KHALA_RUNTIME_DIR", missingRuntime)
-	if err := runtimePendingGeneration([]string{"--identity", "unknown"}); err != nil {
+	if err := runtimePendingQueueDigest([]string{"--identity", "unknown"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(missingRuntime); !os.IsNotExist(err) {
@@ -879,15 +882,15 @@ func TestRuntimePrincipalAndKindPolicy(t *testing.T) {
 }
 
 func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	oldPath := f.stageEnvelope("ink", "1.old", "From: alice@alpha\nType: message\nSubject: old\n\nbody\n")
-	oldLetters := f.conduit.pending("ink")
+	oldPath := f.stageMessageData("ink", "1.old", "From: alice@alpha\nType: message\nSubject: old\n\nbody\n")
+	oldMessages := f.notifier.pending("ink")
 
-	originalHook := conduitBeforeDoorbellWrite
-	t.Cleanup(func() { conduitBeforeDoorbellWrite = originalHook })
-	conduitBeforeDoorbellWrite = func(identity string) {
+	originalHook := notifierBeforeNotificationWrite
+	t.Cleanup(func() { notifierBeforeNotificationWrite = originalHook })
+	notifierBeforeNotificationWrite = func(identity string) {
 		if identity != "ink" {
 			t.Fatalf("pre-write hook identity=%q want ink", identity)
 		}
@@ -899,7 +902,7 @@ func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	time.Sleep(100 * time.Millisecond)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
 		t.Fatalf("stale generation wrote %d socket frames, want 0", got)
@@ -907,9 +910,9 @@ func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 	if !strings.Contains(f.logs.String(), "doorbell skipped: generation changed before write (ink)") {
 		t.Fatalf("missing generation-change log: %s", f.logs.String())
 	}
-	f.conduit.statesMu.Lock()
-	_, stateExists := f.conduit.states["ink"]
-	f.conduit.statesMu.Unlock()
+	f.notifier.statesMu.Lock()
+	_, stateExists := f.notifier.states["ink"]
+	f.notifier.statesMu.Unlock()
 	if stateExists {
 		t.Fatal("empty ring set retained state after pre-write re-check")
 	}
@@ -918,14 +921,14 @@ func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 		t.Fatalf("abandoned write was journaled: entries=%v err=%v", entries, err)
 	}
 
-	conduitBeforeDoorbellWrite = nil
-	f.stageEnvelope("ink", "2.fresh", "From: bob@alpha\nType: message\nSubject: fresh\n\nbody\n")
-	freshLetters := f.conduit.pending("ink")
-	freshGeneration := letterGeneration(freshLetters)
-	if freshGeneration == letterGeneration(oldLetters) {
+	notifierBeforeNotificationWrite = nil
+	f.stageMessageData("ink", "2.fresh", "From: bob@alpha\nType: message\nSubject: fresh\n\nbody\n")
+	freshMessages := f.notifier.pending("ink")
+	freshGeneration := queueDigest(freshMessages)
+	if freshGeneration == queueDigest(oldMessages) {
 		t.Fatal("fresh fixture did not change generation")
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("fresh generation did not ring")
 	}
@@ -943,18 +946,18 @@ func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 }
 
 func TestConduitPreWriteRecheckAllowsUnchangedGenerationOnce(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	letters := f.conduit.pending("ink")
+	messages := f.notifier.pending("ink")
 
-	originalHook := conduitBeforeDoorbellWrite
-	t.Cleanup(func() { conduitBeforeDoorbellWrite = originalHook })
+	originalHook := notifierBeforeNotificationWrite
+	t.Cleanup(func() { notifierBeforeNotificationWrite = originalHook })
 	hookCalls := 0
-	conduitBeforeDoorbellWrite = func(string) { hookCalls++ }
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	notifierBeforeNotificationWrite = func(string) { hookCalls++ }
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		t.Fatal("unchanged generation did not ring")
 	}
@@ -1078,7 +1081,7 @@ func writeRegistrationForTest(t *testing.T, root string, reg sessionRegistration
 }
 
 func TestRegistrationReappearsAndReclaimsAfterBootIDChange(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	old := deadRegistration("boot-A", "ink", "old", time.Now().Add(-time.Hour))
 	writeRegistrationForTest(t, f.runtime, old)
 	regs, err := loadRegistrations(f.runtime, f.bootID)
@@ -1097,7 +1100,7 @@ func TestRegistrationReappearsAndReclaimsAfterBootIDChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := f.addRegistration("ink", "fresh", "interactive", false, time.Now(), 0)
-	f.conduit.scan()
+	f.notifier.scan()
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
 	if lease.BootID != f.bootID || lease.InstanceID != fresh.InstanceID || lease.State != "owned" || lease.Epoch == 0 {
 		t.Fatalf("fresh boot-B registration did not reclaim stale boot-A lease: %+v", lease)
@@ -1105,7 +1108,7 @@ func TestRegistrationReappearsAndReclaimsAfterBootIDChange(t *testing.T) {
 }
 
 func TestConduitReapsOnlyEligibleDeadRegistrations(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	old := deadRegistration(f.bootID, "stale", "dead-old", time.Now().Add(-11*time.Minute))
 	fresh := deadRegistration(f.bootID, "fresh", "dead-fresh", time.Now().Add(-9*time.Minute))
 	foreign := deadRegistration("other-boot", "foreign", "dead-foreign", time.Now().Add(-time.Hour))
@@ -1115,8 +1118,8 @@ func TestConduitReapsOnlyEligibleDeadRegistrations(t *testing.T) {
 	}
 	f.writeLease(owned.Identity, &owned, "owned", 1)
 
-	f.conduit.scan()
-	f.conduit.scan()
+	f.notifier.scan()
+	f.notifier.scan()
 	for instance, wantExists := range map[string]bool{
 		old.InstanceID: false, fresh.InstanceID: true, foreign.InstanceID: true, owned.InstanceID: true,
 	} {
@@ -1132,13 +1135,13 @@ func TestConduitReapsOnlyEligibleDeadRegistrations(t *testing.T) {
 }
 
 func TestConduitReclaimsBeforeReapingDeadLeaseOwner(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	dead := deadRegistration(f.bootID, "shared", "dead-owner", time.Now().Add(-time.Hour))
 	writeRegistrationForTest(t, f.runtime, dead)
 	f.writeLease(dead.Identity, &dead, "owned", 3)
 	live := f.addRegistration("shared", "live-candidate", "interactive", false, time.Now(), 0)
 
-	f.conduit.scan()
+	f.notifier.scan()
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "shared.lease"))
 	if lease.InstanceID != live.InstanceID || lease.State != "owned" {
 		t.Fatalf("live registration did not reclaim lease: %+v", lease)
@@ -1155,7 +1158,7 @@ func TestConduitReclaimsBeforeReapingDeadLeaseOwner(t *testing.T) {
 }
 
 func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "state", "interactive", false, time.Now(), 0)
 	reg.Phase = "starting"
 	reg.ConduitVerified = false
@@ -1163,7 +1166,7 @@ func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
 	writeRegistrationForTest(t, f.runtime, reg)
 
 	for i := 0; i < 3; i++ {
-		f.conduit.scan()
+		f.notifier.scan()
 	}
 	phaseLog := "registration state not verified: phase is not ready"
 	if got := strings.Count(f.logs.String(), phaseLog); got != 1 {
@@ -1172,9 +1175,9 @@ func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
 	if err := os.Remove(filepath.Join(f.runtime, "sessions", reg.InstanceID+".json")); err != nil {
 		t.Fatal(err)
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	writeRegistrationForTest(t, f.runtime, reg)
-	f.conduit.scan()
+	f.notifier.scan()
 	if got := strings.Count(f.logs.String(), phaseLog); got != 2 {
 		t.Fatalf("reason was not logged after registration disappeared and returned: got %d; logs=%s", got, f.logs.String())
 	}
@@ -1184,7 +1187,7 @@ func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
 	reg.ReceiveOptIn = false
 	writeRegistrationForTest(t, f.runtime, reg)
 	for i := 0; i < 2; i++ {
-		f.conduit.scan()
+		f.notifier.scan()
 	}
 	reasonLog := "registration state not verified: non-interactive registration lacks opt-in"
 	if got := strings.Count(f.logs.String(), reasonLog); got != 1 {
@@ -1194,7 +1197,7 @@ func TestConduitVerificationLogsOnlyStateChanges(t *testing.T) {
 	reg.Kind = "interactive"
 	writeRegistrationForTest(t, f.runtime, reg)
 	for i := 0; i < 2; i++ {
-		f.conduit.scan()
+		f.notifier.scan()
 	}
 	if got := strings.Count(f.logs.String(), "registration state verified"); got != 1 {
 		t.Fatalf("recovery log count=%d want 1; logs=%s", got, f.logs.String())
@@ -1239,7 +1242,7 @@ func TestWithRuntimeLockDoesNotRewriteUnchangedBootID(t *testing.T) {
 }
 
 func TestHealLeaseAlreadyCurrentDoesNotAcquireRuntimeLock(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
 	lockPath := filepath.Join(f.runtime, "identities", ".leases.lock")
@@ -1251,7 +1254,7 @@ func TestHealLeaseAlreadyCurrentDoesNotAcquireRuntimeLock(t *testing.T) {
 	if err := os.Chtimes(lockPath, old, old); err != nil {
 		t.Fatal(err)
 	}
-	f.conduit.healLease(reg)
+	f.notifier.healLease(reg)
 	info, err := os.Stat(lockPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1262,7 +1265,7 @@ func TestHealLeaseAlreadyCurrentDoesNotAcquireRuntimeLock(t *testing.T) {
 }
 
 func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
 	markerPID := os.Getpid()
@@ -1289,7 +1292,7 @@ func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- f.conduit.run(ctx) }()
+	go func() { done <- f.notifier.run(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		<-done
@@ -1345,14 +1348,14 @@ func TestConduitWatcherDoesNotSelfFeedAndDebounces(t *testing.T) {
 }
 
 func TestConduitReclaimsReleasedLeaseAndAttemptsDelivery(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", nil, "released", 3)
-	f.stageLetter("ink")
-	if letters := f.conduit.pending("ink"); len(letters) != 1 {
-		t.Fatalf("pending fixture has %d letters, want 1", len(letters))
+	f.stageMessage("ink")
+	if messages := f.notifier.pending("ink"); len(messages) != 1 {
+		t.Fatalf("pending fixture has %d letters, want 1", len(messages))
 	}
-	f.conduit.scan()
+	f.notifier.scan()
 	leasePath := filepath.Join(f.runtime, "identities", "ink.lease")
 	lease := readLeaseForTest(t, leasePath)
 	if lease.State != "owned" || lease.InstanceID != reg.InstanceID || lease.Epoch != 4 {
@@ -1372,7 +1375,7 @@ func TestConduitReclaimsReleasedLeaseAndAttemptsDelivery(t *testing.T) {
 	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
 		entries, journalErr := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
 		t.Fatalf("pending letter did not receive a doorbell attempt after reclaim; pending=%d logs=%s journal entries=%d err=%v",
-			len(f.conduit.pending("ink")), f.logs.String(), len(entries), journalErr)
+			len(f.notifier.pending("ink")), f.logs.String(), len(entries), journalErr)
 	}
 	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
 	if err != nil || len(entries) != 1 {
@@ -1381,16 +1384,16 @@ func TestConduitReclaimsReleasedLeaseAndAttemptsDelivery(t *testing.T) {
 }
 
 func TestUnverifiedChannelEchoesSocketRing(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 
 	channelDeliveries := f.addChannel(&reg)
 
-	letters := f.conduit.pending("ink")
+	messages := f.notifier.pending("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool {
 		return channelDeliveries.Load() == 1 && f.deliveries[reg.InstanceID].Load() == 1
 	}) {
@@ -1414,16 +1417,16 @@ func TestUnverifiedChannelEchoesSocketRing(t *testing.T) {
 }
 
 func TestVerifiedChannelDoesNotEchoSocketRing(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
-	f.stageLetter("ink")
+	f.stageMessage("ink")
 	channelDeliveries := f.addChannel(&reg)
 	reg.ChannelVerified = true
 
-	letters := f.conduit.pending("ink")
+	messages := f.notifier.pending("ink")
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.conduit.maybeRing("ink", lease, reg, letters)
+	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return channelDeliveries.Load() == 1 }) {
 		t.Fatal("verified channel did not receive the doorbell")
 	}
@@ -1445,7 +1448,7 @@ func TestVerifiedChannelDoesNotEchoSocketRing(t *testing.T) {
 }
 
 func TestConduitDoesNotReclaimLiveOwner(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("ink", &reg, "owned", 3)
 	leasePath := filepath.Join(f.runtime, "identities", "ink.lease")
@@ -1454,7 +1457,7 @@ func TestConduitDoesNotReclaimLiveOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3; i++ {
-		f.conduit.scan()
+		f.notifier.scan()
 	}
 	after, err := os.ReadFile(leasePath)
 	if err != nil {
@@ -1469,13 +1472,13 @@ func TestConduitDoesNotReclaimLiveOwner(t *testing.T) {
 }
 
 func TestConduitReclaimChoosesNewestRegistrationWithoutFlapping(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	older := f.addRegistration("shared", "older", "interactive", false, time.Now().Add(-2*time.Hour), 7)
 	newer := f.addRegistration("shared", "newer", "interactive", false, time.Now().Add(-time.Hour), 7)
 	_ = older
 	f.writeLease("shared", nil, "released", 7)
 	for i := 0; i < 3; i++ {
-		f.conduit.scan()
+		f.notifier.scan()
 		lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "shared.lease"))
 		if lease.InstanceID != newer.InstanceID || lease.Epoch != 8 || lease.State != "owned" {
 			t.Fatalf("scan %d selected unstable reclaim owner: %+v", i+1, lease)
@@ -1487,7 +1490,7 @@ func TestConduitReclaimChoosesNewestRegistrationWithoutFlapping(t *testing.T) {
 }
 
 func TestForkSessionAncestorCannotTakeOverLiveInteractiveOwner(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	owner := f.addRegistration("shared", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	f.writeLease("shared", &owner, "owned", 3)
 
@@ -1549,7 +1552,7 @@ func TestForkSessionAncestorCannotTakeOverLiveInteractiveOwner(t *testing.T) {
 }
 
 func TestRuntimeReleaseOnlyClearsOwnedLeaseAndLogs(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	owner := f.addRegistration("shared", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 	worker := f.addRegistration("shared", "worker", "worker", true, time.Now().Add(-30*time.Minute), 3)
 	f.writeLease("shared", &owner, "owned", 3)
@@ -1591,7 +1594,7 @@ func TestRuntimeReservedIdentities(t *testing.T) {
 			}
 		}
 	}
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	reserved := sessionRegistration{BootID: f.bootID, InstanceID: "reserved-instance", Identity: "gateway", ClaudeSessionID: "session"}
 	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", reserved.InstanceID+".json"), reserved, 0600); err != nil {
 		t.Fatal(err)
@@ -1606,7 +1609,7 @@ func TestRuntimeReservedIdentities(t *testing.T) {
 }
 
 func TestRuntimeRegisterAcceptsAutoAndWorkerAndRefusesGatewayKind(t *testing.T) {
-	f := newConduitFixture(t)
+	f := newNotifierFixture(t)
 	for _, test := range []struct {
 		identity string
 		kind     string

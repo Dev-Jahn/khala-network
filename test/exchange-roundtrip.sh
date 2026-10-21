@@ -7,6 +7,7 @@ HOME_A="$HOME/.khala-exchange-alpha-$$"
 HOME_M="$HOME/.khala-exchange-mailbox-$$"
 BOGUS="$HOME/.khala-exchange-missing-$$"
 TEST_DIR="$HOME/.khala-exchange-test-$$"
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$HOME_A" "$HOME_M" "$BOGUS" "$TEST_DIR"
@@ -67,7 +68,7 @@ write_alpha_config() {
 }
 
 mkdir -p -- "$TEST_DIR"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 if ! KHALA_HOME="$HOME_A" "$KHALA" init alpha \
     >"$TEST_DIR/init-alpha.out" 2>"$TEST_DIR/init-alpha.err"; then
@@ -88,12 +89,12 @@ if ! KHALA_HOME="$HOME_A" "$KHALA" sync \
     >"$TEST_DIR/alpha-sync-1.out" 2>"$TEST_DIR/alpha-sync-1.err"; then
     fail 1 "alpha sync failed: $(tr '\n' ' ' < "$TEST_DIR/alpha-sync-1.err")"
 fi
-[ -f "$HOME_M/spool/for/b200/$message_id" ] || fail 1 "message did not reach mailbox spool"
+[ -f "$HOME_M/spool/for/b200/$message_id" ] || fail 1 "message did not reach upstream spool"
 [ -f "$HOME_A/outbox/new/$message_id" ] || fail 1 "sender original was removed before ack"
 grep -Fq "$BOGUS" "$TEST_DIR/alpha-sync-1.err" || fail 1 "bogus candidate skip was not reported"
 pass 1 "candidate fallback pushes while retaining the original"
 
-# 2. Deliver once at the mailbox and create the deterministic ack.
+# 2. Deliver once at the upstream and create the deterministic ack.
 if ! KHALA_HOME="$HOME_M" "$KHALA" sync \
     >"$TEST_DIR/mailbox-sync-1.out" 2>"$TEST_DIR/mailbox-sync-1.err"; then
     fail 2 "b200 sync failed: $(tr '\n' ' ' < "$TEST_DIR/mailbox-sync-1.err")"
@@ -106,7 +107,7 @@ if ! KHALA_HOME="$HOME_M" KHALA_SESSION=bob "$KHALA" inbox \
     >"$TEST_DIR/bob-inbox.out" 2>"$TEST_DIR/bob-inbox.err"; then
     fail 2 "bob heartbeat failed: $(tr '\n' ' ' < "$TEST_DIR/bob-inbox.err")"
 fi
-pass 2 "mailbox delivers once, logs dedup, and creates an ack"
+pass 2 "upstream delivers once, logs dedup, and creates an ack"
 
 # 3. Pull and consume the ack at alpha.
 if ! KHALA_HOME="$HOME_A" "$KHALA" sync \
@@ -115,7 +116,7 @@ if ! KHALA_HOME="$HOME_A" "$KHALA" sync \
 fi
 [ -f "$HOME_A/outbox/acked/$message_id" ] || fail 3 "original did not move to outbox/acked"
 [ "$(count_files "$HOME_A/outbox/new")" -eq 0 ] || fail 3 "outbox/new still contains the original"
-[ "$(count_files "$HOME_M/spool/for/alpha")" -eq 0 ] || fail 3 "mailbox ack source was not removed"
+[ "$(count_files "$HOME_M/spool/for/alpha")" -eq 0 ] || fail 3 "upstream ack source was not removed"
 [ "$(count_files "$HOME_A/spool/for/alpha")" -eq 0 ] || fail 3 "alpha local spool was not consumed"
 [ "$(count_files "$HOME_A/spool/for/b200")" -eq 0 ] || fail 3 "alpha outgoing spool was not settled"
 pass 3 "ack pull settles the sender and empties both ack spools"
@@ -144,7 +145,7 @@ fi
 semantic_snapshot "$HOME_A" >"$TEST_DIR/alpha-tree-after"
 semantic_snapshot "$HOME_M" >"$TEST_DIR/mailbox-tree-after"
 cmp -s "$TEST_DIR/alpha-tree-before" "$TEST_DIR/alpha-tree-after" || fail 4 "alpha listing changed"
-cmp -s "$TEST_DIR/mailbox-tree-before" "$TEST_DIR/mailbox-tree-after" || fail 4 "mailbox listing changed"
+cmp -s "$TEST_DIR/mailbox-tree-before" "$TEST_DIR/mailbox-tree-after" || fail 4 "upstream listing changed"
 pass 4 "the settled pair is idempotent"
 
 # 5. A duplicate wire copy is deduplicated and regenerates a harmless ack.
@@ -180,7 +181,7 @@ grep -q 'asleep = 칼라 활동 없음' "$TEST_DIR/alpha-presence.out" || fail 6
 grep -q 'asleep = 칼라 활동 없음' "$TEST_DIR/mailbox-presence.out" || fail 6 "b200 honesty note is missing"
 pass 6 "presence merges with here/elsewhere states and honesty notes"
 
-# 7. Total mailbox failure is loud but does not block local delivery.
+# 7. Total upstream failure is loud but does not block local delivery.
 write_alpha_config broken || fail 7 "broken alpha config setup failed"
 if ! local_id=$(KHALA_HOME="$HOME_A" KHALA_SESSION=self-session \
     "$KHALA" send self-session@alpha -m "still local" 2>"$TEST_DIR/local-send.err"); then
@@ -188,11 +189,11 @@ if ! local_id=$(KHALA_HOME="$HOME_A" KHALA_SESSION=self-session \
 fi
 if KHALA_HOME="$HOME_A" "$KHALA" sync \
     >"$TEST_DIR/alpha-sync-failed.out" 2>"$TEST_DIR/alpha-sync-failed.err"; then
-    fail 7 "sync with no reachable mailbox unexpectedly succeeded"
+    fail 7 "sync with no reachable upstream unexpectedly succeeded"
 fi
-[ -f "$HOME_A/inbox/self-session/new/$local_id" ] || fail 7 "local message was blocked by mailbox failure"
+[ -f "$HOME_A/inbox/self-session/new/$local_id" ] || fail 7 "local message was blocked by upstream failure"
 grep -q '사용 가능한 mailbox 후보가 없습니다' "$TEST_DIR/alpha-sync-failed.err" || fail 7 "total failure was not reported"
-pass 7 "mailbox failure is non-zero but local delivery continues"
+pass 7 "upstream failure is non-zero but local delivery continues"
 
 # 8. The unchanged single-machine suite remains green.
 if ! bash "$ROOT/test/local-roundtrip.sh" \

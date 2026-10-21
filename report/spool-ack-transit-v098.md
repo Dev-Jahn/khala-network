@@ -8,10 +8,10 @@ Branch: `task/spool-ack-transit`
 
 ## Outcome
 
-The native dial path now removes origin-side `spool` copies after the hub returns
-`STORED` only when the bounded envelope header declares `Type: ack` or
+The native client path now removes origin-side queued copies in `spool` after the upstream returns
+`STORED` only when the bounded message header block declares `Type: ack` or
 `Type: bounce`. The unlink uses the offered digest through `removeTransit`.
-Message and notice copies remain retransmission/retention sources, and the serve
+Message and alert copies remain retransmission/retention sources, and the server
 path is unchanged.
 
 ## RED evidence
@@ -31,21 +31,21 @@ FAIL    github.com/Dev-Jahn/khala-network/link  0.006s
 FAIL
 ```
 
-The message, notice, changed-ack, body-Type, and over-limit header subtests passed
+The message, alert, changed-ack, body-Type, and over-limit header subtests passed
 in the same RED run; only the two leak assertions failed.
 
 ## Property results
 
 | Property | Result | Evidence |
 |---|---|---|
-| P1 dial ack | PASS | `ack` subtest observes the exact DATA bytes at the simulated hub and an absent origin file after `STORED`. |
-| P2 dial bounce | PASS | `bounce` subtest observes the exact DATA bytes at the simulated hub and an absent origin file after `STORED`. |
-| P3 dial message | PASS | `message` subtest observes the origin file still present after `STORED`. |
-| P4 dial notice | PASS | `notice` subtest observes the origin file still present after `STORED`. |
+| P1 client ack | PASS | `ack` subtest observes the exact DATA bytes at the simulated upstream and an absent origin file after `STORED`. |
+| P2 client bounce | PASS | `bounce` subtest observes the exact DATA bytes at the simulated upstream and an absent origin file after `STORED`. |
+| P3 client message | PASS | `message` subtest observes the origin file still present after `STORED`. |
+| P4 client alert | PASS | `notice` subtest observes the origin file still present after `STORED`. |
 | P5 digest check | PASS | `changed ack` rewrites the source after DATA is received but before `STORED`; `removeTransit` refuses the digest mismatch and the changed bytes remain. |
 | P6 bounded header | PASS | `body type is not a header` remains present; `type beyond header read limit` also remains present. Parsing stops at the first empty line and reads at most 64 KiB. |
 | P7 validation | PASS | `go vet ./...`, `go test -p 2 ./...`, and `test/link.sh` all passed. The shell suite reported 20/20 and `RESULT: PASS`. |
-| P8 design | PASS | DESIGN.md §5.2 now states that native link removes the origin copy after hub `STORED`, matching rsync lifetime semantics. |
+| P8 design | PASS | DESIGN.md §5.2 now states that native relay removes the origin copy after upstream `STORED`, matching rsync lifetime semantics. |
 
 ## Commands run
 
@@ -81,5 +81,5 @@ nice -n 19 taskset -c 20-71 test/link.sh
 ## Commits
 
 - `c46281d` — RED regression coverage
-- `86abbfe` — native dial ack/bounce origin unlink fix
+- `86abbfe` — native client ack/bounce origin unlink fix
 - documentation/report — this document and the DESIGN §5.2 sentence

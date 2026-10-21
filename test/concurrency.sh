@@ -11,6 +11,7 @@ REMOTE_HOME="$HOME/.khala-concurrency-remote-$$"
 NETWORK_HOME="$HOME/.khala-concurrency-network-$$"
 LOCK_HOME="$HOME/.khala-concurrency-lock-$$"
 NETWORK_PID=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     if [ -n "$NETWORK_PID" ]; then
@@ -62,13 +63,13 @@ remote_message() {
 }
 
 mkdir -p -- "$TEST_DIR"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
-# 1. spool/for/self is delivered locally and never reflected to the mailbox.
+# 1. spool/for/self is delivered locally and never reflected to the upstream.
 KHALA_HOME="$ECHO_HOME" "$KHALA" init alpha >"$TEST_DIR/echo-init.out" 2>"$TEST_DIR/echo-init.err" || \
     fail 1 "alpha init failed"
 KHALA_HOME="$ECHO_HUB" "$KHALA" init b200 >"$TEST_DIR/hub-init.out" 2>"$TEST_DIR/hub-init.err" || \
-    fail 1 "hub init failed"
+    fail 1 "upstream init failed"
 {
     printf 'self alpha\n'
     printf 'peer alpha %s\n' "$ECHO_HOME"
@@ -82,7 +83,7 @@ echo_id=$(KHALA_HOME="$ECHO_HOME" KHALA_SESSION=sender \
 KHALA_HOME="$ECHO_HOME" "$KHALA" sync >"$TEST_DIR/echo-sync.out" 2>"$TEST_DIR/echo-sync.err" || \
     fail 1 "echo fixture sync failed: $(tr '\n' ' ' < "$TEST_DIR/echo-sync.err")"
 [ -f "$ECHO_HOME/inbox/local/new/$echo_id" ] || fail 1 "self-spool mail was not delivered locally"
-[ "$(count_files "$ECHO_HUB/spool/for/alpha")" -eq 0 ] || fail 1 "mailbox received self-spool mail"
+[ "$(count_files "$ECHO_HUB/spool/for/alpha")" -eq 0 ] || fail 1 "upstream received self-spool mail"
 pass 1 "self-spool mail is delivered locally without upstream echo"
 
 KHALA_HOME="$MAIN_HOME" "$KHALA" init alpha >"$TEST_DIR/main-init.out" 2>"$TEST_DIR/main-init.err" || \
@@ -90,7 +91,7 @@ KHALA_HOME="$MAIN_HOME" "$KHALA" init alpha >"$TEST_DIR/main-init.out" 2>"$TEST_
 KHALA_HOME="$REMOTE_HOME" "$KHALA" init b200 >"$TEST_DIR/remote-init.out" 2>"$TEST_DIR/remote-init.err" || \
     fail 2 "remote init failed"
 
-# 2. Two syncs and a drain loop preserve ten distinct messages exactly once.
+# 2. Two syncs and an inbox-read loop preserve ten distinct messages exactly once.
 : > "$TEST_DIR/concurrent.ids"
 concurrent_i=1
 while [ "$concurrent_i" -le 10 ]; do
@@ -115,7 +116,7 @@ sync_b_pid=$!
 drain_pid=$!
 wait "$sync_a_pid" || fail 2 "first concurrent sync failed"
 wait "$sync_b_pid" || fail 2 "second concurrent sync failed"
-wait "$drain_pid" || fail 2 "concurrent drain loop failed"
+wait "$drain_pid" || fail 2 "concurrent inbox-read loop failed"
 KHALA_HOME="$MAIN_HOME" "$KHALA" reconcile >"$TEST_DIR/quiesce.out" 2>"$TEST_DIR/quiesce.err" || \
     fail 2 "quiescing reconcile failed"
 [ "$(count_files "$MAIN_HOME/inbox/target/new" "$MAIN_HOME/inbox/target/cur")" -eq 10 ] || \
@@ -133,7 +134,7 @@ while IFS= read -r concurrent_id; do
         fail 2 "$concurrent_id is missing or duplicated in delivered log"
 done < "$TEST_DIR/concurrent.ids"
 [ "$(wc -l < "$MAIN_HOME/log/delivered" | tr -d ' ')" -eq 10 ] || fail 2 "delivered log has torn or extra rows"
-pass 2 "concurrent syncs and drain preserve ten messages and log rows exactly once"
+pass 2 "concurrent syncs and inbox read preserve ten messages and log rows exactly once"
 
 # 3. Inbox presence repairs the log and prevents redelivery for new and cur.
 crash_new_id=$(remote_message crashnew "copy then crash in new") || fail 3 "new crash fixture send failed"
@@ -144,7 +145,7 @@ KHALA_HOME="$MAIN_HOME" "$KHALA" sync >"$TEST_DIR/crash-new.out" 2>"$TEST_DIR/cr
     fail 3 "new crash recovery failed"
 [ "$(count_files "$MAIN_HOME/inbox/crashnew/new")" -eq 1 ] || fail 3 "new crash copy was duplicated"
 grep -q " $crash_new_id$" "$MAIN_HOME/log/delivered" || fail 3 "new crash log was not repaired"
-[ ! -e "$MAIN_HOME/spool/for/alpha/$crash_new_id" ] || fail 3 "new crash spool copy remained"
+[ ! -e "$MAIN_HOME/spool/for/alpha/$crash_new_id" ] || fail 3 "new crash queued copy remained"
 grep -l "^Refs: $crash_new_id$" "$MAIN_HOME"/spool/for/b200/* >/dev/null 2>&1 || \
     fail 3 "new crash ack was not regenerated"
 
@@ -157,7 +158,7 @@ KHALA_HOME="$MAIN_HOME" "$KHALA" sync >"$TEST_DIR/crash-cur.out" 2>"$TEST_DIR/cr
 [ -f "$MAIN_HOME/inbox/crashcur/cur/$crash_cur_id" ] || fail 3 "cur crash copy moved or vanished"
 [ "$(count_files "$MAIN_HOME/inbox/crashcur/new")" -eq 0 ] || fail 3 "cur crash copy was redelivered to new"
 grep -q " $crash_cur_id$" "$MAIN_HOME/log/delivered" || fail 3 "cur crash log was not repaired"
-[ ! -e "$MAIN_HOME/spool/for/alpha/$crash_cur_id" ] || fail 3 "cur crash spool copy remained"
+[ ! -e "$MAIN_HOME/spool/for/alpha/$crash_cur_id" ] || fail 3 "cur crash queued copy remained"
 grep -l "^Refs: $crash_cur_id$" "$MAIN_HOME"/spool/for/b200/* >/dev/null 2>&1 || \
     fail 3 "cur crash ack was not regenerated"
 pass 3 "new/cur crash windows repair dedup state without redelivery"
@@ -191,7 +192,7 @@ cmp -s "$TEST_DIR/sentinel.saved" "$MAIN_HOME/inbox/noclobber/new/$clobber_id" |
 grep -q " $clobber_id$" "$MAIN_HOME/log/delivered" || fail 5 "no-clobber log was not repaired"
 pass 5 "delivery never overwrites an existing Id path"
 
-# 6. A blocked exchange does not hold the brain lock needed by inbox drain.
+# 6. A blocked exchange does not hold the state lock needed by an inbox read.
 KHALA_HOME="$NETWORK_HOME" "$KHALA" init alpha >"$TEST_DIR/network-init.out" 2>"$TEST_DIR/network-init.err" || \
     fail 6 "network init failed"
 network_id=$(KHALA_HOME="$NETWORK_HOME" KHALA_SESSION=sender \
@@ -212,31 +213,31 @@ mv "$NETWORK_HOME/tmp/config.concurrency.$$" "$NETWORK_HOME/config"
 ) &
 NETWORK_PID=$!
 sleep 2
-drain_started=$(date +%s) || fail 6 "could not read drain start"
+drain_started=$(date +%s) || fail 6 "could not read inbox read start"
 KHALA_HOME="$NETWORK_HOME" KHALA_SESSION=drainable "$KHALA" inbox --drain \
-    >"$TEST_DIR/network-drain.out" 2>"$TEST_DIR/network-drain.err" || fail 6 "drain failed during exchange"
-drain_ended=$(date +%s) || fail 6 "could not read drain end"
-[ "$((drain_ended - drain_started))" -lt 10 ] || fail 6 "drain waited ten seconds for network"
-[ ! -e "$TEST_DIR/network-sync.status" ] || fail 6 "network sync ended before the drain proved separation"
+    >"$TEST_DIR/network-drain.out" 2>"$TEST_DIR/network-drain.err" || fail 6 "inbox read failed during exchange"
+drain_ended=$(date +%s) || fail 6 "could not read inbox read end"
+[ "$((drain_ended - drain_started))" -lt 10 ] || fail 6 "inbox read waited ten seconds for network"
+[ ! -e "$TEST_DIR/network-sync.status" ] || fail 6 "network sync ended before the inbox read proved separation"
 wait "$NETWORK_PID" || :
 NETWORK_PID=
 [ "$(sed -n '1p' "$TEST_DIR/network-sync.status")" -ne 0 ] || fail 6 "blackhole sync unexpectedly succeeded"
-grep -Fq "$network_id" "$TEST_DIR/network-drain.out" || fail 6 "staged mail was not drained"
-pass 6 "brain lock remains available while exchange is blocked on the network"
+grep -Fq "$network_id" "$TEST_DIR/network-drain.out" || fail 6 "staged mail was not read"
+pass 6 "state lock remains available while exchange is blocked on the network"
 
 # 7. Stale locks are reclaimed loudly; fresh locks wait for their holder.
 KHALA_HOME="$LOCK_HOME" "$KHALA" init alpha >"$TEST_DIR/lock-init.out" 2>"$TEST_DIR/lock-init.err" || \
     fail 7 "lock init failed"
 lock_now=$(date +%s) || fail 7 "could not read lock time"
-mkdir "$LOCK_HOME/run/brain.lock.d" || fail 7 "could not create stale brain lock"
+mkdir "$LOCK_HOME/run/brain.lock.d" || fail 7 "could not create stale state lock"
 printf '%s\npid 777 reconcile\n' "$((lock_now - 400))" > "$LOCK_HOME/run/brain.lock.d/owner"
 KHALA_HOME="$LOCK_HOME" "$KHALA" sync >"$TEST_DIR/stale-lock.out" 2>"$TEST_DIR/stale-lock.err" || \
-    fail 7 "sync did not proceed after stale brain lock"
+    fail 7 "sync did not proceed after stale state lock"
 grep -q 'reclaimed stale lock from pid 777' "$TEST_DIR/stale-lock.err" || \
-    fail 7 "stale brain lock reclaim was not loud"
+    fail 7 "stale state lock reclaim was not loud"
 
 fresh_now=$(date +%s) || fail 7 "could not read fresh lock time"
-mkdir "$LOCK_HOME/run/brain.lock.d" || fail 7 "could not create fresh brain lock"
+mkdir "$LOCK_HOME/run/brain.lock.d" || fail 7 "could not create fresh state lock"
 printf '%s\npid 778 holder\n' "$fresh_now" > "$LOCK_HOME/run/brain.lock.d/owner"
 (
     sleep 2
@@ -255,7 +256,7 @@ wait "$holder_pid" || fail 7 "fresh lock holder failed to release"
 if grep -q 'reclaimed stale lock' "$TEST_DIR/fresh-lock.err"; then
     fail 7 "fresh lock was reclaimed"
 fi
-pass 7 "stale brain locks are reclaimed and fresh locks are awaited"
+pass 7 "stale state locks are reclaimed and fresh locks are awaited"
 
 # 8. Every pre-existing suite remains green.
 for regression_suite in local-roundtrip exchange-roundtrip hardening watch; do

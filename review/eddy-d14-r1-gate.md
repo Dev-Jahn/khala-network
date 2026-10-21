@@ -17,33 +17,33 @@ token 없이는 깨진다. §1.2 훅 불가침 규칙에 한 문장 추가로 �
 ## 라이더 R2 — 세대 갱신의 이월 규칙을 일반형으로 명문화
 
 §1.3 끝은 "변하지 않은 필드의 Declared는 보존"만 말한다. **값**의 이월과
-State의 이월이 빠져 있고, M4(clear 후 재발화만으로 mind 미재현)의 전제가
+State의 이월이 빠져 있고, M4(clear 후 재발화만으로 session status 미재현)의 전제가
 후자다: Start 훅이 model·effort 세대를 만들 때 State를 active로 초기화하면
 clear가 훅에 의해 풀린다 — Pro §2 절연 동작("현재값이 cleared인 동안 훅은
 재생성하지 않는다")의 세대판이 규범에 없다. 권고 문면:
 
 > 세대 갱신은 자기 필드족만 변경한다. 타 필드족은 값·Declared를 바이트
 > 그대로 이월한다. 훅이 만드는 세대는 State(cleared 포함)·Focus·Stance를
-> 이월한다 — 훅은 mind를 만들 수도, 깨울 수도 없다.
+> 이월한다 — 훅은 session status를 만들 수도, 깨울 수도 없다.
 
-이월이므로 profile-만 갱신과 mind-만 갱신이 대칭이고, §1.2의 경계 자와도
+이월이므로 session profile만 갱신과 session status만 갱신이 대칭이고, §1.2의 경계 자와도
 정합(charge/focus 표류 방지가 필드족 소유권으로 물리 집행된다).
 
 ## 확인만 하고 넘어간 것 (이의 없음, 기록용)
 
 - **낮은 세대 pull 재설치 플랩**: push는 무삭제 rsync라 소유자가 GC한 낮은
   세대를 pull이 일시 재설치할 수 있으나, (a) max 선택에 무영향 — 현재값
-  불변, (b) GC 규칙이 전 노드 동일(C1 표)이라 허브도 지워 수렴. D13 §5 경계
+  불변, (b) GC 규칙이 전 노드 동일(C1 표)이라 업스트림 노드도 지워 수렴. D13 §5 경계
   플랩과 같은 계급의 무해.
-- **mind의 나이-지배 class 편입**: 세대 파일명이 epoch 접두라 D13 경화의
+- **session status의 나이-지배 class 편입**: 세대 파일명이 epoch 접두라 D13 경화의
   scan-gate·과거-나이 가드가 문면 그대로 적용된다 — S1-3 상속 게이트가 이를
-  커버함을 확인. 경화 레인 브리프의 "나이-지배 class" 일반형 표현이 mind를
+  커버함을 확인. 경화 레인 브리프의 "나이-지배 class" 일반형 표현이 session status를
   포함하는지 레인 착륙 검수 때 본다.
-- **pen-retire 사고 계급 부재**: mind는 새 트리·새 파일이라 0.3.0 뇌가 아예
-  읽지 않는다 — 구독자 파싱 실패 계급이 없고, 구버전 노드의 mind 부재는
-  minds 표에서 정직한 "없음"으로 보인다. presence 형식은 불변.
+- **pen-retire 사고 계급 부재**: session status는 새 트리·새 파일이라 0.3.0 코어 CLI가 아예
+  읽지 않는다 — 구독자 파싱 실패 계급이 없고, 구버전 노드의 session status 부재는
+  status board 표에서 정직한 "없음"으로 보인다. presence 형식은 불변.
 - **capture 물리**: hardlink 멱등·digest 충돌 quarantine·crash 3상태가 불변
-  객체 전제와 정합. same-FS v0 제한과 허브 로컬 NVMe 실측 정합.
+  객체 전제와 정합. same-FS v0 제한과 업스트림 노드 로컬 NVMe 실측 정합.
 - **경로 계약**: archive가 $KHALA_ROOT 직하 형제 + P4 증명 의무 — 내 S0
   요구 그대로.
 - **NOT-in-r1**: 전부 동의. transcript 진실원은 기록만(후행 후보) — 옳은

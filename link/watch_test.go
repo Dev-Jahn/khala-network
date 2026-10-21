@@ -41,7 +41,7 @@ func TestAgeGovernedFullScanRequiresSuccessfulReconcile(t *testing.T) {
 	}
 
 	out := make(chan candidate, 16)
-	b := newBrain(failing, home, log.New(io.Discard, "", 0))
+	b := newCoreCLI(failing, home, log.New(io.Discard, "", 0))
 	watcher := newTreeWatcher(home, "dial", "alpha", "beta", log.New(io.Discard, "", 0), b, newOriginSet(), out, time.Second)
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -71,7 +71,7 @@ func TestMindEligibleViewDialOwnShardAndServeAllOtherShards(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	brain := newBrain("/bin/true", home, log.New(io.Discard, "", 0))
+	coreCLI := newCoreCLI("/bin/true", home, log.New(io.Discard, "", 0))
 	for _, tc := range []struct {
 		role string
 		self string
@@ -82,13 +82,13 @@ func TestMindEligibleViewDialOwnShardAndServeAllOtherShards(t *testing.T) {
 		{role: "serve", self: "b200", peer: "beta", want: map[string]bool{"alpha": true, "b200": true}},
 	} {
 		out := make(chan candidate, 16)
-		watcher := newTreeWatcher(home, tc.role, tc.self, tc.peer, log.New(io.Discard, "", 0), brain, newOriginSet(), out, time.Second)
+		watcher := newTreeWatcher(home, tc.role, tc.self, tc.peer, log.New(io.Discard, "", 0), coreCLI, newOriginSet(), out, time.Second)
 		fsWatcher, err := fsnotify.NewWatcher()
 		if err != nil {
 			t.Fatal(err)
 		}
 		watcher.w = fsWatcher
-		watcher.scanMinds()
+		watcher.scanStatuses()
 		if err := fsWatcher.Close(); err != nil {
 			t.Fatal(err)
 		}
@@ -120,14 +120,14 @@ func TestMindWatchReregistersSessionAfterGenerationGC(t *testing.T) {
 		t.Fatal(err)
 	}
 	watcher := newTreeWatcher(home, "dial", "alpha", "b200", log.New(io.Discard, "", 0),
-		newBrain("/bin/true", home, log.New(io.Discard, "", 0)), newOriginSet(), make(chan candidate, 4), time.Second)
+		newCoreCLI("/bin/true", home, log.New(io.Discard, "", 0)), newOriginSet(), make(chan candidate, 4), time.Second)
 	fsWatcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fsWatcher.Close()
 	watcher.w = fsWatcher
-	if err := watcher.addMindWatch(sessionDir); err != nil {
+	if err := watcher.addStatusWatch(sessionDir); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(sessionDir); err != nil {
@@ -143,8 +143,8 @@ func TestMindWatchReregistersSessionAfterGenerationGC(t *testing.T) {
 	if err := os.MkdirAll(sessionDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	watcher.refreshMindWatches()
-	if err := watcher.addMindWatch(sessionDir); err != nil {
+	watcher.refreshStatusWatches()
+	if err := watcher.addStatusWatch(sessionDir); err != nil {
 		t.Fatal(err)
 	}
 	if !watchListContains(fsWatcher.WatchList(), sessionDir) {

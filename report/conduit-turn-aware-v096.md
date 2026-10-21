@@ -1,20 +1,20 @@
-# Conduit turn-aware re-ring — 0.9.6
+# Notifier turn-aware 알림 재시도 — 0.9.6
 
 ## 결론
 
-Stop hook은 해석된 신원의 turn 종료를 노드 로컬 스탬프로 남기고, conduit은 이미 쓴 프레임의 사다리 기한이 지난
-경우에만 이를 읽는다. 유효한 스탬프가 있는 신원은 마지막 outstanding 쓰기 이후의 turn 증거가 있어야 한 번 더
-울린다. 스탬프가 없거나 잘못되었으면 0.9.5 bounded ladder를 그대로 적용한다.
+Stop hook은 해석된 신원의 turn 종료를 노드 로컬 마커로 남기고, 알림 데몬은 이미 쓴 프레임의 백오프 일정 기한이 지난
+경우에만 이를 읽는다. 유효한 마커가 있는 신원은 마지막 outstanding 쓰기 이후의 turn 증거가 있어야 한 번 더
+알림을 전송한다. 마커가 없거나 잘못되었으면 0.9.5 bounded 백오프 일정을 그대로 적용한다.
 
-스탬프 문법은 선택 필드 없이 정확히 다음 한 줄이다.
+마커 문법은 선택 필드 없이 정확히 다음 한 줄이다.
 
 ```
 turn 1 <epoch>
 ```
 
 Claude session id는 판정에 필요하지 않고 문법과 노출 면적만 늘리므로 넣지 않았다. Stop hook은
-`khala_resolve_session 0 0`으로 SessionStart drain 경로와 같은 identity를 고른 뒤 `$KHALA_HOME/tmp`의 0600
-임시 파일을 `run/turns/<identity>`로 옮긴다. `run/`과 `run/turns/`는 0700이다. CLI, 네트워크, lock, drain,
+`khala_resolve_session 0 0`으로 SessionStart 수신함 읽기 경로와 같은 identity를 고른 뒤 `$KHALA_HOME/tmp`의 0600
+임시 파일을 `run/turns/<identity>`로 옮긴다. `run/`과 `run/turns/`는 0700이다. CLI, 네트워크, lock, 수신함 읽기,
 프로세스 신호를 사용하지 않는다.
 
 ## RED 증거
@@ -34,17 +34,17 @@ Claude session id는 판정에 필요하지 않고 문법과 노출 면적만 �
 | 속성 | 결과 | 증거 |
 |---|---|---|
 | P1 parked session | PASS | Go `TestConduitTurnStampGatesEachRering`; shell H24는 26개 pending 중 1 frame 유지 |
-| P2 ignored doorbell | PASS | 같은 Go 테스트와 H24에서 새 turn 하나당 re-ring 하나만 허용 |
-| P3 stamp 없음 | PASS | 기존 `TestConduitBoundsUndrainedGenerationChanges`와 H23 무수정 통과 |
-| P4 drain 우선 | PASS | 기존 `TestConduitDrainResetsOutstandingLadder`와 H13 무수정 통과 |
+| P2 ignored inbox notification | PASS | 같은 Go 테스트와 H24에서 새 turn 하나당 알림 재시도 하나만 허용 |
+| P3 marker 없음 | PASS | 기존 `TestConduitBoundsUndrainedGenerationChanges`와 H23 무수정 통과 |
+| P4 수신함 읽기 우선 | PASS | 기존 `TestConduitDrainResetsOutstandingLadder`와 H13 무수정 통과 |
 | P5 restart | PASS | `TestConduitRestartRestoresTurnGate`; 기존 H8 통과 |
 | P6 hook | PASS | plugin case 8: 문법·0600/0700·overwrite·재귀/no-identity·시간·동일 resolver 확인 |
 | P7 process binding | PASS | 기존 `TestConduitOutstandingStateDoesNotCrossProcesses` 무수정 통과 |
 | P8 hot path | PASS | 5회 중앙값 2.601897 ms → 2.618382 ms = 1.0063x |
-| P9 docs | PASS | DESIGN §9.6 layout과 §3.3 정책 갱신; README에는 현재 re-ring 설명이 없어 무변경 |
+| P9 docs | PASS | DESIGN §9.6 layout과 §3.3 정책 갱신; README에는 현재 알림 재시도 설명이 없어 무변경 |
 
-malformed regular file과 symlink는 `openRegular` 경로에서 거부하며, 신원별 로그 한 줄 뒤 stamp absent로 처리한다.
-`TestConduitMalformedTurnStampFailsOpenOnce`는 기한 전 파일을 읽지 않는 것과 fail-open ladder를 함께 고정하고,
+malformed regular file과 symlink는 `openRegular` 경로에서 거부하며, 신원별 로그 한 줄 뒤 marker absent로 처리한다.
+`TestConduitMalformedTurnStampFailsOpenOnce`는 기한 전 파일을 읽지 않는 것과 fail-open 백오프 일정을 함께 고정하고,
 `TestConduitTurnStampRefusesSymlink`는 `O_NOFOLLOW` 거부와 로그 1회를 고정한다.
 
 ## Hot-path 측정
@@ -59,17 +59,17 @@ malformed regular file과 symlink는 `openRegular` 경로에서 거부하며, �
 
 ## 의도적으로 제외한 것
 
-- ladder 상수, frame 문법, `from:` sender, drain-stamp 계약은 바꾸지 않았다.
+- 백오프 일정 상수, frame 문법, `from:` sender, 수신함 읽기 마커 계약은 바꾸지 않았다.
 - `.ear` 형식과 버전 문자열, CLI 복사본, channel server, dashboard는 바꾸지 않았다.
-- Stop hook은 drain이나 CLI 호출을 하지 않으며 turn stamp는 복제하지 않는다.
-- restart용 sidecar 필드는 추가하지 않았다. 기존 journal의 outstanding write 시각과 디스크 stamp만 사용한다.
+- Stop hook은 수신함 읽기나 CLI 호출을 하지 않으며 턴 마커는 복제하지 않는다.
+- restart용 sidecar 필드는 추가하지 않았다. 기존 journal의 outstanding write 시각과 디스크 marker만 사용한다.
 - journal retention은 별도 `fix/deliveries-retention` 작업으로 남겼다.
 
 ## 검증 기록
 
 - 구현 전 기준 성능: PASS, 위 표 참조.
 - RED Go/H24/plugin: 예상 실패, 위 RED 증거 참조.
-- 구현 후 targeted Go turn/drain/restart/process tests: PASS.
+- 구현 후 targeted Go turn/수신함 읽기/restart/process tests: PASS.
 - 구현 후 `test/conduit.sh`: `RESULT: PASS`, H1–H24 PASS.
 - 최종 `go vet ./...`: PASS (stdout 없음).
 - 최종 `go test -p 2 ./...`: PASS, `ok github.com/Dev-Jahn/khala-network/link 7.049s`.

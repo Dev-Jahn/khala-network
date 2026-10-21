@@ -3,13 +3,14 @@ set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=$ROOT/bin/khala
-GO=${GO:-/NHNHOME/jahn/go-toolchain/bin/go}
+GO=${GO:-$(command -v go)}
 RIG=${KHALA_TEST_ROOT:-${HOME}/.khala-conduit-test-$$}
 BIN=$RIG/khala-link
 RUNTIME_BASE=$RIG/runtime
 LISTENER=$ROOT/test/conduit-listener.py
 CHANNEL_LISTENER=$ROOT/test/channel-listener.py
 PIDS=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_pid in $PIDS; do
@@ -176,11 +177,11 @@ stop_pid() {
 }
 
 mkdir -p "$RIG" "$RUNTIME_BASE" "$RIG/cc-sessions" || fail setup "fixture mkdir failed"
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 (uv venv --python 3.13 "$RIG/venv" >/dev/null) || fail setup "test Python venv failed"
 (cd "$ROOT/link" && CGO_ENABLED=0 "$GO" build -o "$BIN" .) || fail setup "Go build failed"
 
-# H20 — a live channel child replaces the CC socket doorbell for the
+# H20 — a live channel child replaces the CC socket inbox notification for the
 # generation. A dead channel is recorded and falls back to the CC socket for
 # the next generation, never delivering through both paths.
 H20_HOME=$RIG/h20-home
@@ -202,7 +203,7 @@ runtime_env "$BIN" runtime register-channel --instance "$H20_INSTANCE" \
 stage_letter "$H20_HOME" channelled 20 reel@bw2 "Priority: later"
 start_conduit "$H20_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H20_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H20_CHANNEL_FRAMES" 1 40 || fail H20 "live channel did not receive doorbell"
+wait_lines "$H20_CHANNEL_FRAMES" 1 40 || fail H20 "live channel did not receive inbox notification"
 sleep 0.15
 [ "$(line_count "$H20_CC_FRAMES")" -eq 0 ] || fail H20 "CC socket also received successful channel generation"
 uv run --no-project python - "$H20_CHANNEL_FRAMES" <<'PY' || fail H20 "channel request JSON/shape invalid"
@@ -269,7 +270,7 @@ H1_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H1_FRAMES" 1 40 || fail H1 "no frame within 2s"
 sleep 0.15
 [ "$(line_count "$H1_FRAMES")" -eq 1 ] || fail H1 "first generation rang more than once before backoff"
-[ -f "$H1_HOME/inbox/eddy/new/1700000000.1.1.sender@alpha" ] || fail H1 "conduit consumed new/"
+[ -f "$H1_HOME/inbox/eddy/new/1700000000.1.1.sender@alpha" ] || fail H1 "notifier consumed new/"
 uv run --no-project python - "$H1_FRAMES" <<'PY' || fail H1 "frame JSON/shape invalid"
 import json, sys
 frame = json.loads(open(sys.argv[1], encoding="utf-8").readline())
@@ -279,24 +280,24 @@ assert frame["message"]["content"].startswith("KHALA-CONDUIT/1")
 assert frame["priority"] == "next", frame["priority"]
 assert ":" in frame["msg_id"]
 PY
-pass H1 "one valid doorbell arrived (priority next) and the letter remained in new/"
+pass H1 "one valid inbox notification arrived (priority next) and the message remained in new/"
 
 stage_letter "$H1_HOME" eddy 2 clawd@mini
 sleep 0.15
 [ "$(line_count "$H1_FRAMES")" -eq 1 ] || fail H2 "second generation bypassed the outstanding schedule"
-wait_lines "$H1_FRAMES" 2 20 || fail H2 "second generation did not ring on schedule"
+wait_lines "$H1_FRAMES" 2 20 || fail H2 "second generation did not send an inbox notification on schedule"
 stage_letter "$H1_HOME" eddy 3 pen@b200
 sleep 0.15
 [ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed the outstanding schedule"
-wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not ring on schedule"
+wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not send an inbox notification on schedule"
 pass H2 "generation changes refresh the next scheduled frame without minting one immediately"
 
 stop_pid "$H1_CONDUIT_PID"
 stop_pid "$H1_LISTENER_PID"
 
-# H19 — doorbell priority: next by default; later only when every pending
-# letter carries "Priority: later" (khala send --later); one ordinary letter in
-# the batch keeps next; the header is read from the envelope, never the body.
+# H19 — inbox notification priority: next by default; later only when every pending
+# message carries "Priority: later" (khala send --later); one ordinary message in
+# the batch keeps next; the header is read from the header block, never the body.
 H19_HOME=$RIG/h19-home
 init_home "$H19_HOME"
 start_listener h19 h19-session
@@ -308,7 +309,7 @@ register_session "$H19_HOME" quiet h19-session "$H19_LISTENER_PID" \
 stage_letter "$H19_HOME" quiet 1 reel@bw2 "Priority: later"
 start_conduit "$H19_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H19_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H19_FRAMES" 1 40 || fail H19 "later-only generation did not ring"
+wait_lines "$H19_FRAMES" 1 40 || fail H19 "later-only generation did not send an inbox notification"
 uv run --no-project python - "$H19_FRAMES" 1 later <<'PY' || fail H19 "later-only batch was not rung as later"
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
@@ -320,8 +321,8 @@ mkdir -p "$H19_HOME/inbox/quiet/cur"
 mv "$H19_HOME/inbox/quiet/new/1700000000.1.1.sender@alpha" "$H19_HOME/inbox/quiet/cur/"
 printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H19_HOME/run/drained/quiet"
 stage_letter "$H19_HOME" quiet 2 clawd@mini
-wait_lines "$H19_FRAMES" 2 40 || fail H19 "mixed generation did not ring"
-uv run --no-project python - "$H19_FRAMES" 2 next <<'PY' || fail H19 "one ordinary letter did not lift the batch to next"
+wait_lines "$H19_FRAMES" 2 40 || fail H19 "mixed generation did not send an inbox notification"
+uv run --no-project python - "$H19_FRAMES" 2 next <<'PY' || fail H19 "one ordinary message did not lift the batch to next"
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
 frame = json.loads(lines[int(sys.argv[2]) - 1])
@@ -341,7 +342,7 @@ stage_letter "$H19B_HOME" bodyonly 1 reel@bw2
 printf 'Priority: later\n' >> "$H19B_HOME/inbox/bodyonly/new/1700000000.1.1.sender@alpha"
 start_conduit "$H19B_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H19B_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H19B_FRAMES" 1 40 || fail H19 "body-case generation did not ring"
+wait_lines "$H19B_FRAMES" 1 40 || fail H19 "body-case generation did not send an inbox notification"
 uv run --no-project python - "$H19B_FRAMES" 1 next <<'PY' || fail H19 "a body line was honoured as a Priority header"
 import json, sys
 lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
@@ -350,11 +351,11 @@ assert frame["priority"] == sys.argv[3], frame["priority"]
 PY
 stop_pid "$H19B_CONDUIT_PID"
 stop_pid "$H19B_LISTENER_PID"
-pass H19 "doorbell is next by default, later only when every letter asks, and only via the envelope"
+pass H19 "inbox notification is next by default, later only when every message asks, and only via the header block"
 
-# H13 — a written doorbell stays outstanding until a later drain. An unchanged
-# generation does not use the fast backoff; after a drain, a changed generation
-# rings immediately.
+# H13 — a written inbox notification stays outstanding until a later inbox read. An unchanged
+# generation does not use the fast backoff; after an inbox read, a changed generation
+# notifies immediately.
 H13_HOME=$RIG/h13-home
 init_home "$H13_HOME"
 start_listener h13 h13-session
@@ -374,16 +375,16 @@ mkdir -p "$H13_HOME/inbox/h13id/cur"
 mv "$H13_HOME/inbox/h13id/new/1700000000.1.1.sender@alpha" "$H13_HOME/inbox/h13id/cur/"
 printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H13_HOME/run/drained/h13id"
 stage_letter "$H13_HOME" h13id 2 clawd@mini
-wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change after drain did not ring"
+wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change after inbox read did not send an inbox notification"
 sleep 1
 [ "$(line_count "$H13_FRAMES")" -eq 2 ] || fail H13 "second written generation was re-rung"
 stop_pid "$H13_CONDUIT_PID"
 stop_pid "$H13_LISTENER_PID"
-pass H13 "an outstanding frame is held; drain consumption makes the next generation ring immediately"
+pass H13 "an outstanding frame is held; inbox read consumption makes the next generation notify immediately"
 
-# H23 — frequent generation changes cannot outrun the bounded re-ring ladder
-# while the accepting session never drains. The 1.25s observation window is 25
-# first intervals; the final frame must summarize all coalesced letters.
+# H23 — frequent generation changes cannot outrun the bounded backoff schedule
+# while the accepting session never reads the inbox. The 1.25s observation window is 25
+# first intervals; the final frame must summarize all coalesced messages.
 H23_HOME=$RIG/h23-home
 init_home "$H23_HOME"
 start_listener h23 h23-session
@@ -403,8 +404,8 @@ while [ "$h23_seq" -le 26 ]; do
 done
 sleep 0.25
 h23_count=$(line_count "$H23_FRAMES")
-[ "$h23_count" -le 6 ] || fail H23 "26 letters wrote $h23_count frames; schedule permits at most 6"
-[ "$h23_count" -ge 5 ] || fail H23 "ladder wrote only $h23_count frames; want at least 5"
+[ "$h23_count" -le 6 ] || fail H23 "26 messages wrote $h23_count frames; schedule permits at most 6"
+[ "$h23_count" -ge 5 ] || fail H23 "backoff schedule wrote only $h23_count frames; want at least 5"
 h23_journals=$(find "$RUNTIME_BASE/deliveries/bounded" -type f -name '*.json' | wc -l | tr -d ' ')
 [ "$h23_journals" -eq "$h23_count" ] || fail H23 "$h23_journals journals for $h23_count frames"
 H23_PENDING=$(runtime_env KHALA_HOME="$H23_HOME" "$BIN" runtime pending-generation --identity bounded) || \
@@ -424,9 +425,9 @@ assert lines["retry"] == "0", lines
 PY
 stop_pid "$H23_CONDUIT_PID"
 stop_pid "$H23_PID"
-pass H23 "26 changing generations over 25 first intervals stayed within the six-frame ladder bound"
+pass H23 "26 changing generations over 25 first intervals stayed within the six-frame backoff schedule bound"
 
-# H24 — an existing turn stamp gates each scheduled re-ring. A parked session
+# H24 — an existing turn marker gates each scheduled notification retry. A parked session
 # keeps only its first queued frame; a fresh turn permits exactly one more.
 H24_HOME=$RIG/h24-home
 init_home "$H24_HOME"
@@ -457,15 +458,15 @@ while [ "$(date +%s)" -le "$h24_turn" ]; do
     sleep 0.05
 done
 mv "$H24_HOME/tmp/h24-turn" "$H24_HOME/run/turns/turnaware"
-wait_lines "$H24_FRAMES" 2 40 || fail H24 "new turn did not allow the due re-ring"
+wait_lines "$H24_FRAMES" 2 40 || fail H24 "new turn did not allow the due notification retry"
 sleep 0.65
 [ "$(line_count "$H24_FRAMES")" -eq 2 ] || \
-    fail H24 "one turn allowed more than one re-ring (got $(line_count "$H24_FRAMES") frames)"
+    fail H24 "one turn allowed more than one notification retry (got $(line_count "$H24_FRAMES") frames)"
 printf 'turn 1 %s\n' "$(date +%s)" > "$H24_HOME/run/turns/turnaware"
-wait_lines "$H24_FRAMES" 3 40 || fail H24 "second new turn did not allow the next due re-ring"
+wait_lines "$H24_FRAMES" 3 40 || fail H24 "second new turn did not allow the next due notification retry"
 stop_pid "$H24_CONDUIT_PID"
 stop_pid "$H24_PID"
-pass H24 "parked sessions keep one frame and each later turn permits one scheduled re-ring"
+pass H24 "parked sessions keep one frame and each later turn permits one scheduled notification retry"
 
 # H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
 H3_HOME=$RIG/h3-home
@@ -495,7 +496,7 @@ stop_pid "$H3_PID"
 
 # H14 — resume race: the lease was claimed before the Claude registry file
 # existed (pid unknown → lease pid 0); once the registration resolves the pid,
-# the conduit heals the lease and rings instead of failing forever with
+# the notifier heals the lease and notifies instead of failing forever with
 # "pid/start mismatch" (measured 2026-08-16, ink `claude --resume`).
 H14_HOME=$RIG/h14-home
 init_home "$H14_HOME"
@@ -517,7 +518,7 @@ mv "$RIG/h14-registry.hidden" "$RIG/cc-sessions/$H14_PID.json"
 stage_letter "$H14_HOME" resumed 5
 start_conduit "$H14_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms
 H14_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H14_FRAMES" 1 60 || fail H14 "conduit never rang after the registry landed (lease pid stayed 0)"
+wait_lines "$H14_FRAMES" 1 60 || fail H14 "notifier never sent an inbox notification after the registry landed (lease pid stayed 0)"
 uv run --no-project python - "$RUNTIME_BASE/identities/resumed.lease" "$H14_PID" <<'PY' || fail H14 "lease was not healed with the live pid"
 import json, sys
 lease = json.load(open(sys.argv[1]))
@@ -558,8 +559,8 @@ HOME=$RIG KHALA_HOME=$H4_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID
     "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h4-hook-session"}' \
     >"$RIG/h4-hook.out" 2>"$RIG/h4-hook.err" || fail H4 "non-owner SessionStart failed"
 grep -q 'you are not the receiver of shared' "$RIG/h4-hook.out" || fail H4 "non-owner hook warning missing"
-[ -f "$H4_HOME/inbox/shared/new/1700000000.1.5.sender@alpha" ] || fail H4 "non-owner hook drained mail"
-pass H4 "only the lease owner is rung; a second SessionStart warns and drains nothing"
+[ -f "$H4_HOME/inbox/shared/new/1700000000.1.5.sender@alpha" ] || fail H4 "non-owner hook read mail"
+pass H4 "only the lease owner is notified; a second SessionStart warns and reads nothing"
 
 WORKER_REG=$(register_session "$H4_HOME" worker worker-session "$CLAIM_PID" "$CLAIM_SOCKET" \
     worker ready) || fail H5 "worker registration failed"
@@ -583,7 +584,7 @@ PY
 kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "takeover signalled the prior owner"
 stage_letter "$H4_HOME" shared 6
 wait_lines "$CLAIM_FRAMES" 1 40 || fail H6 "new owner was not rung after takeover"
-kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "old owner died after conduit reroute"
+kill -0 "$OWNER_PID" 2>/dev/null || fail H6 "old owner died after notifier reroute"
 pass H6 "takeover bumps only the epoch, reroutes delivery, and sends no signal"
 
 # H15 — a bind run from inside ANOTHER session (whose environment exports
@@ -656,8 +657,8 @@ stop_pid "$H4_CONDUIT_PID"
 stop_pid "$OWNER_PID"
 stop_pid "$CLAIM_PID"
 
-# H7/H9 are hook-level gates: no identity refuses; non-owner never drains;
-# ready registration survives a drain lock deadline.
+# H7/H9 are hook-level gates: no identity refuses; non-owner never reads the inbox;
+# ready registration survives an inbox-read lock deadline.
 H7_HOME=$RIG/h7-home
 init_home "$H7_HOME"
 H7_PROJECT=$RIG/h7-project
@@ -678,9 +679,17 @@ stage_letter "$H7_HOME" timed 7
 mkdir -p "$H7_HOME/run/brain.lock.d"
 printf '%s\npid %s contention\n' "$(date +%s)" "$$" > "$H7_HOME/run/brain.lock.d/owner"
 h9_reconcile_pids=
+# Each contention loop leads its own process group, so it is killed whole:
+# setsid(1) is util-linux; on macOS the system perl makes the same setsid(2).
+if command -v setsid >/dev/null 2>&1; then
+    h9_own_session=(setsid)
+else
+    h9_own_session=(perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!\n";
+        exec { $ARGV[0] } @ARGV or die "exec: $!\n"' --)
+fi
 h9_loop=1
 while [ "$h9_loop" -le 3 ]; do
-    setsid sh -c 'while :; do KHALA_HOME=$1 "$2" reconcile >/dev/null 2>&1 || :; done' \
+    "${h9_own_session[@]}" sh -c 'while :; do KHALA_HOME=$1 "$2" reconcile >/dev/null 2>&1 || :; done' \
         sh "$H7_HOME" "$KHALA" &
     h9_reconcile_pid=$!
     h9_reconcile_pids="$h9_reconcile_pids $h9_reconcile_pid"
@@ -694,7 +703,7 @@ while ! runtime_env KHALA_HOME="$H7_HOME" "$BIN" runtime daemon-status >/dev/nul
     sleep 0.05
     h9_wait=$((h9_wait + 1))
 done
-[ "$h9_wait" -lt 40 ] || fail H9 "fixture conduit did not become live"
+[ "$h9_wait" -lt 40 ] || fail H9 "fixture notifier did not become live"
 H7_OWNER=$(register_session "$H7_HOME" taken h7-owner "$$" "$RIG/h7-missing.sock" \
     interactive ready) || fail H7 "live owner registration failed"
 printf '%s\n' "$H7_OWNER" | grep -q '^owner yes$' || fail H7 "fixture owner did not get lease"
@@ -736,13 +745,13 @@ import sys
 assert float(sys.argv[1]) < 12.0
 PY
 grep -R -q '"phase":"ready"' "$RUNTIME_BASE/sessions" || fail H9 "registration never reached ready"
-[ -f "$H7_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out drain consumed/misplaced mail"
+[ -f "$H7_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out inbox read consumed/misplaced mail"
 rm -rf -- "$H7_HOME/run/brain.lock.d"
 for h9_reconcile_pid in $h9_reconcile_pids; do
     kill -- "-$h9_reconcile_pid" 2>/dev/null || :
     wait "$h9_reconcile_pid" 2>/dev/null || :
 done
-pass H9 "contended SessionStart ${h9_elapsed}s (<12s), ready preceded the 10s drain timeout"
+pass H9 "contended SessionStart ${h9_elapsed}s (<12s), ready preceded the 10s inbox read timeout"
 stop_pid "$H9_CONDUIT_PID"
 
 # H8 — journal recovery suppresses an immediate duplicate; failed writes retry.
@@ -798,8 +807,8 @@ kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified channel made watch 
 grep -Fqx 'watch: conduit path unverified; watching directly' "$RIG/h10-unverified.err" || \
     fail H10 "direct-watch explanation missing"
 stage_letter "$H10_HOME" watcher 10
-wait "$H10_WATCH_PID" || fail H10 "direct watch did not wake on a letter"
-grep -q '^1$' "$RIG/h10-unverified.out" || fail H10 "direct watch output missing letter count"
+wait "$H10_WATCH_PID" || fail H10 "direct watch did not wake on a message"
+grep -q '^1$' "$RIG/h10-unverified.out" || fail H10 "direct watch output missing message count"
 runtime_env "$BIN" runtime register-channel --instance "$H10_INSTANCE" \
     --session-id h10-session --channel-socket "$H10_CHANNEL_SOCKET" \
     --caller-pid "$H10_CHANNEL_PID" --verified >/dev/null || fail H10 "verified channel registration failed"
@@ -817,9 +826,9 @@ PIDS="$PIDS $H10_WATCH_PID"
 sleep 0.2
 kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified watch retreated early"
 stage_letter "$H10_HOME" legacy 10
-wait "$H10_WATCH_PID" || fail H10 "legacy watch did not wake on a letter"
-grep -q '^1$' "$RIG/h10-legacy.out" || fail H10 "legacy watch output missing letter count"
-pass H10 "watch keeps its own ear for an unverified channel and yields for a verified path"
+wait "$H10_WATCH_PID" || fail H10 "legacy watch did not wake on a message"
+grep -q '^1$' "$RIG/h10-legacy.out" || fail H10 "legacy watch output missing message count"
+pass H10 "watch keeps watching directly for an unverified channel and yields for a verified path"
 stop_pid "$H10_CHANNEL_PID"
 stop_pid "$H10_CONDUIT_PID"
 stop_pid "$H10_PID"
@@ -832,7 +841,7 @@ mkdir -p "$RIG/h11-target"
 ln -s "$RIG/h11-target" "$H11_RUNTIME"
 if env KHALA_RUNTIME_DIR=$H11_RUNTIME KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_HOME=$H11_HOME \
     "$BIN" conduit >"$RIG/h11.out" 2>"$RIG/h11.err"; then
-    fail H11 "conduit accepted a symlink runtime"
+    fail H11 "notifier accepted a symlink runtime"
 fi
 grep -qi 'symlink' "$RIG/h11.err" || fail H11 "symlink refusal was unclear"
 H11_PROJECT=$RIG/h11-project
@@ -846,7 +855,7 @@ HOME=$RIG KHALA_HOME=$H11_HOME KHALA_RUNTIME_DIR=$H11_RUNTIME \
     fail H11 "symlink hook exited nonzero"
 grep -qi 'symlink' "$RIG/h11-hook.out" || fail H11 "hook symlink refusal was unclear"
 [ -z "$(find "$RIG/h11-target" -mindepth 1 -print -quit)" ] || fail H11 "symlink target was written"
-pass H11 "conduit and SessionStart refuse a symlink runtime root"
+pass H11 "notifier and SessionStart refuse a symlink runtime root"
 
 # H12 — only the dial process may launch periodic reconcile; serve is per-peer singleton.
 H12_A=$RIG/h12-a
@@ -874,7 +883,7 @@ while [ "$(date +%s)" -lt "$h12_end" ]; do
         if [ -n "$h12_owner" ]; then
             h12_parent=$(ps -o ppid= -p "$h12_owner" 2>/dev/null | tr -d ' ')
             [ -z "$h12_parent" ] || [ "$h12_parent" = "$H12_DIAL_PID" ] || \
-                fail H12 "non-dial process $h12_parent owned periodic brain reconcile"
+                fail H12 "non-dial process $h12_parent owned periodic core CLI reconcile"
         fi
     fi
     [ ! -d "$H12_B/run/brain.lock.d" ] || \
@@ -897,17 +906,17 @@ env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG
     "$BIN" conduit >"$H17_RIG/a.out" 2>"$H17_RIG/a.err" &
 H17_CONDUIT_PID=$!
 PIDS="$PIDS $H17_CONDUIT_PID"
-wait_file "$H17_RUNTIME/conduit.status.json" 100 || fail H17 "conduit A wrote no status"
+wait_file "$H17_RUNTIME/conduit.status.json" 100 || fail H17 "notifier A wrote no status"
 h17_wait=0
 while ! grep -q 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null && \
     [ "$h17_wait" -lt 100 ]; do
     sleep 0.05
     h17_wait=$((h17_wait + 1))
 done
-[ "$h17_wait" -lt 100 ] || fail H17 "conduit A did not log its start"
+[ "$h17_wait" -lt 100 ] || fail H17 "notifier A did not log its start"
 env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_B \
     KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" runtime daemon-status >/dev/null 2>"$H17_RIG/daemon-b.err" || \
-    fail H17 "runtime daemon-status from XDG environment B did not see conduit A"
+    fail H17 "runtime daemon-status from XDG environment B did not see notifier A"
 find "$RIG" -name conduit.status.json -type f -print | sort > "$H17_RIG/status.before"
 h17_started_before=$(grep -c 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null || :)
 env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_B \
@@ -922,15 +931,15 @@ while kill -0 "$H17_SECOND_PID" 2>/dev/null && [ "$h17_wait" -lt 40 ]; do
 done
 if kill -0 "$H17_SECOND_PID" 2>/dev/null; then
     stop_pid "$H17_SECOND_PID"
-    fail H17 "second conduit from XDG environment B did not exit immediately"
+    fail H17 "second notifier from XDG environment B did not exit immediately"
 fi
 wait "$H17_SECOND_PID"
 h17_second_status=$?
-[ "$h17_second_status" -eq 0 ] || fail H17 "second conduit exited $h17_second_status"
+[ "$h17_second_status" -eq 0 ] || fail H17 "second notifier exited $h17_second_status"
 find "$RIG" -name conduit.status.json -type f -print | sort > "$H17_RIG/status.after"
-cmp -s "$H17_RIG/status.before" "$H17_RIG/status.after" || fail H17 "second conduit wrote another status file"
+cmp -s "$H17_RIG/status.before" "$H17_RIG/status.after" || fail H17 "second notifier wrote another status file"
 h17_started_after=$(grep -c 'started pid=' "$H17_HOME/log/conduit.log" 2>/dev/null || :)
-[ "$h17_started_after" -eq "$h17_started_before" ] || fail H17 "second conduit logged started pid="
+[ "$h17_started_after" -eq "$h17_started_before" ] || fail H17 "second notifier logged started pid="
 env KHALA_HOME=$H17_HOME KHALA_RUNTIME_DIR=$H17_RUNTIME XDG_RUNTIME_DIR=$H17_XDG_A \
     KHALA_TEST_BOOT_ID=h17-test-boot "$BIN" runtime status > "$H17_RIG/status-a.out" || \
     fail H17 "runtime status failed in environment A"
@@ -942,12 +951,12 @@ h17_runtime_b=$(sed -n '1p' "$H17_RIG/status-b.out")
 [ "$h17_runtime_a" = "runtime: $H17_RUNTIME" ] || fail H17 "environment A printed $h17_runtime_a"
 [ "$h17_runtime_a" = "$h17_runtime_b" ] || fail H17 "runtime lines differ across XDG environments"
 grep -Fq "\"runtime\":\"$H17_RUNTIME\"" "$H17_RUNTIME/conduit.status.json" || \
-    fail H17 "conduit status omitted the chosen runtime root"
+    fail H17 "notifier status omitted the chosen runtime root"
 stop_pid "$H17_CONDUIT_PID"
-pass H17 "one explicit runtime plane survives differing XDG environments and rejects a second conduit"
+pass H17 "one explicit runtime plane survives differing XDG environments and rejects a second notifier"
 
 # H18 — even after obtaining a replacement lock inode, a live status record
-# prevents a second conduit from overwriting the singleton's state.
+# prevents a second notifier from overwriting the singleton's state.
 H18_RIG=$RIG/h18
 H18_HOME=$H18_RIG/home
 H18_RUNTIME=$H18_RIG/rt
@@ -963,9 +972,9 @@ env KHALA_HOME=$H18_HOME KHALA_RUNTIME_DIR=$H18_RUNTIME KHALA_TEST_BOOT_ID=h18-t
     fail H18 "live-status guard did not exit 0"
 grep -Fq "another conduit is live (pid=$$); exiting" "$H18_HOME/log/conduit.log" || \
     fail H18 "live-status guard log is missing"
-grep -q 'started pid=' "$H18_HOME/log/conduit.log" && fail H18 "guarded conduit logged a start"
+grep -q 'started pid=' "$H18_HOME/log/conduit.log" && fail H18 "guarded notifier logged a start"
 cmp -s "$H18_RIG/status.before" "$H18_RUNTIME/conduit.status.json" || \
-    fail H18 "guarded conduit overwrote the live status"
+    fail H18 "guarded notifier overwrote the live status"
 sleep 30 &
 H18_DEAD_PID=$!
 PIDS="$PIDS $H18_DEAD_PID"
@@ -985,14 +994,14 @@ while ! grep -q "\"pid\":$H18_CONDUIT_PID" "$H18_RUNTIME/conduit.status.json" 2>
     sleep 0.05
     h18_wait=$((h18_wait + 1))
 done
-[ "$h18_wait" -lt 100 ] || fail H18 "dead status did not allow a fresh conduit to start"
-kill -0 "$H18_CONDUIT_PID" 2>/dev/null || fail H18 "fresh conduit is not live"
+[ "$h18_wait" -lt 100 ] || fail H18 "dead status did not allow a fresh notifier to start"
+kill -0 "$H18_CONDUIT_PID" 2>/dev/null || fail H18 "fresh notifier is not live"
 grep -Fq "started pid=$H18_CONDUIT_PID runtime=$H18_RUNTIME" "$H18_HOME/log/conduit.log" || \
-    fail H18 "fresh conduit did not log its start"
+    fail H18 "fresh notifier did not log its start"
 stop_pid "$H18_CONDUIT_PID"
 pass H18 "a live status survives a replaced lock inode; a dead status permits startup"
 
-# H21 — one real conduit snapshot is bounded, leak-free, transition-driven,
+# H21 — one real listener snapshot is bounded, leak-free, transition-driven,
 # and replaced by an empty snapshot on clean shutdown.
 H21_HOME=$RIG/h21-home
 init_home "$H21_HOME"
@@ -1051,7 +1060,7 @@ H21_PENDING=$(runtime_env KHALA_HOME="$H21_HOME" "$BIN" runtime pending-generati
 [ ! -s "$RIG/h21.pending.err" ] || fail H21 "pending-generation wrote stderr"
 H21_PENDING_GENERATION=${H21_PENDING%% *}
 uv run --no-project python - "$LISTENER_OUTPUT" "$H21_PENDING_GENERATION" <<'PY' || \
-    fail H21 "pending-generation differs from the doorbell frame"
+    fail H21 "pending-generation differs from the notification frame"
 import json, sys
 frame = json.loads(open(sys.argv[1], encoding="utf-8").readline())
 content = frame["message"]["content"].splitlines()
@@ -1076,7 +1085,7 @@ done
 stop_pid "$H21_CONDUIT_PID"
 [ "$(grep -c '^identity ' "$H21_EAR" || :)" -eq 0 ] || fail H21 "clean shutdown snapshot retained identities"
 grep -q '^state stopping$' "$H21_EAR" || fail H21 "clean shutdown snapshot did not say stopping"
-pass H21 "ear snapshot is exact, leak-free, transition-driven, and empty on shutdown"
+pass H21 "listener snapshot is exact, leak-free, transition-driven, and empty on shutdown"
 
 # H22 — dashboard binds the requested ephemeral address, authenticates every
 # API call, returns the security headers, and leaves KHALA_HOME byte-for-byte

@@ -1,16 +1,35 @@
 #!/usr/bin/env python3
 """Isolated compatibility tests; no installed Khala, SSH, or live peers used."""
 import concurrent.futures
+import json
 import os
 from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 
 CLI = Path(__file__).resolve().parents[1] / "bin/khala"
+ISOLATE = Path(__file__).resolve().parent / "lib/isolate.sh"
+
+
+def isolated_environment(base):
+    """The environment test/lib/isolate.sh gives every suite, isolated inside base.
+
+    The exec skips the helper's exit trap, so its directory stays until base
+    itself is removed.
+    """
+    dump = "import json, os, sys; json.dump(dict(os.environ), sys.stdout)"
+    result = subprocess.run(["bash", "-c", '. "$0" && exec "$1" -c "$2"',
+                             str(ISOLATE), sys.executable, dump],
+                            env={**os.environ, "KHALA_TEST_ISOLATION_BASE": base},
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    return json.loads(result.stdout)
 
 
 class MailboxCompatibility(unittest.TestCase):
@@ -18,7 +37,8 @@ class MailboxCompatibility(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "khala"
-        self.env = {**os.environ, "KHALA_HOME": str(self.home), "KHALA_SESSION": "sender"}
+        self.env = {**isolated_environment(self.tmp.name),
+                    "KHALA_HOME": str(self.home), "KHALA_SESSION": "sender"}
         self.run_cli("init", "test")
 
     def run_cli(self, *args, session=None, body=None, ok=True):

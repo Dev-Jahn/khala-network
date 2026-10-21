@@ -5,6 +5,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 KHALA=${KHALA_UNDER_TEST-$ROOT/bin/khala}
 RIG=$HOME/.khala-locks-test-$$
 FAILURES=
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     rm -rf -- "$RIG"
@@ -74,31 +75,31 @@ assert_prompt_say() {
 
 property_p1() {
     home=$RIG/p1-home
-    prepare_letters "$home" 8 || die "could not prepare eight drain letters"
+    prepare_letters "$home" 8 || die "could not prepare eight messages to read"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
         2>"$RIG/p1-drain.err" | head -3 >"$RIG/p1-head.out"
     drain_status=${PIPESTATUS[0]}
-    [ "$drain_status" -ne 0 ] || die "early-closed drain unexpectedly completed"
+    [ "$drain_status" -ne 0 ] || die "early-closed inbox read unexpectedly completed"
     [ ! -e "$home/run/brain.lock.d" ] || die "SIGPIPE left brain.lock.d behind"
     assert_prompt_say "$home" p1 || die "subsequent say did not succeed within 3s"
 }
 
 property_p2() {
     home=$RIG/p2-home
-    prepare_letters "$home" 8 || die "could not prepare eight drain letters"
+    prepare_letters "$home" 8 || die "could not prepare eight messages to read"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
         2>"$RIG/p2-drain.err" | head -30 >"$RIG/p2-head.out"
     drain_status=${PIPESTATUS[0]}
-    [ "$drain_status" -ne 0 ] || die "bounded-output drain unexpectedly completed"
+    [ "$drain_status" -ne 0 ] || die "bounded-output inbox read unexpectedly completed"
     printed_id=$(sed -n 's/^--- \(.*\) ---$/\1/p' "$RIG/p2-head.out")
-    [ -n "$printed_id" ] || die "drain did not print a complete letter marker"
+    [ -n "$printed_id" ] || die "inbox read did not print a complete message marker"
     [ "$(printf '%s\n' "$printed_id" | wc -l | tr -d ' ')" -eq 1 ] || \
-        die "drain printed more than one letter marker"
-    [ -f "$home/inbox/reader/cur/$printed_id" ] || die "printed letter was not moved to cur"
+        die "inbox read printed more than one message marker"
+    [ -f "$home/inbox/reader/cur/$printed_id" ] || die "printed message was not moved to cur"
     [ "$(count_files "$home/inbox/reader/cur")" -eq 1 ] || \
-        die "an unprinted letter was moved to cur"
+        die "an unprinted message was moved to cur"
     [ "$(count_files "$home/inbox/reader/new")" -eq 7 ] || \
-        die "unprinted letters did not remain in new"
+        die "unprinted messages did not remain in new"
 }
 
 run_drain_signal_case() {
@@ -119,7 +120,7 @@ run_drain_signal_case() {
         "$KHALA" inbox --drain >"$RIG/$signal_tag.out" 2>"$RIG/$signal_tag.err"
     drain_status=$?
     if [ "$drain_status" -ne "$signal_status" ]; then
-        printf '    %s drain status was %s, expected %s\n' \
+        printf '    %s inbox read status was %s, expected %s\n' \
             "$signal_name" "$drain_status" "$signal_status" >&2
         return 1
     fi
@@ -138,7 +139,7 @@ property_p3() {
     signal_failed=0
     run_drain_signal_case INT 130 p3-int || signal_failed=1
     run_drain_signal_case TERM 143 p3-term || signal_failed=1
-    [ "$signal_failed" -eq 0 ] || die "INT/TERM drain cleanup failed"
+    [ "$signal_failed" -eq 0 ] || die "INT/TERM inbox read cleanup failed"
 }
 
 property_p4() {
@@ -233,11 +234,7 @@ property_p6() {
     for regression_suite in local-roundtrip exchange-roundtrip hardening watch \
         concurrency plugin link; do
         if [ "$regression_suite" = plugin ]; then
-            PLUGIN_SKIP_REGRESSION=1 PATH=$HOME/go-toolchain/bin:$PATH \
-                bash "$p6_root/test/$regression_suite.sh" \
-                >"$RIG/p6-$regression_suite.out" 2>"$RIG/p6-$regression_suite.err"
-        elif [ "$regression_suite" = link ]; then
-            PATH=$HOME/go-toolchain/bin:$PATH \
+            PLUGIN_SKIP_REGRESSION=1 \
                 bash "$p6_root/test/$regression_suite.sh" \
                 >"$RIG/p6-$regression_suite.out" 2>"$RIG/p6-$regression_suite.err"
         else
@@ -267,11 +264,11 @@ run_property() {
 }
 
 mkdir -p "$RIG" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
-run_property P1 'early-closed drain releases brain lock and the next say is prompt' property_p1
-run_property P2 'printed letters move to cur while unprinted letters remain in new' property_p2
-run_property P3 'INT and TERM during drain release brain lock and the next say is prompt' property_p3
+run_property P1 'early-closed inbox read releases state lock and the next say is prompt' property_p1
+run_property P2 'printed messages move to cur while unprinted messages remain in new' property_p2
+run_property P3 'INT and TERM during inbox read release state lock and the next say is prompt' property_p3
 run_property P4 'interrupted watch still removes its marker and singleton lock' property_p4
 run_property P5 'scan gate wins short contention but returns promptly on long contention' property_p5
 if [ "${LOCKS_SKIP_REGRESSION-}" = 1 ]; then

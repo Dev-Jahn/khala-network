@@ -7,9 +7,10 @@ START=$ROOT/plugin/hooks/session-start.sh
 STOP=$ROOT/plugin/hooks/stop.sh
 RIG=$HOME/.khala-minds-test-$$
 FAILURES=
-GO=${GO_BINARY-"$HOME/go-toolchain/bin/go"}
+GO=${GO_BINARY-$(command -v go)}
 GO_TMP=$HOME/.cache/khala-go-tmp
 GO_CACHE=$HOME/.cache/khala-go-cache
+. "$ROOT/test/lib/isolate.sh"
 
 cleanup() {
     for cleanup_status in "$RIG"/*/runtime-root/conduit.status.json; do
@@ -176,7 +177,7 @@ property_m1() {
     home_h=$RIG/m1-b200
     init_home "$home_a" alpha
     init_home "$home_h" b200
-    write_spoke_config "$home_a" alpha "$home_h" || die "could not write spoke config"
+    write_spoke_config "$home_a" alpha "$home_h" || die "could not write downstream node config"
     initial_gen=$(KHALA_HOME=$home_a KHALA_SESSION=worker "$KHALA" mind -m 'V1') || die "V1 failed"
     rollback_epoch=$(( ${initial_gen%%.*} + 10 ))
     gen1=$rollback_epoch.0
@@ -192,21 +193,21 @@ property_m1() {
         die "generation did not increase monotonically"
     mkdir -p "$home_h/minds/alpha/worker" || die "could not make delayed shard"
     cp "$RIG/m1-v1" "$home_h/minds/alpha/worker/$gen1" || die "could not stage delayed V1"
-    KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/m1-sync.err" || die "mind sync failed"
-    KHALA_HOME=$home_a "$KHALA" minds >"$RIG/m1.out" || die "minds failed"
+    KHALA_HOME=$home_a "$KHALA" sync >/dev/null 2>"$RIG/m1-sync.err" || die "session status sync failed"
+    KHALA_HOME=$home_a "$KHALA" minds >"$RIG/m1.out" || die "status board failed"
     grep -Fq 'V2' "$RIG/m1.out" || die "delayed V1 displaced V2"
-    grep -Fq 'V1' "$RIG/m1.out" && die "minds displayed delayed V1"
+    grep -Fq 'V1' "$RIG/m1.out" && die "status board displayed delayed V1"
     [ "$(latest_generation "$home_a/minds/alpha/worker")" = "$gen2" ] || die "local GC did not retain max generation"
 }
 
 property_m2() {
     home=$RIG/m2-home
     init_home "$home" alpha
-    old=$(KHALA_HOME=$home KHALA_SESSION=worker "$KHALA" mind -m 'withdraw me') || die "mind failed"
-    cp "$home/minds/alpha/worker/$old" "$RIG/m2-old" || die "could not save old mind"
+    old=$(KHALA_HOME=$home KHALA_SESSION=worker "$KHALA" mind -m 'withdraw me') || die "status update failed"
+    cp "$home/minds/alpha/worker/$old" "$RIG/m2-old" || die "could not save old session status"
     clear=$(KHALA_HOME=$home KHALA_SESSION=worker "$KHALA" mind --clear) || die "clear failed"
-    cp "$RIG/m2-old" "$home/minds/alpha/worker/$old" || die "could not reintroduce old mind"
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m2.out" || die "minds failed"
+    cp "$RIG/m2-old" "$home/minds/alpha/worker/$old" || die "could not reintroduce old session status"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m2.out" || die "status board failed"
     grep -Fq 'withdraw me' "$RIG/m2.out" && die "clear was revived by an old generation"
     grep -qx 'State: cleared' "$home/minds/alpha/worker/$clear" || die "clear generation is not cleared"
 }
@@ -222,7 +223,7 @@ property_m3() {
     run_start "$home" "$project" "$RIG/m3-start-a.out" \
         '{"hook_event_name":"SessionStart","source":"startup","model":"claude-a"}' || die "Start A failed"
     KHALA_HOME=$home KHALA_SESSION=same-name "$KHALA" mind -m 'B owns this' --stance focused >/dev/null ||
-        die "B mind failed"
+        die "B status update failed"
     run_start "$home" "$project" "$RIG/m3-start-b.out" \
         '{"hook_event_name":"SessionStart","source":"resume","model":"claude-b"}' || die "Start B failed"
     before_model_less=$(latest_generation "$home/minds/alpha/same-name")
@@ -236,8 +237,8 @@ property_m3() {
         PATH=$HOOK_SHIM:/usr/bin:/bin "$STOP" >/dev/null 2>"$RIG/m3-stop.err" || die "late Stop failed"
     after=$(count_files "$home/minds/alpha/same-name")
     [ "$count_after_model_less" -eq "$after" ] || die "Stop created a generation"
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m3.out" || die "minds failed"
-    grep -Fq 'B owns this' "$RIG/m3.out" || die "Start/Stop changed the mind family"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m3.out" || die "status board failed"
+    grep -Fq 'B owns this' "$RIG/m3.out" || die "Start/Stop changed the session status family"
     grep -Fq 'claude-b' "$RIG/m3.out" || die "latest Start model was not declared"
     grep -Fq 'high' "$RIG/m3.out" || die "Start model update changed effort"
 }
@@ -246,9 +247,9 @@ property_m4() {
     home=$RIG/m4-home
     project=$RIG/m4-project
     init_home "$home" alpha
-    KHALA_HOME=$home KHALA_SESSION=retired-one "$KHALA" mind -m 'old focus' >/dev/null || die "mind failed"
+    KHALA_HOME=$home KHALA_SESSION=retired-one "$KHALA" mind -m 'old focus' >/dev/null || die "status update failed"
     KHALA_HOME=$home "$KHALA" retire retired-one >/dev/null || die "retire failed"
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m4-retired.out" || die "retired minds failed"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m4-retired.out" || die "retired status board failed"
     grep -q '^retired-one@alpha' "$RIG/m4-retired.out" && die "retired identity stayed visible"
     prepare_hook || die "could not prepare hook rig"
     mkdir -p "$project"
@@ -256,9 +257,9 @@ property_m4() {
     run_start "$home" "$project" "$RIG/m4-start.out" \
         '{"hook_event_name":"SessionStart","source":"resume","model":"claude-new"}' || die "restart hook failed"
     KHALA_HOME=$home KHALA_SESSION=retired-one "$KHALA" say -m 'presence only' >/dev/null || die "revival say failed"
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m4-revived.out" || die "revived minds failed"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m4-revived.out" || die "revived status board failed"
     grep -q '^retired-one@alpha' "$RIG/m4-revived.out" || die "revived presence missing"
-    grep -Fq 'old focus' "$RIG/m4-revived.out" && die "restart or utterance revived cleared mind"
+    grep -Fq 'old focus' "$RIG/m4-revived.out" && die "restart or utterance revived cleared session status"
     return 0
 }
 
@@ -277,9 +278,9 @@ property_m5() {
             "$old" "$old" "$old" "$old"
     } > "$home/minds/alpha/aged/$generation"
     printf '%s\n' "$(date +%s)" > "$home/presence/aged@alpha"
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m5.out" || die "minds failed"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m5.out" || die "status board failed"
     grep -q '^ADDRESS.*MODEL_AGE.*FOCUS_AGE' "$RIG/m5.out" || die "per-field age columns missing"
-    grep -q '^aged@alpha.*claude-aged.*old focus.*stale' "$RIG/m5.out" || die "stale mind was shown as fresh"
+    grep -q '^aged@alpha.*claude-aged.*old focus.*stale' "$RIG/m5.out" || die "stale session status was shown as fresh"
 }
 
 property_m6() {
@@ -287,8 +288,8 @@ property_m6() {
     home_h=$RIG/m6-b200
     init_home "$home_a" alpha
     init_home "$home_h" b200
-    write_spoke_config "$home_a" alpha "$home_h" || die "could not write spoke config"
-    generation=$(KHALA_HOME=$home_a KHALA_SESSION=worker "$KHALA" mind -m 'original') || die "mind failed"
+    write_spoke_config "$home_a" alpha "$home_h" || die "could not write downstream node config"
+    generation=$(KHALA_HOME=$home_a KHALA_SESSION=worker "$KHALA" mind -m 'original') || die "status update failed"
     original=$home_a/minds/alpha/worker/$generation
     mkdir -p "$home_h/minds/alpha/worker"
     sed 's/^Focus: original$/Focus: conflict/' "$original" > "$home_h/minds/alpha/worker/$generation"
@@ -304,33 +305,33 @@ property_m6() {
 property_m7() {
     home=$RIG/m7-home
     init_home "$home" alpha
-    add_preserve "$home" all || die "could not enable preserver"
+    add_preserve "$home" all || die "could not enable archive node"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >/dev/null
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" join khala --from-start >/dev/null
     cursor_before=$(cksum "$home/join/reader/khala")
-    KHALA_HOME=$home KHALA_SESSION=worker "$KHALA" mind -m 'private ambient state' >/dev/null || die "mind failed"
+    KHALA_HOME=$home KHALA_SESSION=worker "$KHALA" mind -m 'private ambient state' >/dev/null || die "status update failed"
     if KHALA_HOME=$home "$KHALA" watch --session reader --interval 1 --max-wait 2 \
         >"$RIG/m7-watch.out" 2>"$RIG/m7-watch.err"; then
-        die "mind generation woke watch"
+        die "session status generation woke watch"
     else
         watch_status=$?
     fi
     [ "$watch_status" -eq 3 ] || die "watch exited $watch_status"
-    KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/m7-drain.out" || die "drain failed"
-    grep -Fq 'private ambient state' "$RIG/m7-drain.out" && die "mind appeared in drain"
-    [ "$(cksum "$home/join/reader/khala")" = "$cursor_before" ] || die "mind changed stream state"
+    KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/m7-drain.out" || die "inbox read failed"
+    grep -Fq 'private ambient state' "$RIG/m7-drain.out" && die "session status appeared in inbox read"
+    [ "$(cksum "$home/join/reader/khala")" = "$cursor_before" ] || die "session status changed stream state"
     KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/m7-rec.err" || die "reconcile failed"
     if [ -d "$home/archive" ] && find "$home/archive" -type f -print | grep -q .; then
-        die "preserver captured a mind generation"
+        die "archive node captured a session status generation"
     fi
 }
 
 property_m8() {
-    if ! PATH="$HOME/go-toolchain/bin:$PATH" bash "$ROOT/test/link-minds.sh" \
+    if ! GO_BINARY=$GO bash "$ROOT/test/link-minds.sh" \
         >"$RIG/m8.out" 2>"$RIG/m8.err"; then
-        die "link mind suite failed: $(tail -n 8 "$RIG/m8.err" | tr '\n' ' ')"
+        die "link-minds.sh suite failed: $(tail -n 8 "$RIG/m8.err" | tr '\n' ' ')"
     fi
-    grep -q '^RESULT: PASS$' "$RIG/m8.out" || die "link mind suite omitted RESULT: PASS"
+    grep -q '^RESULT: PASS$' "$RIG/m8.out" || die "link-minds.sh suite omitted RESULT: PASS"
 }
 
 property_m9() {
@@ -339,20 +340,20 @@ property_m9() {
     KHALA_HOME=$home KHALA_SESSION=joined "$KHALA" inbox >/dev/null || die "heartbeat failed"
     KHALA_HOME=$home KHALA_SESSION=joined "$KHALA" profile \
         --model claude-x --effort medium --role builder --charge D14 >/dev/null || die "profile failed"
-    KHALA_HOME=$home KHALA_SESSION=joined "$KHALA" mind -m 'implement register' --stance focused >/dev/null || die "mind failed"
+    KHALA_HOME=$home KHALA_SESSION=joined "$KHALA" mind -m 'implement register' --stance focused >/dev/null || die "status update failed"
     printf '%s\n30\n' "$(date +%s)" > "$home/presence/orphan@alpha.watching"
     current=$(latest_generation "$home/minds/alpha/joined")
     current_file=$home/minds/alpha/joined/$current
-    KHALA_HOME=$home "$KHALA" minds >"$RIG/m9.out" || die "minds failed"
+    KHALA_HOME=$home "$KHALA" minds >"$RIG/m9.out" || die "status board failed"
     grep -q '^joined@alpha.*alive-here.*claude-x.*medium.*builder.*D14.*implement register.*focused' \
         "$RIG/m9.out" || die "joined row disagrees with physical fields"
     grep -q '^orphan@alpha.*unknown.*yes' "$RIG/m9.out" || die "watching-only presence row is missing"
     [ "$(sed -n 's/^Generation: //p' "$current_file")" = "$current" ] || die "Generation header differs from filename"
     [ "$(sed -n 's/^Session: //p' "$current_file")" = joined ] || die "Session header differs"
     [ "$(sed -n 's/^Node: //p' "$current_file")" = alpha ] || die "Node header differs"
-    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.9.10' ] || die "brain version is not 0.9.10"
-    grep -q '"version": "0.9.10"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
-        die "plugin version is not 0.9.10"
+    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.9.11' ] || die "core CLI version is not 0.9.11"
+    grep -q '"version": "0.9.11"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
+        die "plugin version is not 0.9.11"
     grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && die "plugin manifest contains forbidden hooks key"
     return 0
 }
@@ -536,7 +537,7 @@ EOF
     chmod 755 "$cross_shim/stat"
     if PATH=$cross_shim:/usr/bin:/bin KHALA_HOME=$cross_home "$KHALA" reconcile \
         >"$RIG/p5-cross.out" 2>"$RIG/p5-cross.err"; then
-        die "cross-filesystem preserver was accepted"
+        die "cross-filesystem archive node was accepted"
     fi
     [ -f "$cross_home/streams/khala/alpha/$cross_id" ] || die "cross-FS rejection pruned live"
     grep -q '다른 filesystem' "$RIG/p5-cross.err" || die "cross-FS error was unclear"
@@ -599,7 +600,7 @@ property_t1() {
         if [ "$suite" = streams ]; then
             # T1 has already run every legacy suite that streams property 9
             # composes. Avoid recursively running that same set again under
-            # plugin/link liveness load; all stream-specific properties still run.
+            # plugin/relay liveness load; all stream-specific properties still run.
             STREAMS_SKIP_LEGACY=1 bash "$ROOT/test/$suite.sh" \
                 >"$RIG/t1-$suite.out" 2>"$RIG/t1-$suite.err"
             suite_status=$?
@@ -619,11 +620,11 @@ property_t1() {
         fi
         grep -q '^RESULT: PASS$' "$RIG/t1-$suite.out" || die "$suite omitted RESULT: PASS"
     done
-    if [ -x "$HOME/go-toolchain/bin/go" ]; then
-        PATH=$HOME/go-toolchain/bin:$PATH bash "$ROOT/test/link.sh" \
+    if [ -x "$GO" ]; then
+        GO_BINARY=$GO bash "$ROOT/test/link.sh" \
             >"$RIG/t1-link.out" 2>"$RIG/t1-link.err" ||
-            die "link regression failed: $(tail -n 4 "$RIG/t1-link.err" | tr '\n' ' ')"
-        grep -q '^RESULT: PASS$' "$RIG/t1-link.out" || die "link omitted RESULT: PASS"
+            die "link.sh regression failed: $(tail -n 4 "$RIG/t1-link.err" | tr '\n' ' ')"
+        grep -q '^RESULT: PASS$' "$RIG/t1-link.out" || die "link.sh omitted RESULT: PASS"
     else
         printf 'SKIP T1 link — Go toolchain unavailable\n'
     fi
@@ -642,15 +643,15 @@ run_property() {
 }
 
 mkdir -p "$RIG" || exit 1
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property M1 'V2 설치 후 지연 V1이 링크·rsync 양쪽으로 도착해도 현재값 V2' property_m1
-run_property M2 'clear 후 지연 구세대 도착 — mind 재출현 0' property_m2
+run_property M2 'clear 후 지연 구세대 도착 — 세션 상태 재출현 0' property_m2
 run_property M3 '같은 명의 세션 A→B 교체 후 A의 늦은 Stop 훅이 B의 상태를 못 바꾼다' property_m3
-run_property M4 'retire 후 minds 표에서 즉시 소거; 재발화만으로 과거 mind 미재현' property_m4
+run_property M4 'retire 후 상태 보드에서 즉시 소거; 재발화만으로 과거 세션 상태 미재현' property_m4
 run_property M5 'freshness 경과 시 stale 명시 표기와 필드별 Declared 나이' property_m5
 run_property M6 '같은 세대·다른 바이트 = quarantine, 덮어쓰기 0' property_m6
-run_property M7 'mind는 watch 비각성·drain 비출력·커서 무관·preserver 비대상' property_m7
+run_property M7 '세션 상태는 watch 비각성·inbox read 비출력·커서 무관·보관 노드 비대상' property_m7
 run_property M8 'protocol 1.2 링크 전파·협상·순서역전·경주·나이 가드' property_m8
 run_property M9 '3층 조인 표가 실파일과 일치' property_m9
 run_property P1 'capture 각 단계 kill — live만/live+archive/archive만, 소실 없음' property_p1
