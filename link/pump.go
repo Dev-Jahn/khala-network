@@ -23,7 +23,7 @@ type readWriter struct {
 	io.Writer
 }
 
-type pump struct {
+type relayLoop struct {
 	home             string
 	role             string
 	self             string
@@ -36,7 +36,7 @@ type pump struct {
 	logger           *log.Logger
 	reader           *bufio.Reader
 	writer           *frameWriter
-	brain            *brain
+	coreCLI          *coreCLI
 	origins          *originSet
 	responses        chan frame
 	lastInput        atomic.Int64
@@ -48,12 +48,12 @@ type pump struct {
 	expiredOfferLogs *logOnceSet
 }
 
-func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer, brainPath string, nodeBrain *brain, maxObject int64, retainDays uint64, scanEvery time.Duration, expiredOfferLogs *logOnceSet, logger *log.Logger) (hello, error) {
+func runRelayLoop(ctx context.Context, rw readWriter, home, role, self, expectedPeer, coreCLIPath string, nodeCoreCLI *coreCLI, maxObject int64, retainDays uint64, scanEvery time.Duration, expiredOfferLogs *logOnceSet, logger *log.Logger) (hello, error) {
 	localMinor, err := advertisedMinor(role)
 	if err != nil {
 		return hello{}, err
 	}
-	p := &pump{
+	p := &relayLoop{
 		home: home, role: role, self: self, peer: expectedPeer,
 		localMinor: localMinor,
 		maxObject:  maxObject, retainDays: retainDays, scanEvery: scanEvery, logger: logger,
@@ -72,7 +72,7 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	if p.minor < streamMinor {
 		logger.Printf("negotiated protocol %d.%d; stream offers disabled", protocolMajor, p.minor)
 	}
-	if p.minor < mindMinor {
+	if p.minor < statusMinor {
 		logger.Printf("negotiated protocol %d.%d; mind offers disabled", protocolMajor, p.minor)
 	}
 	if role == "dial" && expectedPeer != "" && remote.Node != expectedPeer {
@@ -85,14 +85,14 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	p.lastInput.Store(time.Now().UnixNano())
 
 	sessionCtx, cancel := context.WithCancel(ctx)
-	// A dial carrier shares the main process's one reconcile owner. A serve
-	// carrier gets a trigger-only handle that never invokes the brain itself.
-	p.brain = nodeBrain
-	if p.brain == nil {
-		p.brain = newBrain(brainPath, home, logger, false)
+	// A client transport shares the main process's one reconcile owner. A server
+	// transport gets a trigger-only handle that never invokes the core CLI itself.
+	p.coreCLI = nodeCoreCLI
+	if p.coreCLI == nil {
+		p.coreCLI = newCoreCLI(coreCLIPath, home, logger, false)
 	}
 	candidates := make(chan candidate, 256)
-	watcher := newTreeWatcher(home, role, self, p.peer, logger, p.brain, p.origins, candidates, scanEvery)
+	watcher := newTreeWatcher(home, role, self, p.peer, logger, p.coreCLI, p.origins, candidates, scanEvery)
 	errs := make(chan error, 4)
 	watcherDone := make(chan struct{})
 	go func() {
@@ -101,8 +101,8 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	}()
 	defer func() {
 		cancel()
-		// A dial scan-gate can be using the shared reconcile owner. Let the
-		// watcher leave that call before carrier teardown returns.
+		// A client scan-gate can be using the shared reconcile owner. Let the
+		// tree-watcher goroutine leave that call before transport teardown returns.
 		<-watcherDone
 	}()
 	go func() { errs <- p.sendLoop(sessionCtx, candidates) }()
@@ -123,7 +123,7 @@ func runPump(ctx context.Context, rw readWriter, home, role, self, expectedPeer,
 	}
 }
 
-func (p *pump) handshake() (hello, error) {
+func (p *relayLoop) handshake() (hello, error) {
 	local := hello{Magic: protocolMagic, Major: protocolMajor, Minor: p.localMinor, Node: p.self, Role: p.role, Impl: implVersion}
 	if err := p.writer.write(helloFrame(local)); err != nil {
 		return hello{}, fmt.Errorf("write HELLO: %w", err)
@@ -179,13 +179,13 @@ func advertisedMinor(role string) (uint64, error) {
 	return minor, nil
 }
 
-func (p *pump) fatal(code, text string) {
+func (p *relayLoop) fatal(code, text string) {
 	p.logger.Printf("fatal protocol error %s: %s", code, text)
 	_ = p.writer.write(errorFrame(code, false, text))
 	_ = p.writer.write(frame{typ: frameBye})
 }
 
-func (p *pump) readLoop(ctx context.Context) error {
+func (p *relayLoop) readLoop(ctx context.Context) error {
 	installPeer := p.peer
 	if p.role == "dial" {
 		installPeer = p.self
@@ -218,8 +218,8 @@ func (p *pump) readLoop(ctx context.Context) error {
 				}
 				continue
 			}
-			if o.Class == "mind" && p.minor < mindMinor {
-				text := fmt.Sprintf("mind OFFER requires protocol minor %d", mindMinor)
+			if o.Class == "mind" && p.minor < statusMinor {
+				text := fmt.Sprintf("mind OFFER requires protocol minor %d", statusMinor)
 				p.logger.Printf("refused unnegotiated OFFER: %s", text)
 				if err := p.writer.write(errorFrame("UNNEGOTIATED_CLASS", true, text)); err != nil {
 					return err
@@ -369,7 +369,7 @@ func (p *pump) readLoop(ctx context.Context) error {
 // installIncoming keeps disk durability latency out of the sole protocol
 // reader. The sender cannot start a second inbound object until this goroutine
 // replies with STORED or ERROR, so the per-direction in-flight limit stays one.
-func (p *pump) installIncoming(ins *installer, o offer, data []byte, active *atomic.Bool) {
+func (p *relayLoop) installIncoming(ins *installer, o offer, data []byte, active *atomic.Bool) {
 	result, path, installErr := ins.receive(o, data)
 	if result == expiredSkipped && installErr == nil {
 		active.Store(false)
@@ -403,17 +403,17 @@ func (p *pump) installIncoming(ins *installer, o offer, data []byte, active *ato
 		}
 	}
 	p.logger.Printf("stored %s/%s at %s", o.Node, o.Basename, path)
-	p.brain.trigger()
+	p.coreCLI.trigger()
 }
 
-func (p *pump) reportAsyncError(err error) {
+func (p *relayLoop) reportAsyncError(err error) {
 	select {
 	case p.asyncErr <- err:
 	default:
 	}
 }
 
-func (p *pump) sendLoop(ctx context.Context, candidates <-chan candidate) error {
+func (p *relayLoop) sendLoop(ctx context.Context, candidates <-chan candidate) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -426,11 +426,11 @@ func (p *pump) sendLoop(ctx context.Context, candidates <-chan candidate) error 
 	}
 }
 
-func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
+func (p *relayLoop) sendCandidate(ctx context.Context, c candidate) error {
 	if c.class == "stream" && p.minor < streamMinor {
 		return nil
 	}
-	if c.class == "mind" && p.minor < mindMinor {
+	if c.class == "mind" && p.minor < statusMinor {
 		return nil
 	}
 	now := time.Now()
@@ -490,7 +490,7 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	}
 	digest := sha256.Sum256(data)
 	id := transferID(c.class, c.stream, c.node, c.session, c.basename, digest)
-	removeOriginAfterStored := p.role == "dial" && c.class == "spool" && fireAndForgetEnvelope(data)
+	removeOriginAfterStored := p.role == "dial" && c.class == "spool" && fireAndForgetMessage(data)
 	if p.origins.has(c.key(), id) {
 		return nil
 	}
@@ -500,9 +500,9 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	if p.isKnown(c.key(), id) {
 		if (p.role == "serve" && c.deleteAfterStored) || removeOriginAfterStored {
 			if err := removeTransit(c.path, digest); err != nil && !os.IsNotExist(err) {
-				p.logger.Printf("refused reappeared transit unlink %s: %v", c.path, err)
+				p.logger.Printf("refused reappeared in-flight copy unlink %s: %v", c.path, err)
 			} else {
-				p.logger.Printf("removed reappeared C3-identical transit %s; peer already STORED it", c.path)
+				p.logger.Printf("removed reappeared C3-identical in-flight copy %s; peer already STORED it", c.path)
 			}
 		}
 		return nil
@@ -560,20 +560,20 @@ func (p *pump) sendCandidate(ctx context.Context, c candidate) error {
 	}
 	if c.deleteAfterStored || removeOriginAfterStored {
 		if p.role != "serve" && !removeOriginAfterStored {
-			return errors.New("internal ownership error: dial reached transit unlink")
+			return errors.New("internal ownership error: client reached in-flight copy unlink")
 		}
 		if err := removeTransit(c.path, digest); err != nil && !os.IsNotExist(err) {
-			p.logger.Printf("refused transit unlink %s after STORED: %v", c.path, err)
+			p.logger.Printf("refused in-flight copy unlink %s after STORED: %v", c.path, err)
 		} else if p.role == "dial" {
-			p.logger.Printf("removed origin infrastructure %s after hub STORED", c.path)
+			p.logger.Printf("removed origin infrastructure %s after upstream STORED", c.path)
 		} else {
-			p.logger.Printf("removed hub transit %s after peer STORED (C1 depends on C3)", c.path)
+			p.logger.Printf("removed upstream in-flight copy %s after peer STORED (C1 depends on C3)", c.path)
 		}
 	}
 	return nil
 }
 
-func fireAndForgetEnvelope(data []byte) bool {
+func fireAndForgetMessage(data []byte) bool {
 	typeValue := ""
 	scanner := bufio.NewScanner(io.LimitReader(bytes.NewReader(data), 64<<10))
 	for scanner.Scan() {
@@ -588,7 +588,7 @@ func fireAndForgetEnvelope(data []byte) bool {
 	return typeValue == "ack" || typeValue == "bounce"
 }
 
-func (p *pump) waitResponse(ctx context.Context, id string) (frame, error) {
+func (p *relayLoop) waitResponse(ctx context.Context, id string) (frame, error) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -612,7 +612,7 @@ func (p *pump) waitResponse(ctx context.Context, id string) (frame, error) {
 	}
 }
 
-func (p *pump) keepalive(ctx context.Context) error {
+func (p *relayLoop) keepalive(ctx context.Context) error {
 	pingEvery := durationEnv("KHALA_LINK_TEST_PING_INTERVAL", 5*time.Second)
 	quiet := 60 * time.Second
 	if p.role == "dial" {
@@ -645,27 +645,27 @@ func (p *pump) keepalive(ctx context.Context) error {
 	}
 }
 
-func (p *pump) isKnown(key, id string) bool {
+func (p *relayLoop) isKnown(key, id string) bool {
 	p.knownMu.Lock()
 	got, ok := p.known[key]
 	p.knownMu.Unlock()
 	return ok && got == id
 }
-func (p *pump) markKnown(key, id string) {
+func (p *relayLoop) markKnown(key, id string) {
 	p.knownMu.Lock()
 	p.known[key] = id
 	delete(p.rejected, key)
 	p.knownMu.Unlock()
 }
 
-func (p *pump) isRejected(key, id string) bool {
+func (p *relayLoop) isRejected(key, id string) bool {
 	p.knownMu.Lock()
 	got, ok := p.rejected[key]
 	p.knownMu.Unlock()
 	return ok && got == id
 }
 
-func (p *pump) markRejected(key, id string) {
+func (p *relayLoop) markRejected(key, id string) {
 	p.knownMu.Lock()
 	p.rejected[key] = id
 	p.knownMu.Unlock()
@@ -682,7 +682,7 @@ func expiredOfferError(class, basename string) (string, string) {
 	return "STREAM_EXPIRED", fmt.Sprintf("expired stream skipped without install or quarantine: %s", basename)
 }
 
-func (p *pump) touchFresh() error {
+func (p *relayLoop) touchFresh() error {
 	dir := filepath.Join(p.home, "run")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err

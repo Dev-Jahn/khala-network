@@ -1,3 +1,5 @@
 .claude/
 .khala-session
 link/link
+.hippo/scribe.lock
+dist/

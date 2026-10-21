@@ -67,7 +67,7 @@ type treeWatcher struct {
 	self          string
 	peer          string
 	logger        *log.Logger
-	brain         *brain
+	coreCLI       *coreCLI
 	origins       *originSet
 	out           chan<- candidate
 	period        time.Duration
@@ -76,20 +76,20 @@ type treeWatcher struct {
 	w             *fsnotify.Watcher
 	spoolWatches  map[string]struct{}
 	streamWatches map[string]struct{}
-	mindWatches   map[string]struct{}
+	statusWatches map[string]struct{}
 	presenceWatch bool
 	ageReady      bool
 }
 
-func newTreeWatcher(home, role, self, peer string, logger *log.Logger, b *brain, origins *originSet, out chan<- candidate, period time.Duration) *treeWatcher {
+func newTreeWatcher(home, role, self, peer string, logger *log.Logger, b *coreCLI, origins *originSet, out chan<- candidate, period time.Duration) *treeWatcher {
 	return &treeWatcher{
-		home: home, role: role, self: self, peer: peer, logger: logger, brain: b,
+		home: home, role: role, self: self, peer: peer, logger: logger, coreCLI: b,
 		origins: origins, out: out, period: period,
 		dropEvents:    os.Getenv("KHALA_LINK_TEST_DROP_EVENTS") == "1",
 		overflowOnce:  os.Getenv("KHALA_LINK_TEST_OVERFLOW_ON_EVENT") == "1",
 		spoolWatches:  make(map[string]struct{}),
 		streamWatches: make(map[string]struct{}),
-		mindWatches:   make(map[string]struct{}),
+		statusWatches: make(map[string]struct{}),
 	}
 }
 
@@ -100,7 +100,7 @@ func (t *treeWatcher) run(ctx context.Context) error {
 	}
 	t.w = w
 	defer w.Close()
-	// Spool is not age-governed and remains live even if the brain is busy.
+	// Spool is not age-governed and remains live even if the core CLI is busy.
 	if err := t.register(); err != nil {
 		return err
 	}
@@ -218,25 +218,25 @@ func (t *treeWatcher) registerAgeGoverned() error {
 	if err := t.addStreamWatch(streamsRoot); err != nil {
 		return fmt.Errorf("watch streams root: %w", err)
 	}
-	mindsRoot := filepath.Join(t.home, "minds")
-	if err := os.MkdirAll(mindsRoot, 0700); err != nil {
+	statusesRoot := filepath.Join(t.home, "minds")
+	if err := os.MkdirAll(statusesRoot, 0700); err != nil {
 		return err
 	}
-	t.refreshMindWatches()
-	if err := t.addMindWatch(mindsRoot); err != nil {
-		return fmt.Errorf("watch minds root: %w", err)
+	t.refreshStatusWatches()
+	if err := t.addStatusWatch(statusesRoot); err != nil {
+		return fmt.Errorf("watch session status root: %w", err)
 	}
 	return nil
 }
 
-func (t *treeWatcher) refreshMindWatches() {
+func (t *treeWatcher) refreshStatusWatches() {
 	active := make(map[string]struct{})
 	for _, path := range t.w.WatchList() {
 		active[path] = struct{}{}
 	}
-	for path := range t.mindWatches {
+	for path := range t.statusWatches {
 		if _, ok := active[path]; !ok {
-			delete(t.mindWatches, path)
+			delete(t.statusWatches, path)
 		}
 	}
 }
@@ -294,14 +294,14 @@ func (t *treeWatcher) scanAgeGoverned() {
 	}
 	t.scanPresence()
 	t.scanStreams()
-	t.scanMinds()
+	t.scanStatuses()
 }
 
 func (t *treeWatcher) ageScanReady() bool {
-	if t.brain.ownsReconcile() {
-		if err := t.brain.reconcile(true); err != nil {
+	if t.coreCLI.ownsReconcile() {
+		if err := t.coreCLI.reconcile(true); err != nil {
 			t.ageReady = false
-			t.logger.Printf("age-governed scan skipped; brain reconcile failed: %v", err)
+			t.logger.Printf("age-governed scan skipped; core CLI reconcile failed: %v", err)
 			return false
 		}
 	}
@@ -325,7 +325,7 @@ func (t *treeWatcher) scanOutbox() {
 	}
 	for _, entry := range entries {
 		if entry.Type().IsRegular() && validBasename(entry.Name()) {
-			t.brain.trigger()
+			t.coreCLI.trigger()
 			return
 		}
 	}
@@ -457,8 +457,8 @@ func (t *treeWatcher) scanStreamShard(stream, node string) {
 	}
 }
 
-func (t *treeWatcher) addMindWatch(path string) error {
-	if _, ok := t.mindWatches[path]; ok {
+func (t *treeWatcher) addStatusWatch(path string) error {
+	if _, ok := t.statusWatches[path]; ok {
 		return nil
 	}
 	info, err := os.Lstat(path)
@@ -466,48 +466,48 @@ func (t *treeWatcher) addMindWatch(path string) error {
 		return err
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("mind path is not a directory: %s", path)
+		return fmt.Errorf("session status path is not a directory: %s", path)
 	}
 	if err := t.w.Add(path); err != nil {
 		return err
 	}
-	t.mindWatches[path] = struct{}{}
+	t.statusWatches[path] = struct{}{}
 	return nil
 }
 
-func (t *treeWatcher) eligibleMindNode(node string) bool {
+func (t *treeWatcher) eligibleStatusNode(node string) bool {
 	if t.role == "dial" {
 		return node == t.self
 	}
 	return node != t.peer
 }
 
-func (t *treeWatcher) scanMinds() {
+func (t *treeWatcher) scanStatuses() {
 	root := filepath.Join(t.home, "minds")
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		t.logger.Printf("scan minds root failed: %v", err)
+		t.logger.Printf("scan session status root failed: %v", err)
 		return
 	}
 	for _, entry := range entries {
 		node := entry.Name()
-		if !entry.IsDir() || !validNode(node) || !t.eligibleMindNode(node) {
+		if !entry.IsDir() || !validNode(node) || !t.eligibleStatusNode(node) {
 			continue
 		}
 		nodeDir := filepath.Join(root, node)
-		if err := t.addMindWatch(nodeDir); err != nil {
-			t.logger.Printf("watch mind node %s failed: %v", node, err)
+		if err := t.addStatusWatch(nodeDir); err != nil {
+			t.logger.Printf("watch session status node %s failed: %v", node, err)
 			continue
 		}
-		t.scanMindNode(node)
+		t.scanStatusNode(node)
 	}
 }
 
-func (t *treeWatcher) scanMindNode(node string) {
+func (t *treeWatcher) scanStatusNode(node string) {
 	dir := filepath.Join(t.home, "minds", node)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.logger.Printf("scan mind node %s failed: %v", node, err)
+		t.logger.Printf("scan session status node %s failed: %v", node, err)
 		return
 	}
 	for _, entry := range entries {
@@ -516,19 +516,19 @@ func (t *treeWatcher) scanMindNode(node string) {
 			continue
 		}
 		sessionDir := filepath.Join(dir, session)
-		if err := t.addMindWatch(sessionDir); err != nil {
-			t.logger.Printf("watch mind session %s/%s failed: %v", node, session, err)
+		if err := t.addStatusWatch(sessionDir); err != nil {
+			t.logger.Printf("watch session status session %s/%s failed: %v", node, session, err)
 			continue
 		}
-		t.scanMindSession(node, session)
+		t.scanStatusSession(node, session)
 	}
 }
 
-func (t *treeWatcher) scanMindSession(node, session string) {
+func (t *treeWatcher) scanStatusSession(node, session string) {
 	dir := filepath.Join(t.home, "minds", node, session)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		t.logger.Printf("scan mind session %s/%s failed: %v", node, session, err)
+		t.logger.Printf("scan session status session %s/%s failed: %v", node, session, err)
 		return
 	}
 	for _, entry := range entries {
@@ -554,13 +554,13 @@ func (t *treeWatcher) handleHint(path string) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			delete(t.mindWatches, path)
+			delete(t.statusWatches, path)
 		}
 		return
 	}
 	spoolRoot := filepath.Join(t.home, "spool", "for")
 	streamsRoot := filepath.Join(t.home, "streams")
-	mindsRoot := filepath.Join(t.home, "minds")
+	statusesRoot := filepath.Join(t.home, "minds")
 	if info.IsDir() && filepath.Dir(path) == spoolRoot {
 		node := filepath.Base(path)
 		if t.role == "dial" && validNode(node) && node != t.self {
@@ -593,25 +593,25 @@ func (t *treeWatcher) handleHint(path string) {
 		}
 		return
 	}
-	if info.IsDir() && filepath.Dir(path) == mindsRoot {
+	if info.IsDir() && filepath.Dir(path) == statusesRoot {
 		node := filepath.Base(path)
-		if validNode(node) && t.eligibleMindNode(node) && t.ageScanReady() {
-			if err := t.addMindWatch(path); err != nil {
-				t.logger.Printf("watch mind node %s failed: %v", node, err)
+		if validNode(node) && t.eligibleStatusNode(node) && t.ageScanReady() {
+			if err := t.addStatusWatch(path); err != nil {
+				t.logger.Printf("watch session status node %s failed: %v", node, err)
 			} else {
-				t.scanMindNode(node)
+				t.scanStatusNode(node)
 			}
 		}
 		return
 	}
-	if info.IsDir() && filepath.Dir(filepath.Dir(path)) == mindsRoot {
+	if info.IsDir() && filepath.Dir(filepath.Dir(path)) == statusesRoot {
 		node := filepath.Base(filepath.Dir(path))
 		session := filepath.Base(path)
-		if validNode(node) && validNode(session) && t.eligibleMindNode(node) && t.ageScanReady() {
-			if err := t.addMindWatch(path); err != nil {
-				t.logger.Printf("watch mind session %s/%s failed: %v", node, session, err)
+		if validNode(node) && validNode(session) && t.eligibleStatusNode(node) && t.ageScanReady() {
+			if err := t.addStatusWatch(path); err != nil {
+				t.logger.Printf("watch session status session %s/%s failed: %v", node, session, err)
 			} else {
-				t.scanMindSession(node, session)
+				t.scanStatusSession(node, session)
 			}
 		}
 		return
@@ -620,7 +620,7 @@ func (t *treeWatcher) handleHint(path string) {
 		return
 	}
 	if filepath.Dir(path) == filepath.Join(t.home, "outbox", "new") && t.role == "dial" {
-		t.brain.trigger()
+		t.coreCLI.trigger()
 		return
 	}
 	if filepath.Dir(path) == filepath.Join(t.home, "presence") {
@@ -642,11 +642,11 @@ func (t *treeWatcher) handleHint(path string) {
 	}
 	sessionDir := filepath.Dir(path)
 	nodeDir := filepath.Dir(sessionDir)
-	if filepath.Dir(nodeDir) == mindsRoot {
+	if filepath.Dir(nodeDir) == statusesRoot {
 		node := filepath.Base(nodeDir)
 		session := filepath.Base(sessionDir)
 		generation := filepath.Base(path)
-		if t.ageReady && validNode(node) && validNode(session) && t.eligibleMindNode(node) && validGeneration(generation) {
+		if t.ageReady && validNode(node) && validNode(session) && t.eligibleStatusNode(node) && validGeneration(generation) {
 			t.enqueue(candidate{class: "mind", node: node, session: session, basename: generation, path: path})
 		}
 		return

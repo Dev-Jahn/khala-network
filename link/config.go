@@ -21,12 +21,12 @@ var (
 )
 
 type config struct {
-	self        string
-	retainDays  uint64
-	ttl         int64
-	earsEnabled bool
-	mailboxes   []string
-	peers       map[string][]string
+	self            string
+	retainDays      uint64
+	ttl             int64
+	listenerEnabled bool
+	upstreamNodes   []string
+	peers           map[string][]string
 }
 
 type dialEndpoint struct {
@@ -40,10 +40,10 @@ func loadConfig(home string) (config, error) {
 		return config{}, fmt.Errorf("read config: %w", err)
 	}
 	defer f.Close()
-	c := config{retainDays: 30, ttl: 120, earsEnabled: true, peers: make(map[string][]string)}
+	c := config{retainDays: 30, ttl: 120, listenerEnabled: true, peers: make(map[string][]string)}
 	retainSet := false
 	ttlSet := false
-	earsSet := false
+	listenerSet := false
 	s := bufio.NewScanner(f)
 	for s.Scan() {
 		fields := strings.Fields(s.Text())
@@ -57,7 +57,7 @@ func loadConfig(home string) (config, error) {
 			}
 		case "mailbox":
 			if len(fields) > 1 {
-				c.mailboxes = append(c.mailboxes, fields[1:]...)
+				c.upstreamNodes = append(c.upstreamNodes, fields[1:]...)
 			}
 		case "peer":
 			if len(fields) > 2 {
@@ -84,11 +84,11 @@ func loadConfig(home string) (config, error) {
 			c.ttl = ttl
 			ttlSet = true
 		case "ears":
-			if len(fields) != 2 || earsSet || (fields[1] != "on" && fields[1] != "off") {
+			if len(fields) != 2 || listenerSet || (fields[1] != "on" && fields[1] != "off") {
 				return config{}, errorsf("config ears must be exactly one of on or off")
 			}
-			c.earsEnabled = fields[1] == "on"
-			earsSet = true
+			c.listenerEnabled = fields[1] == "on"
+			listenerSet = true
 		}
 	}
 	if err := s.Err(); err != nil {
@@ -102,18 +102,18 @@ func loadConfig(home string) (config, error) {
 
 func (c config) dialEndpoints() ([]dialEndpoint, error) {
 	var endpoints []dialEndpoint
-	for _, mailbox := range c.mailboxes {
-		if !validNode(mailbox) {
-			return nil, errorsf("config mailbox %q is invalid", mailbox)
+	for _, upstreamNode := range c.upstreamNodes {
+		if !validNode(upstreamNode) {
+			return nil, errorsf("config mailbox %q is invalid", upstreamNode)
 		}
-		if mailbox == c.self {
+		if upstreamNode == c.self {
 			continue
 		}
-		for _, endpoint := range c.peers[mailbox] {
+		for _, endpoint := range c.peers[upstreamNode] {
 			if filepath.IsAbs(endpoint) {
-				return nil, errorsf("link refuses local-path peer %q; production carrier is ssh and tests must select the direct carrier explicitly", endpoint)
+				return nil, errorsf("relay refuses local-path peer %q; production transport is ssh and tests must select the direct transport explicitly", endpoint)
 			}
-			endpoints = append(endpoints, dialEndpoint{node: mailbox, address: endpoint})
+			endpoints = append(endpoints, dialEndpoint{node: upstreamNode, address: endpoint})
 		}
 	}
 	if len(endpoints) == 0 {

@@ -115,7 +115,7 @@ if ! KHALA_SESSION="$KHALA_RESOLVED_SESSION" KHALA_CLAUDE_SESSION_ID="$khala_hoo
 fi
 khala_hook_instance=$(sed -n 's/^instance //p' "$khala_hook_bind")
 if [ -z "$khala_hook_instance" ]; then
-    printf '%s\n' 'khala: session registration이 instance를 반환하지 않았습니다 — 드레인을 건너뜁니다'
+    printf '%s\n' 'khala: session registration이 instance를 반환하지 않았습니다 — 수신함 읽기를 건너뜁니다'
     rm -f "$khala_hook_bind" "$khala_hook_bind_err"
     exit 0
 fi
@@ -135,13 +135,14 @@ khala_native_warning=$(KHALA_SESSION="$KHALA_RESOLVED_SESSION" \
     "$KHALA_BIN" bind --native-warning --instance "$khala_hook_instance" 2>/dev/null) || \
     khala_native_warning=
 if [ "$khala_native_warning" = native-degraded ]; then
-    printf 'khala: %s native-degraded — socket doorbell failures; khala status를 확인하세요\n' \
+    printf 'khala: %s native-degraded — socket inbox notification failures; khala status를 확인하세요\n' \
         "$KHALA_RESOLVED_SESSION"
 fi
 
 # Model declaration is independent of inbox consumption, but it shares the
-# brain lock with drain and join. Finish its bounded attempt before starting
-# those jobs so the hook cannot starve its own authoritative model update.
+# state lock with inbox reads and stream subscriptions. Finish its bounded
+# attempt before starting those jobs so the hook cannot starve its own
+# authoritative model update.
 khala_join_job=
 khala_start_model=$(printf '%s\n' "$khala_start_input" | tr '\n' ' ' | \
     sed -n 's/.*"model"[[:space:]]*:[[:space:]]*"\([^"\\]*\)".*/\1/p')
@@ -185,9 +186,9 @@ if [ "$khala_hook_owner" = yes ]; then
     else
         khala_drain_status=$?
         if [ "$khala_drain_status" -eq 124 ]; then
-            printf '%s\n' 'khala: inbox drain 10s deadline — registration은 이미 ready입니다' >&2
+            printf '%s\n' 'khala: inbox read 10s deadline — registration은 이미 ready입니다' >&2
         else
-            printf '%s\n' 'khala: inbox drain 실패 — 상세는 stderr를 확인하세요' >&2
+            printf '%s\n' 'khala: inbox read 실패 — 상세는 stderr를 확인하세요' >&2
         fi
     fi
     [ ! -f "$khala_drain_out" ] || cat "$khala_drain_out"

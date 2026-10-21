@@ -58,7 +58,7 @@ type identityLease struct {
 	State           string `json:"state"`
 }
 
-type conduitStatus struct {
+type notifierStatus struct {
 	BootID    string `json:"bootId"`
 	PID       int    `json:"pid"`
 	PIDStart  string `json:"pidStart"`
@@ -107,7 +107,7 @@ func runRuntime(args []string) int {
 	case "native-warning":
 		err = runtimeNativeWarning(args[1:])
 	case "pending-generation":
-		err = runtimePendingGeneration(args[1:])
+		err = runtimePendingQueueDigest(args[1:])
 	default:
 		err = fmt.Errorf("unknown runtime command %q", args[0])
 	}
@@ -342,7 +342,7 @@ func processStart(pid int, bootID string) (string, error) {
 
 // processStartCommand reads a process start time on darwin. `ps -o lstart=`
 // renders the timestamp in the caller's locale, so a channel child spawned
-// under a Korean-locale session and a conduit under launchd (no LANG) would
+// under a Korean-locale session and a notifier under launchd (no LANG) would
 // record two different strings for one process and never match. The locale
 // is pinned so every writer and reader produces the same bytes.
 func processStartCommand(pid int) *exec.Cmd {
@@ -732,6 +732,7 @@ func runtimeRegister(args []string, publicBind bool) error {
 	callerPID := fs.Int("caller-pid", os.Getppid(), "")
 	receiveOptIn := fs.Bool("receive-opt-in", os.Getenv("KHALA_RECEIVE") == "1", "")
 	takeover := fs.Bool("takeover", false, "")
+	parent := fs.String("parent", os.Getenv("KHALA_PARENT"), "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 {
 		return errors.New("invalid runtime registration arguments")
 	}
@@ -740,6 +741,20 @@ func runtimeRegister(args []string, publicBind bool) error {
 	}
 	if isReservedIdentity(*identity) {
 		return fmt.Errorf("reserved identity %q", *identity)
+	}
+	var home string
+	if *parent != "" || flagPassed(fs, "parent") {
+		var err error
+		if home, err = khalaHome(); err != nil {
+			return err
+		}
+		cfg, err := loadConfig(home)
+		if err != nil {
+			return err
+		}
+		if err := validateParent(*parent, *identity, cfg.self); err != nil {
+			return err
+		}
 	}
 	if *phase != "starting" && *phase != "ready" {
 		return fmt.Errorf("invalid registration phase %q", *phase)
@@ -807,12 +822,33 @@ func runtimeRegister(args []string, publicBind bool) error {
 	}
 	reg.ClaudeSessionID = firstNonempty(*sessionID, reg.ClaudeSessionID)
 	reg.Harness = firstNonempty(*harness, reg.Harness, "claude")
+	if reg.Harness == "claude" && os.Getenv("CODEX_THREAD_ID") != "" {
+		// A Codex process inherits the Claude session's messaging socket from
+		// the session that launched it; binding it would ring that session
+		// with this identity's mail (D18 §1).
+		return errors.New("this is a codex session; use khala-codex")
+	}
 	if reg.Harness == "codex" {
 		if !flagPassed(fs, "socket") {
 			*socketPath = ""
 		}
 		if *socketPath != "" || reg.SocketPath != "" {
 			return errors.New("Codex registrations use a channel, not a Claude socket")
+		}
+		if *kind == "worker" {
+			// A Codex worker (an exec lane) has no doorbell path: its mail
+			// enters the turn through hooks. An inherited KHALA_RECEIVE=1 is
+			// not a request to ring it; an explicit one is refused.
+			if flagPassed(fs, "receive-opt-in") && *receiveOptIn {
+				return errors.New("a Codex worker receives through hooks; it cannot opt in to doorbells")
+			}
+			*receiveOptIn = false
+			reg.ReceiveOptIn = false
+		}
+	}
+	if home != "" {
+		if err := recordParent(home, *identity, *parent); err != nil {
+			return fmt.Errorf("record parent: %w", err)
 		}
 	}
 	// A socket inherited from the environment (CLAUDE_CODE_MESSAGING_SOCKET
@@ -1068,11 +1104,7 @@ func liveLeaseOwnerRegistration(root, bootID string, lease identityLease) (sessi
 		reg.BootID != bootID || reg.InstanceID != lease.InstanceID || reg.Identity != lease.Identity {
 		return sessionRegistration{}, false
 	}
-	if processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
-		return reg, true
-	}
-	started, err := time.Parse(time.RFC3339Nano, reg.StartedAt)
-	return reg, err == nil && reg.PID <= 1 && time.Since(started) < 30*time.Second
+	return reg, registrationLive(reg, bootID)
 }
 
 func runtimeRelease(args []string) error {
@@ -1155,7 +1187,7 @@ func runtimeRelease(args []string) error {
 			if err != nil {
 				return err
 			}
-			logger, err := newConduitLogger(home)
+			logger, err := newNotifierLogger(home)
 			if err != nil {
 				return err
 			}
@@ -1315,11 +1347,11 @@ func runtimeWatchReady(args []string) error {
 		lease.Epoch == 0 || lease.Epoch != reg.LeaseEpoch || lease.PID != reg.PID ||
 		lease.PIDStart != reg.PIDStart || lease.ClaudeSessionID != reg.ClaudeSessionID ||
 		!processAliveWithStart(reg.PID, reg.PIDStart, bootID) {
-		return errors.New("registration is not conduit verified")
+		return errors.New("registration is not notifier verified")
 	}
 	if reg.Harness == "codex" {
 		// A Codex registration has no Claude inbox socket: its verified channel
-		// socket is the only conduit path, so that is what readiness means.
+		// socket is the only notifier path, so that is what readiness means.
 		if reg.ChannelSocket == "" || !reg.ChannelVerified {
 			return errors.New("registration channel is not verified")
 		}
@@ -1329,7 +1361,7 @@ func runtimeWatchReady(args []string) error {
 		}
 	} else {
 		if reg.SocketPath == "" {
-			return errors.New("registration is not conduit verified")
+			return errors.New("registration is not notifier verified")
 		}
 		info, err := os.Lstat(reg.SocketPath)
 		if err != nil || info.Mode()&os.ModeSocket == 0 {
@@ -1359,7 +1391,7 @@ func runtimeDaemonStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	var status conduitStatus
+	var status notifierStatus
 	if err := readJSON(filepath.Join(root, "conduit.status.json"), &status); err != nil {
 		return err
 	}
@@ -1420,7 +1452,7 @@ func runtimeNativeWarning(args []string) error {
 	return nil
 }
 
-func runtimePendingGeneration(args []string) error {
+func runtimePendingQueueDigest(args []string) error {
 	fs := flag.NewFlagSet("runtime pending-generation", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	identity := fs.String("identity", os.Getenv("KHALA_SESSION"), "")
@@ -1431,19 +1463,19 @@ func runtimePendingGeneration(args []string) error {
 	if err != nil {
 		return err
 	}
-	generation, ring, info := pendingGeneration(home, *identity)
-	fmt.Fprintf(os.Stdout, "%s %d %d\n", generation, ring, info)
+	pendingDigest, notifiable, info := pendingQueueDigest(home, *identity)
+	fmt.Fprintf(os.Stdout, "%s %d %d\n", pendingDigest, notifiable, info)
 	return nil
 }
 
-func pendingGeneration(home, identity string) (string, int, int) {
-	letters := (&conduit{home: home}).pending(identity)
-	mail, notices, urgent := letterCounts(letters)
-	ring := mail + urgent
-	if ring == 0 {
-		return "-", 0, notices - urgent
+func pendingQueueDigest(home, identity string) (string, int, int) {
+	messages := (&notifier{home: home}).pending(identity)
+	mail, alerts, urgent := messageCounts(messages)
+	notifiable := mail + urgent
+	if notifiable == 0 {
+		return "-", 0, alerts - urgent
 	}
-	return letterGeneration(letters), ring, notices - urgent
+	return queueDigest(messages), notifiable, alerts - urgent
 }
 
 func countRegularFiles(path string) int {

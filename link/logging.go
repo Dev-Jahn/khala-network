@@ -49,10 +49,10 @@ func (r *rotatingLog) Write(p []byte) (int, error) {
 func logStderr(logger *log.Logger, r io.Reader) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		logger.Printf("carrier stderr: %s", scanner.Text())
+		logger.Printf("transport stderr: %s", scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
-		logger.Printf("carrier stderr read failed: %v", err)
+		logger.Printf("transport stderr read failed: %v", err)
 	}
 }
 

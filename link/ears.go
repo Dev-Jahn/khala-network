@@ -17,26 +17,26 @@ import (
 )
 
 const (
-	earsReaderMaxBytes      = 128 << 10
-	earsReaderMaxLines      = 320
-	earsMaxRecordBytes      = 1024
-	earsWriterMaxBytes      = 96 << 10
-	earsWriterMaxIdentities = 256
+	listenerReaderMaxBytes      = 128 << 10
+	listenerReaderMaxLines      = 320
+	listenerMaxRecordBytes      = 1024
+	listenerWriterMaxBytes      = 96 << 10
+	listenerWriterMaxIdentities = 256
 )
 
 var (
-	earValuePattern      = regexp.MustCompile(`^[A-Za-z0-9._:+-]{1,64}$`)
-	earGenerationPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	listenerValuePattern = regexp.MustCompile(`^[A-Za-z0-9._:+-]{1,64}$`)
+	queueDigestPattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
-type earsComponent struct {
+type listenerComponent struct {
 	Name    string `json:"name"`
 	Release string `json:"release"`
 	Adapter string `json:"adapter"`
 	Ears    string `json:"ears"`
 }
 
-type earsIdentity struct {
+type listenerIdentity struct {
 	Name            string `json:"name"`
 	Principal       string `json:"principal"`
 	Listening       bool   `json:"listening"`
@@ -58,35 +58,35 @@ type earsIdentity struct {
 	LastDrainStatus string `json:"lastDrainStatus"`
 }
 
-type earsSnapshot struct {
+type listenerSnapshot struct {
 	Node       string
 	Generation int64
 	WrittenAt  int64
 	Interval   int64
 	State      string
 	Complete   bool
-	Components []earsComponent
+	Components []listenerComponent
 	Mailboxes  []string
 	LinkAge    int64
-	Identities []earsIdentity
+	Identities []listenerIdentity
 	Truncated  int
 }
 
-type earsModel struct {
+type listenerModel struct {
 	Now        time.Time
 	State      string
 	LinkAge    int64
-	Identities []earsIdentity
+	Identities []listenerIdentity
 }
 
-type earSidecar struct {
+type listenerSidecar struct {
 	Generation   string `json:"generation"`
 	FirstSeen    int64  `json:"firstSeen"`
 	WrittenRings int    `json:"writtenRings"`
 	LastWritten  int64  `json:"lastWritten"`
 }
 
-type earDrainStamp struct {
+type inboxReadMarker struct {
 	LastDrain       int64
 	LastDrainBefore string
 	LastDrainAfter  string
@@ -94,38 +94,38 @@ type earDrainStamp struct {
 	Token           string
 }
 
-type conduitTurnStamp struct {
+type turnMarker struct {
 	LastTurn int64
 	Token    string
 	Present  bool
 }
 
-func parseEars(path string) (earsSnapshot, error) {
+func parseListenerSnapshot(path string) (listenerSnapshot, error) {
 	base := filepath.Base(path)
-	node, ok := earSnapshotNode(base)
+	node, ok := listenerSnapshotNode(base)
 	if !ok {
-		return earsSnapshot{}, fmt.Errorf("invalid ear filename %q", base)
+		return listenerSnapshot{}, fmt.Errorf("invalid listener snapshot filename %q", base)
 	}
 	f, err := openRegular(path)
 	if err != nil {
-		return earsSnapshot{}, err
+		return listenerSnapshot{}, err
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return earsSnapshot{}, err
+		return listenerSnapshot{}, err
 	}
-	if info.Size() > earsReaderMaxBytes {
-		return earsSnapshot{}, fmt.Errorf("ear exceeds %d bytes", earsReaderMaxBytes)
+	if info.Size() > listenerReaderMaxBytes {
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot exceeds %d bytes", listenerReaderMaxBytes)
 	}
-	data, err := io.ReadAll(io.LimitReader(f, earsReaderMaxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, listenerReaderMaxBytes+1))
 	if err != nil {
-		return earsSnapshot{}, err
+		return listenerSnapshot{}, err
 	}
-	return parseEarsBytes(data, node)
+	return parseListenerSnapshotBytes(data, node)
 }
 
-func earSnapshotNode(base string) (string, bool) {
+func listenerSnapshotNode(base string) (string, bool) {
 	if !strings.HasPrefix(base, "conduit@") || !strings.HasSuffix(base, ".ear") {
 		return "", false
 	}
@@ -133,26 +133,26 @@ func earSnapshotNode(base string) (string, bool) {
 	return node, validNode(node) && base == "conduit@"+node+".ear"
 }
 
-func parseEarsBytes(data []byte, filenameNode string) (earsSnapshot, error) {
-	if len(data) > earsReaderMaxBytes {
-		return earsSnapshot{}, fmt.Errorf("ear exceeds %d bytes", earsReaderMaxBytes)
+func parseListenerSnapshotBytes(data []byte, filenameNode string) (listenerSnapshot, error) {
+	if len(data) > listenerReaderMaxBytes {
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot exceeds %d bytes", listenerReaderMaxBytes)
 	}
 	lines := bytes.Split(data, []byte{'\n'})
 	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
 		lines = lines[:len(lines)-1]
 	}
-	if len(lines) > earsReaderMaxLines {
-		return earsSnapshot{}, fmt.Errorf("ear exceeds %d lines", earsReaderMaxLines)
+	if len(lines) > listenerReaderMaxLines {
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot exceeds %d lines", listenerReaderMaxLines)
 	}
 	if len(lines) == 0 || string(lines[0]) != "ears 1" {
-		return earsSnapshot{}, fmt.Errorf("ear first line is not ears 1")
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot first line is not `ears 1`")
 	}
 	for _, line := range lines {
-		if len(line) > earsMaxRecordBytes {
-			return earsSnapshot{}, fmt.Errorf("ear record exceeds %d bytes", earsMaxRecordBytes)
+		if len(line) > listenerMaxRecordBytes {
+			return listenerSnapshot{}, fmt.Errorf("listener snapshot record exceeds %d bytes", listenerMaxRecordBytes)
 		}
 	}
-	result := earsSnapshot{LinkAge: -1}
+	result := listenerSnapshot{LinkAge: -1}
 	seen := make(map[string]bool)
 	identityNames := make(map[string]bool)
 	truncatedIndex := -1
@@ -172,92 +172,92 @@ func parseEarsBytes(data []byte, filenameNode string) (earsSnapshot, error) {
 		switch key {
 		case "node":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed node record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed node record")
 			}
 			result.Node = fields[1]
 		case "generation":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed generation record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed generation record")
 			}
 			value, err := parseNonnegativeInt64(fields[1])
 			if err != nil {
-				return earsSnapshot{}, fmt.Errorf("invalid ear generation")
+				return listenerSnapshot{}, fmt.Errorf("invalid snapshot sequence number")
 			}
 			result.Generation = value
 		case "written-at":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed written-at record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed written-at record")
 			}
 			value, err := parseNonnegativeInt64(fields[1])
 			if err != nil {
-				return earsSnapshot{}, fmt.Errorf("invalid written-at")
+				return listenerSnapshot{}, fmt.Errorf("invalid written-at")
 			}
 			result.WrittenAt = value
 		case "interval":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed interval record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed interval record")
 			}
 			value, err := parseNonnegativeInt64(fields[1])
 			if err != nil || value == 0 {
-				return earsSnapshot{}, fmt.Errorf("invalid ear interval")
+				return listenerSnapshot{}, fmt.Errorf("invalid listener snapshot interval")
 			}
 			result.Interval = value
 		case "state":
 			if err := single(); err != nil || len(fields) != 2 || (fields[1] != "running" && fields[1] != "stopping") {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed state record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed state record")
 			}
 			result.State = fields[1]
 		case "complete":
 			if err := single(); err != nil || len(fields) != 2 || (fields[1] != "yes" && fields[1] != "no") {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed complete record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed complete record")
 			}
 			result.Complete = fields[1] == "yes"
 		case "component":
-			component, err := parseEarComponent(fields)
+			component, err := parseListenerComponent(fields)
 			if err != nil {
-				return earsSnapshot{}, err
+				return listenerSnapshot{}, err
 			}
 			result.Components = append(result.Components, component)
 		case "mailbox":
 			if err := single(); err != nil || len(fields) < 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed mailbox record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed mailbox record")
 			}
 			if len(fields) != 2 || fields[1] != "-" {
-				for _, mailbox := range fields[1:] {
-					if !validNode(mailbox) {
-						return earsSnapshot{}, fmt.Errorf("invalid mailbox value")
+				for _, upstreamNode := range fields[1:] {
+					if !validNode(upstreamNode) {
+						return listenerSnapshot{}, fmt.Errorf("invalid mailbox value")
 					}
-					result.Mailboxes = append(result.Mailboxes, mailbox)
+					result.Mailboxes = append(result.Mailboxes, upstreamNode)
 				}
 			}
 		case "link":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed link record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed link record")
 			}
 			if fields[1] != "-" {
 				value, err := parseNonnegativeInt64(fields[1])
 				if err != nil {
-					return earsSnapshot{}, fmt.Errorf("invalid link age")
+					return listenerSnapshot{}, fmt.Errorf("invalid link age")
 				}
 				result.LinkAge = value
 			}
 		case "identity":
-			identity, err := parseEarsIdentity(fields[1:])
+			identity, err := parseListenerIdentity(fields[1:])
 			if err != nil {
-				return earsSnapshot{}, err
+				return listenerSnapshot{}, err
 			}
 			if identityNames[identity.Name] {
-				return earsSnapshot{}, fmt.Errorf("duplicate identity name %q", identity.Name)
+				return listenerSnapshot{}, fmt.Errorf("duplicate identity name %q", identity.Name)
 			}
 			identityNames[identity.Name] = true
 			result.Identities = append(result.Identities, identity)
 		case "truncated":
 			if err := single(); err != nil || len(fields) != 2 {
-				return earsSnapshot{}, fmt.Errorf("duplicate or malformed truncated record")
+				return listenerSnapshot{}, fmt.Errorf("duplicate or malformed truncated record")
 			}
 			value, err := strconv.Atoi(fields[1])
 			if err != nil || value < 0 {
-				return earsSnapshot{}, fmt.Errorf("invalid truncated count")
+				return listenerSnapshot{}, fmt.Errorf("invalid truncated count")
 			}
 			result.Truncated = value
 			truncatedIndex = index + 1
@@ -267,55 +267,55 @@ func parseEarsBytes(data []byte, filenameNode string) (earsSnapshot, error) {
 	}
 	for _, mandatory := range []string{"node", "generation", "written-at", "interval", "state", "complete", "mailbox", "link"} {
 		if !seen[mandatory] {
-			return earsSnapshot{}, fmt.Errorf("ear is missing mandatory %s record", mandatory)
+			return listenerSnapshot{}, fmt.Errorf("listener snapshot is missing mandatory %s record", mandatory)
 		}
 	}
 	if len(result.Components) == 0 {
-		return earsSnapshot{}, fmt.Errorf("ear is missing mandatory component record")
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot is missing mandatory component record")
 	}
 	if result.Node != filenameNode {
-		return earsSnapshot{}, fmt.Errorf("ear node %q does not match filename node %q", result.Node, filenameNode)
+		return listenerSnapshot{}, fmt.Errorf("listener snapshot node %q does not match filename node %q", result.Node, filenameNode)
 	}
 	if seen["truncated"] != !result.Complete || (seen["truncated"] && truncatedIndex != len(lines)-1) {
-		return earsSnapshot{}, fmt.Errorf("truncated record does not match complete state or is not last")
+		return listenerSnapshot{}, fmt.Errorf("truncated record does not match complete state or is not last")
 	}
 	return result, nil
 }
 
-func parseEarComponent(fields []string) (earsComponent, error) {
-	if len(fields) < 2 || !validEarValue(fields[1]) {
-		return earsComponent{}, fmt.Errorf("malformed component record")
+func parseListenerComponent(fields []string) (listenerComponent, error) {
+	if len(fields) < 2 || !validListenerValue(fields[1]) {
+		return listenerComponent{}, fmt.Errorf("malformed component record")
 	}
-	values, err := parseEarKeyValues(fields[2:])
+	values, err := parseListenerKeyValues(fields[2:])
 	if err != nil {
-		return earsComponent{}, fmt.Errorf("malformed component record: %w", err)
+		return listenerComponent{}, fmt.Errorf("malformed component record: %w", err)
 	}
-	return earsComponent{Name: fields[1], Release: values["release"], Adapter: values["adapter"], Ears: values["ears"]}, nil
+	return listenerComponent{Name: fields[1], Release: values["release"], Adapter: values["adapter"], Ears: values["ears"]}, nil
 }
 
-func parseEarsIdentity(fields []string) (earsIdentity, error) {
-	values, err := parseEarKeyValues(fields)
+func parseListenerIdentity(fields []string) (listenerIdentity, error) {
+	values, err := parseListenerKeyValues(fields)
 	if err != nil {
-		return earsIdentity{}, fmt.Errorf("malformed identity record: %w", err)
+		return listenerIdentity{}, fmt.Errorf("malformed identity record: %w", err)
 	}
 	for _, key := range []string{"name", "principal", "listening", "route", "reason"} {
 		if _, ok := values[key]; !ok {
-			return earsIdentity{}, fmt.Errorf("identity record missing %s", key)
+			return listenerIdentity{}, fmt.Errorf("identity record missing %s", key)
 		}
 	}
-	identity := earsIdentity{Name: values["name"], Principal: values["principal"], Route: values["route"], Phase: valueOrDash(values["phase"]), CCVersion: valueOrDash(values["cc"]), Reason: values["reason"], Generation: valueOrDash(values["generation"]), LastDrainBefore: valueOrDash(values["last-drain-before"]), LastDrainAfter: valueOrDash(values["last-drain-after"]), LastDrainStatus: valueOrDash(values["last-drain-status"])}
+	identity := listenerIdentity{Name: values["name"], Principal: values["principal"], Route: values["route"], Phase: valueOrDash(values["phase"]), CCVersion: valueOrDash(values["cc"]), Reason: values["reason"], Generation: valueOrDash(values["generation"]), LastDrainBefore: valueOrDash(values["last-drain-before"]), LastDrainAfter: valueOrDash(values["last-drain-after"]), LastDrainStatus: valueOrDash(values["last-drain-status"])}
 	if values["listening"] != "yes" && values["listening"] != "no" {
-		return earsIdentity{}, fmt.Errorf("invalid listening value")
+		return listenerIdentity{}, fmt.Errorf("invalid listening value")
 	}
 	identity.Listening = values["listening"] == "yes"
 	if !oneOf(identity.Principal, "session", "watcher", "gateway") || !oneOf(identity.Route, "socket", "channel", "channel+socket", "none") || !oneOf(identity.Reason, "-", "noreg", "boot", "phase", "optin", "pid", "session", "socket", "registry", "lease") || !oneOf(identity.Phase, "ready", "starting", "-") || !oneOf(identity.LastDrainStatus, "ok", "partial", "-") {
-		return earsIdentity{}, fmt.Errorf("invalid identity enum")
+		return listenerIdentity{}, fmt.Errorf("invalid identity enum")
 	}
 	if identity.Listening && identity.Route == "none" || !identity.Listening && identity.Route != "none" {
-		return earsIdentity{}, fmt.Errorf("identity listening and route disagree")
+		return listenerIdentity{}, fmt.Errorf("identity listening and route disagree")
 	}
-	if identity.Generation != "-" && !earGenerationPattern.MatchString(identity.Generation) || identity.LastDrainBefore != "-" && !earGenerationPattern.MatchString(identity.LastDrainBefore) || identity.LastDrainAfter != "-" && !earGenerationPattern.MatchString(identity.LastDrainAfter) {
-		return earsIdentity{}, fmt.Errorf("invalid identity generation")
+	if identity.Generation != "-" && !queueDigestPattern.MatchString(identity.Generation) || identity.LastDrainBefore != "-" && !queueDigestPattern.MatchString(identity.LastDrainBefore) || identity.LastDrainAfter != "-" && !queueDigestPattern.MatchString(identity.LastDrainAfter) {
+		return listenerIdentity{}, fmt.Errorf("invalid identity generation")
 	}
 	for key, destination := range map[string]*int64{"first-seen": &identity.FirstSeen, "oldest-pending": &identity.OldestPending, "last-written": &identity.LastWritten, "last-drain": &identity.LastDrain} {
 		if values[key] == "" {
@@ -323,7 +323,7 @@ func parseEarsIdentity(fields []string) (earsIdentity, error) {
 		}
 		value, err := parseNonnegativeInt64(values[key])
 		if err != nil {
-			return earsIdentity{}, fmt.Errorf("invalid identity %s", key)
+			return listenerIdentity{}, fmt.Errorf("invalid identity %s", key)
 		}
 		*destination = value
 	}
@@ -333,18 +333,18 @@ func parseEarsIdentity(fields []string) (earsIdentity, error) {
 		}
 		value, err := strconv.Atoi(values[key])
 		if err != nil || value < 0 {
-			return earsIdentity{}, fmt.Errorf("invalid identity %s", key)
+			return listenerIdentity{}, fmt.Errorf("invalid identity %s", key)
 		}
 		*destination = value
 	}
 	return identity, nil
 }
 
-func parseEarKeyValues(fields []string) (map[string]string, error) {
+func parseListenerKeyValues(fields []string) (map[string]string, error) {
 	values := make(map[string]string)
 	for _, field := range fields {
 		key, value, ok := strings.Cut(field, "=")
-		if !ok || key == "" || !validEarValue(value) || values[key] != "" {
+		if !ok || key == "" || !validListenerValue(value) || values[key] != "" {
 			return nil, fmt.Errorf("invalid or duplicate token %q", field)
 		}
 		values[key] = value
@@ -352,20 +352,22 @@ func parseEarKeyValues(fields []string) (map[string]string, error) {
 	return values, nil
 }
 
-func formatEars(snapshot earsSnapshot) ([]byte, error) {
+func formatListenerSnapshot(snapshot listenerSnapshot) ([]byte, error) {
 	if !validNode(snapshot.Node) || snapshot.Generation < 0 || snapshot.WrittenAt < 0 || snapshot.Interval <= 0 || !oneOf(snapshot.State, "running", "stopping") || len(snapshot.Components) == 0 {
-		return nil, fmt.Errorf("invalid ear snapshot header")
+		return nil, fmt.Errorf("invalid listener snapshot header")
 	}
-	identities := append([]earsIdentity(nil), snapshot.Identities...)
-	sort.Slice(identities, func(i, j int) bool { return safeEarValue(identities[i].Name) < safeEarValue(identities[j].Name) })
+	identities := append([]listenerIdentity(nil), snapshot.Identities...)
+	sort.Slice(identities, func(i, j int) bool {
+		return safeListenerValue(identities[i].Name) < safeListenerValue(identities[j].Name)
+	})
 	lines := make([]string, 0, len(identities))
 	for _, identity := range identities {
-		line, err := formatEarsIdentity(identity)
+		line, err := formatListenerIdentity(identity)
 		if err != nil {
 			return nil, err
 		}
-		if len(line)-1 > earsMaxRecordBytes {
-			return nil, fmt.Errorf("identity record exceeds %d bytes", earsMaxRecordBytes)
+		if len(line)-1 > listenerMaxRecordBytes {
+			return nil, fmt.Errorf("identity record exceeds %d bytes", listenerMaxRecordBytes)
 		}
 		lines = append(lines, line)
 	}
@@ -373,13 +375,13 @@ func formatEars(snapshot earsSnapshot) ([]byte, error) {
 		var out strings.Builder
 		fmt.Fprintf(&out, "ears 1\nnode %s\ngeneration %d\nwritten-at %d\ninterval %d\nstate %s\ncomplete %s\n", snapshot.Node, snapshot.Generation, snapshot.WrittenAt, snapshot.Interval, snapshot.State, yesNo(complete))
 		for _, component := range snapshot.Components {
-			fmt.Fprintf(&out, "component %s release=%s adapter=%s ears=%s\n", safeEarValue(component.Name), safeEarValue(component.Release), safeEarValue(component.Adapter), safeEarValue(component.Ears))
+			fmt.Fprintf(&out, "component %s release=%s adapter=%s ears=%s\n", safeListenerValue(component.Name), safeListenerValue(component.Release), safeListenerValue(component.Adapter), safeListenerValue(component.Ears))
 		}
-		mailboxes := safeSortedUnique(snapshot.Mailboxes)
-		if len(mailboxes) == 0 {
-			mailboxes = []string{"-"}
+		upstreamNodes := safeSortedUnique(snapshot.Mailboxes)
+		if len(upstreamNodes) == 0 {
+			upstreamNodes = []string{"-"}
 		}
-		fmt.Fprintf(&out, "mailbox %s\n", strings.Join(mailboxes, " "))
+		fmt.Fprintf(&out, "mailbox %s\n", strings.Join(upstreamNodes, " "))
 		link := "-"
 		if snapshot.LinkAge >= 0 {
 			link = strconv.FormatInt(snapshot.LinkAge, 10)
@@ -387,9 +389,9 @@ func formatEars(snapshot earsSnapshot) ([]byte, error) {
 		fmt.Fprintf(&out, "link %s\n", link)
 		return out.String()
 	}
-	complete := len(lines) <= earsWriterMaxIdentities
+	complete := len(lines) <= listenerWriterMaxIdentities
 	header := buildHeader(complete)
-	if err := validateEarsRecordLengths(header); err != nil {
+	if err := validateListenerSnapshotRecordLengths(header); err != nil {
 		return nil, err
 	}
 	if complete {
@@ -397,22 +399,22 @@ func formatEars(snapshot earsSnapshot) ([]byte, error) {
 		for _, line := range lines {
 			total += len(line)
 		}
-		complete = total <= earsWriterMaxBytes
+		complete = total <= listenerWriterMaxBytes
 	}
 	if complete {
 		return []byte(header + strings.Join(lines, "")), nil
 	}
 	header = buildHeader(false)
-	if err := validateEarsRecordLengths(header); err != nil {
+	if err := validateListenerSnapshotRecordLengths(header); err != nil {
 		return nil, err
 	}
 	var out strings.Builder
 	out.WriteString(header)
 	written := 0
-	for written < len(lines) && written < earsWriterMaxIdentities {
+	for written < len(lines) && written < listenerWriterMaxIdentities {
 		omittedAfter := len(lines) - written - 1
 		trailer := fmt.Sprintf("truncated %d\n", omittedAfter)
-		if out.Len()+len(lines[written])+len(trailer) > earsWriterMaxBytes {
+		if out.Len()+len(lines[written])+len(trailer) > listenerWriterMaxBytes {
 			break
 		}
 		out.WriteString(lines[written])
@@ -420,46 +422,46 @@ func formatEars(snapshot earsSnapshot) ([]byte, error) {
 	}
 	omitted := len(lines) - written
 	trailer := fmt.Sprintf("truncated %d\n", omitted)
-	if out.Len()+len(trailer) > earsWriterMaxBytes {
-		return nil, fmt.Errorf("ear header leaves no room for truncation record")
+	if out.Len()+len(trailer) > listenerWriterMaxBytes {
+		return nil, fmt.Errorf("listener snapshot header leaves no room for truncation record")
 	}
 	out.WriteString(trailer)
 	return []byte(out.String()), nil
 }
 
-func validateEarsRecordLengths(text string) error {
+func validateListenerSnapshotRecordLengths(text string) error {
 	for _, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
-		if len(line) > earsMaxRecordBytes {
-			return fmt.Errorf("ear record exceeds %d bytes", earsMaxRecordBytes)
+		if len(line) > listenerMaxRecordBytes {
+			return fmt.Errorf("listener snapshot record exceeds %d bytes", listenerMaxRecordBytes)
 		}
 	}
 	return nil
 }
 
-func formatEarsIdentity(identity earsIdentity) (string, error) {
+func formatListenerIdentity(identity listenerIdentity) (string, error) {
 	if !oneOf(identity.Principal, "session", "watcher", "gateway") || !oneOf(identity.Route, "socket", "channel", "channel+socket", "none") || !oneOf(identity.Phase, "ready", "starting", "-") || !oneOf(identity.Reason, "-", "noreg", "boot", "phase", "optin", "pid", "session", "socket", "registry", "lease") || !oneOf(identity.LastDrainStatus, "ok", "partial", "-") {
-		return "", fmt.Errorf("invalid ear identity enums")
+		return "", fmt.Errorf("invalid listener snapshot identity enums")
 	}
 	if identity.Listening && identity.Route == "none" || !identity.Listening && identity.Route != "none" || identity.PendingRing < 0 || identity.PendingInfo < 0 || identity.PendingOperator < 0 || identity.FirstSeen < 0 || identity.OldestPending < 0 || identity.WrittenRings < 0 || identity.LastWritten < 0 || identity.LastDrain < 0 {
-		return "", fmt.Errorf("invalid ear identity state")
+		return "", fmt.Errorf("invalid listener snapshot identity state")
 	}
-	generation := safeEarGeneration(identity.Generation)
-	before := safeEarGeneration(identity.LastDrainBefore)
-	after := safeEarGeneration(identity.LastDrainAfter)
-	return fmt.Sprintf("identity name=%s principal=%s listening=%s route=%s phase=%s cc=%s reason=%s pending-ring=%d pending-info=%d pending-operator=%d generation=%s first-seen=%d oldest-pending=%d written-rings=%d last-written=%d last-drain=%d last-drain-before=%s last-drain-after=%s last-drain-status=%s\n", safeEarValue(identity.Name), identity.Principal, yesNo(identity.Listening), identity.Route, identity.Phase, safeEarValue(identity.CCVersion), identity.Reason, identity.PendingRing, identity.PendingInfo, identity.PendingOperator, generation, identity.FirstSeen, identity.OldestPending, identity.WrittenRings, identity.LastWritten, identity.LastDrain, before, after, identity.LastDrainStatus), nil
+	pendingDigest := safeQueueDigest(identity.Generation)
+	before := safeQueueDigest(identity.LastDrainBefore)
+	after := safeQueueDigest(identity.LastDrainAfter)
+	return fmt.Sprintf("identity name=%s principal=%s listening=%s route=%s phase=%s cc=%s reason=%s pending-ring=%d pending-info=%d pending-operator=%d generation=%s first-seen=%d oldest-pending=%d written-rings=%d last-written=%d last-drain=%d last-drain-before=%s last-drain-after=%s last-drain-status=%s\n", safeListenerValue(identity.Name), identity.Principal, yesNo(identity.Listening), identity.Route, identity.Phase, safeListenerValue(identity.CCVersion), identity.Reason, identity.PendingRing, identity.PendingInfo, identity.PendingOperator, pendingDigest, identity.FirstSeen, identity.OldestPending, identity.WrittenRings, identity.LastWritten, identity.LastDrain, before, after, identity.LastDrainStatus), nil
 }
 
-func validEarValue(value string) bool { return earValuePattern.MatchString(value) }
+func validListenerValue(value string) bool { return listenerValuePattern.MatchString(value) }
 
-func safeEarValue(value string) string {
-	if !validEarValue(value) {
+func safeListenerValue(value string) string {
+	if !validListenerValue(value) {
 		return "-"
 	}
 	return value
 }
 
-func safeEarGeneration(value string) string {
-	if value == "-" || earGenerationPattern.MatchString(value) {
+func safeQueueDigest(value string) string {
+	if value == "-" || queueDigestPattern.MatchString(value) {
 		return value
 	}
 	return "-"
@@ -468,7 +470,7 @@ func safeEarGeneration(value string) string {
 func safeSortedUnique(values []string) []string {
 	set := make(map[string]bool)
 	for _, value := range values {
-		set[safeEarValue(value)] = true
+		set[safeListenerValue(value)] = true
 	}
 	result := make([]string, 0, len(set))
 	for value := range set {
@@ -502,7 +504,7 @@ func parseNonnegativeInt64(value string) (int64, error) {
 	return parsed, nil
 }
 
-func earReason(reason string) (string, bool) {
+func listenerReason(reason string) (string, bool) {
 	switch reason {
 	case "boot id mismatch":
 		return "boot", true
@@ -524,17 +526,17 @@ func earReason(reason string) (string, bool) {
 	}
 }
 
-func readEarGeneration(path string) int64 {
-	snapshot, err := parseEars(path)
+func readSnapshotSequence(path string) int64 {
+	snapshot, err := parseListenerSnapshot(path)
 	if err != nil {
 		return 0
 	}
 	return snapshot.Generation
 }
 
-func (c *conduit) writeEars(model earsModel) error {
-	if c.earInterval <= 0 {
-		c.earInterval = 60 * time.Second
+func (c *notifier) writeListenerSnapshot(model listenerModel) error {
+	if c.listenerInterval <= 0 {
+		c.listenerInterval = 60 * time.Second
 	}
 	if model.Now.IsZero() {
 		model.Now = time.Now()
@@ -546,75 +548,75 @@ func (c *conduit) writeEars(model earsModel) error {
 	if err != nil {
 		return err
 	}
-	c.earMailboxes = append(c.earMailboxes[:0], cfg.mailboxes...)
-	if !cfg.earsEnabled {
-		c.earMu.Lock()
-		alreadySuppressed := c.earSuppressed
-		c.earSuppressed = true
-		c.earMu.Unlock()
+	c.listenerUpstreams = append(c.listenerUpstreams[:0], cfg.upstreamNodes...)
+	if !cfg.listenerEnabled {
+		c.listenerMu.Lock()
+		alreadySuppressed := c.listenerSuppressed
+		c.listenerSuppressed = true
+		c.listenerMu.Unlock()
 		if alreadySuppressed {
 			return nil
 		}
 		model.State = "stopping"
 		model.Identities = nil
 	} else {
-		c.earMu.Lock()
-		c.earSuppressed = false
-		c.earMu.Unlock()
+		c.listenerMu.Lock()
+		c.listenerSuppressed = false
+		c.listenerMu.Unlock()
 	}
-	generation, err := c.nextEarGeneration(model.Now)
+	sequenceNumber, err := c.nextSnapshotSequence(model.Now)
 	if err != nil {
 		return err
 	}
-	mailboxes := append([]string(nil), c.earMailboxes...)
-	if len(mailboxes) == 1 && mailboxes[0] == c.self {
-		mailboxes = nil
+	upstreamNodes := append([]string(nil), c.listenerUpstreams...)
+	if len(upstreamNodes) == 1 && upstreamNodes[0] == c.self {
+		upstreamNodes = nil
 	}
-	snapshot := earsSnapshot{Node: c.self, Generation: generation, WrittenAt: model.Now.Unix(), Interval: int64(c.earInterval / time.Second), State: model.State, Components: []earsComponent{{Name: "conduit", Release: linkVersion, Adapter: conduitAdapterVersion, Ears: "1"}}, Mailboxes: mailboxes, LinkAge: model.LinkAge, Identities: append([]earsIdentity(nil), model.Identities...)}
-	data, err := formatEars(snapshot)
+	snapshot := listenerSnapshot{Node: c.self, Generation: sequenceNumber, WrittenAt: model.Now.Unix(), Interval: int64(c.listenerInterval / time.Second), State: model.State, Components: []listenerComponent{{Name: "conduit", Release: linkVersion, Adapter: notifierAdapterVersion, Ears: "1"}}, Mailboxes: upstreamNodes, LinkAge: model.LinkAge, Identities: append([]listenerIdentity(nil), model.Identities...)}
+	data, err := formatListenerSnapshot(snapshot)
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(c.home, "presence", "conduit@"+c.self+".ear")
-	if err := writeEarAtomic(c.home, path, data); err != nil {
+	if err := writeListenerAtomic(c.home, path, data); err != nil {
 		return err
 	}
-	c.earMu.Lock()
-	c.earGeneration = generation
-	c.earLastWrite = model.Now
-	c.earLastSignature = earsListeningSignature(model.Identities)
-	c.earForceWrite = false
-	c.earMu.Unlock()
+	c.listenerMu.Lock()
+	c.snapshotSequence = sequenceNumber
+	c.listenerLastWrite = model.Now
+	c.listenerLastSignature = listenerReachabilitySignature(model.Identities)
+	c.listenerForceWrite = false
+	c.listenerMu.Unlock()
 	return nil
 }
 
-func (c *conduit) earWriteDelay() time.Duration {
-	c.earMu.Lock()
-	defer c.earMu.Unlock()
-	if c.earLastWrite.IsZero() {
+func (c *notifier) listenerWriteDelay() time.Duration {
+	c.listenerMu.Lock()
+	defer c.listenerMu.Unlock()
+	if c.listenerLastWrite.IsZero() {
 		return 0
 	}
-	remaining := time.Second - time.Since(c.earLastWrite)
+	remaining := time.Second - time.Since(c.listenerLastWrite)
 	if remaining < 0 {
 		return 0
 	}
 	return remaining
 }
 
-func (c *conduit) waitEarWriteSlot() {
-	if wait := c.earWriteDelay(); wait > 0 {
+func (c *notifier) waitListenerWriteSlot() {
+	if wait := c.listenerWriteDelay(); wait > 0 {
 		time.Sleep(wait)
 	}
 }
 
-func (c *conduit) nextEarGeneration(now time.Time) (int64, error) {
-	own := readEarGeneration(filepath.Join(c.home, "presence", "conduit@"+c.self+".ear"))
-	runtimeGeneration := readGenerationState(filepath.Join(c.runtime, "ears", "generation"))
+func (c *notifier) nextSnapshotSequence(now time.Time) (int64, error) {
+	own := readSnapshotSequence(filepath.Join(c.home, "presence", "conduit@"+c.self+".ear"))
+	runtimeSequence := readSnapshotSequenceState(filepath.Join(c.runtime, "ears", "generation"))
 	next := now.Unix()
-	for _, current := range []int64{own, runtimeGeneration} {
+	for _, current := range []int64{own, runtimeSequence} {
 		if current >= next {
 			if current == math.MaxInt64 {
-				return 0, fmt.Errorf("ear generation cannot advance past %d", current)
+				return 0, fmt.Errorf("snapshot sequence number cannot advance past %d", current)
 			}
 			next = current + 1
 		}
@@ -625,7 +627,7 @@ func (c *conduit) nextEarGeneration(now time.Time) (int64, error) {
 	return next, nil
 }
 
-func readGenerationState(path string) int64 {
+func readSnapshotSequenceState(path string) int64 {
 	data, err := readRegularBytes(path, 65)
 	if err != nil || len(data) > 64 {
 		return 0
@@ -676,8 +678,8 @@ func writeAtomicText(path, value string) error {
 	return nil
 }
 
-func earsListeningSignature(identities []earsIdentity) string {
-	ordered := append([]earsIdentity(nil), identities...)
+func listenerReachabilitySignature(identities []listenerIdentity) string {
+	ordered := append([]listenerIdentity(nil), identities...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
 	var signature strings.Builder
 	for _, identity := range ordered {
@@ -686,7 +688,7 @@ func earsListeningSignature(identities []earsIdentity) string {
 	return signature.String()
 }
 
-func loadEarLeases(root, bootID string) (map[string]identityLease, error) {
+func loadListenerLeases(root, bootID string) (map[string]identityLease, error) {
 	entries, err := os.ReadDir(filepath.Join(root, "identities"))
 	if err != nil {
 		return nil, err
@@ -708,27 +710,27 @@ func loadEarLeases(root, bootID string) (map[string]identityLease, error) {
 	return leases, nil
 }
 
-func (c *conduit) buildEarsModel(registrations map[string]sessionRegistration, leases map[string]identityLease, now time.Time, state string) (earsModel, error) {
-	identities, err := c.buildEarIdentities(registrations, leases)
+func (c *notifier) buildListenerModel(registrations map[string]sessionRegistration, leases map[string]identityLease, now time.Time, state string) (listenerModel, error) {
+	identities, err := c.buildListenerIdentities(registrations, leases)
 	if err != nil {
-		return earsModel{}, err
+		return listenerModel{}, err
 	}
-	return earsModel{Now: now, State: state, LinkAge: linkFreshAge(c.home, now), Identities: identities}, nil
+	return listenerModel{Now: now, State: state, LinkAge: linkFreshAge(c.home, now), Identities: identities}, nil
 }
 
-func (c *conduit) captureEarsModel(state string) (earsModel, error) {
+func (c *notifier) captureListenerModel(state string) (listenerModel, error) {
 	registrations, err := loadRegistrations(c.runtime, c.bootID)
 	if err != nil {
-		return earsModel{}, err
+		return listenerModel{}, err
 	}
-	leases, err := loadEarLeases(c.runtime, c.bootID)
+	leases, err := loadListenerLeases(c.runtime, c.bootID)
 	if err != nil {
-		return earsModel{}, err
+		return listenerModel{}, err
 	}
-	return c.buildEarsModel(registrations, leases, time.Now(), state)
+	return c.buildListenerModel(registrations, leases, time.Now(), state)
 }
 
-func (c *conduit) buildEarIdentities(registrations map[string]sessionRegistration, leases map[string]identityLease) ([]earsIdentity, error) {
+func (c *notifier) buildListenerIdentities(registrations map[string]sessionRegistration, leases map[string]identityLease) ([]listenerIdentity, error) {
 	byIdentity := make(map[string][]sessionRegistration)
 	for _, registration := range registrations {
 		byIdentity[registration.Identity] = append(byIdentity[registration.Identity], registration)
@@ -747,9 +749,9 @@ func (c *conduit) buildEarIdentities(registrations map[string]sessionRegistratio
 		names = append(names, identity)
 	}
 	sort.Strings(names)
-	result := make([]earsIdentity, 0, len(names))
+	result := make([]listenerIdentity, 0, len(names))
 	for _, identity := range names {
-		row, err := c.buildEarIdentity(identity, byIdentity[identity], leases[identity])
+		row, err := c.buildListenerIdentity(identity, byIdentity[identity], leases[identity])
 		if err != nil {
 			return nil, err
 		}
@@ -758,7 +760,7 @@ func (c *conduit) buildEarIdentities(registrations map[string]sessionRegistratio
 	return result, nil
 }
 
-func (c *conduit) buildEarIdentityBase(identity string, registrations []sessionRegistration, lease identityLease) (earsIdentity, error) {
+func (c *notifier) buildListenerIdentityBase(identity string, registrations []sessionRegistration, lease identityLease) (listenerIdentity, error) {
 	selected := sessionRegistration{}
 	owned := lease.State == "owned" && lease.InstanceID != ""
 	if owned {
@@ -774,7 +776,7 @@ func (c *conduit) buildEarIdentityBase(identity string, registrations []sessionR
 		sortRegistrationsForReclaim(registrations)
 		selected = registrations[0]
 	}
-	row := earsIdentity{Name: identity, Principal: "session", Route: "none", Phase: "-", CCVersion: "-", Reason: "noreg", Generation: "-", LastDrainBefore: "-", LastDrainAfter: "-", LastDrainStatus: "-"}
+	row := listenerIdentity{Name: identity, Principal: "session", Route: "none", Phase: "-", CCVersion: "-", Reason: "noreg", Generation: "-", LastDrainBefore: "-", LastDrainAfter: "-", LastDrainStatus: "-"}
 	if selected.InstanceID != "" {
 		row.Phase = valueOrDash(selected.Phase)
 		row.CCVersion = valueOrDash(selected.CCVersion)
@@ -785,12 +787,12 @@ func (c *conduit) buildEarIdentityBase(identity string, registrations []sessionR
 		case !selectedOwned:
 			row.Reason = "lease"
 		case !selected.ConduitVerified:
-			mapped, ok := earReason(c.verificationReasons[selected.InstanceID])
+			mapped, ok := listenerReason(c.verificationReasons[selected.InstanceID])
 			if !ok {
-				return earsIdentity{}, fmt.Errorf("registration %s has unmapped verification reason %q", selected.InstanceID, c.verificationReasons[selected.InstanceID])
+				return listenerIdentity{}, fmt.Errorf("registration %s has unmapped verification reason %q", selected.InstanceID, c.verificationReasons[selected.InstanceID])
 			}
 			row.Reason = mapped
-		case !registrationRingReady(selected, lease):
+		case !registrationNotifyReady(selected, lease):
 			row.Reason = "lease"
 		default:
 			row.Listening = true
@@ -808,35 +810,35 @@ func (c *conduit) buildEarIdentityBase(identity string, registrations []sessionR
 	return row, nil
 }
 
-func (c *conduit) buildEarIdentity(identity string, registrations []sessionRegistration, lease identityLease) (earsIdentity, error) {
-	row, err := c.buildEarIdentityBase(identity, registrations, lease)
+func (c *notifier) buildListenerIdentity(identity string, registrations []sessionRegistration, lease identityLease) (listenerIdentity, error) {
+	row, err := c.buildListenerIdentityBase(identity, registrations, lease)
 	if err != nil {
-		return earsIdentity{}, err
+		return listenerIdentity{}, err
 	}
-	letters := c.pendingForSnapshot(identity)
-	mail, notices, urgent := letterCounts(letters)
+	messages := c.pendingForSnapshot(identity)
+	mail, alerts, urgent := messageCounts(messages)
 	row.PendingRing = mail + urgent
-	row.PendingInfo = notices - urgent
+	row.PendingInfo = alerts - urgent
 	if row.PendingRing > 0 {
-		row.Generation = letterGeneration(letters)
-		for _, letter := range ringLetters(letters) {
-			if letter.installedAt > 0 && (row.OldestPending == 0 || letter.installedAt < row.OldestPending) {
-				row.OldestPending = letter.installedAt
+		row.Generation = queueDigest(messages)
+		for _, messageItem := range notifiableMessages(messages) {
+			if messageItem.installedAt > 0 && (row.OldestPending == 0 || messageItem.installedAt < row.OldestPending) {
+				row.OldestPending = messageItem.installedAt
 			}
 		}
-		if sidecar, err := c.readEarSidecar(identity); err == nil && sidecar.Generation == row.Generation {
+		if sidecar, err := c.readListenerSidecar(identity); err == nil && sidecar.Generation == row.Generation {
 			row.FirstSeen, row.WrittenRings = sidecar.FirstSeen, sidecar.WrittenRings
 			row.LastWritten = sidecar.LastWritten
 		} else if err != nil && !os.IsNotExist(err) {
-			return earsIdentity{}, err
+			return listenerIdentity{}, err
 		}
-	} else if sidecar, err := c.readEarSidecar(identity); err == nil {
+	} else if sidecar, err := c.readListenerSidecar(identity); err == nil {
 		row.LastWritten = sidecar.LastWritten
 	} else if err != nil && !os.IsNotExist(err) {
-		return earsIdentity{}, err
+		return listenerIdentity{}, err
 	}
-	drain := c.readDrainStamp(identity)
-	row.LastDrain, row.LastDrainBefore, row.LastDrainAfter, row.LastDrainStatus = drain.LastDrain, drain.LastDrainBefore, drain.LastDrainAfter, drain.LastDrainStatus
+	inboxRead := c.readInboxReadMarker(identity)
+	row.LastDrain, row.LastDrainBefore, row.LastDrainAfter, row.LastDrainStatus = inboxRead.LastDrain, inboxRead.LastDrainBefore, inboxRead.LastDrainAfter, inboxRead.LastDrainStatus
 	return row, nil
 }
 
@@ -860,28 +862,28 @@ func sortRegistrationsForReclaim(registrations []sessionRegistration) {
 	})
 }
 
-func registrationRingReady(registration sessionRegistration, lease identityLease) bool {
+func registrationNotifyReady(registration sessionRegistration, lease identityLease) bool {
 	return registration.ConduitVerified && registration.Phase == "ready" && lease.State == "owned" && lease.InstanceID == registration.InstanceID && lease.Epoch > 0 && lease.Epoch == registration.LeaseEpoch && lease.PID == registration.PID && lease.PIDStart == registration.PIDStart && lease.ClaudeSessionID == registration.ClaudeSessionID
 }
 
-func (c *conduit) readEarSidecar(identity string) (earSidecar, error) {
+func (c *notifier) readListenerSidecar(identity string) (listenerSidecar, error) {
 	data, err := readRegularBytes(filepath.Join(c.runtime, "ears", identity+".json"), 4097)
 	if err != nil {
-		return earSidecar{}, err
+		return listenerSidecar{}, err
 	}
 	if len(data) > 4096 {
-		return earSidecar{}, fmt.Errorf("ear sidecar too large")
+		return listenerSidecar{}, fmt.Errorf("listener sidecar too large")
 	}
-	var sidecar earSidecar
-	if err := json.Unmarshal(data, &sidecar); err != nil || (sidecar.Generation != "" && !earGenerationPattern.MatchString(sidecar.Generation)) || sidecar.FirstSeen < 0 || sidecar.WrittenRings < 0 || sidecar.LastWritten < 0 {
-		return earSidecar{}, fmt.Errorf("invalid ear sidecar for %s", identity)
+	var sidecar listenerSidecar
+	if err := json.Unmarshal(data, &sidecar); err != nil || (sidecar.Generation != "" && !queueDigestPattern.MatchString(sidecar.Generation)) || sidecar.FirstSeen < 0 || sidecar.WrittenRings < 0 || sidecar.LastWritten < 0 {
+		return listenerSidecar{}, fmt.Errorf("invalid listener sidecar for %s", identity)
 	}
 	return sidecar, nil
 }
 
-func (c *conduit) writeEarSidecar(identity string, state conduitState) error {
-	if !validNode(identity) || state.generation == "" || !earGenerationPattern.MatchString(state.generation) {
-		return fmt.Errorf("invalid ear sidecar identity or generation")
+func (c *notifier) writeListenerSidecar(identity string, state notifierState) error {
+	if !validNode(identity) || state.pendingDigest == "" || !queueDigestPattern.MatchString(state.pendingDigest) {
+		return fmt.Errorf("invalid listener sidecar identity or queue digest")
 	}
 	firstSeen, lastWritten := int64(0), int64(0)
 	if !state.firstSeen.IsZero() {
@@ -890,58 +892,58 @@ func (c *conduit) writeEarSidecar(identity string, state conduitState) error {
 	if !state.lastWritten.IsZero() {
 		lastWritten = state.lastWritten.Unix()
 	}
-	return writeAtomicJSON(filepath.Join(c.runtime, "ears", identity+".json"), earSidecar{Generation: state.generation, FirstSeen: firstSeen, WrittenRings: state.writtenRings, LastWritten: lastWritten}, 0600)
+	return writeAtomicJSON(filepath.Join(c.runtime, "ears", identity+".json"), listenerSidecar{Generation: state.pendingDigest, FirstSeen: firstSeen, WrittenRings: state.notificationsSent, LastWritten: lastWritten}, 0600)
 }
 
-func (c *conduit) readDrainStamp(identity string) earDrainStamp {
-	result := earDrainStamp{LastDrainBefore: "-", LastDrainAfter: "-", LastDrainStatus: "-"}
+func (c *notifier) readInboxReadMarker(identity string) inboxReadMarker {
+	result := inboxReadMarker{LastDrainBefore: "-", LastDrainAfter: "-", LastDrainStatus: "-"}
 	f, err := openRegular(filepath.Join(c.home, "run", "drained", identity))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return result
 		}
-		return c.malformedDrain(identity, result)
+		return c.malformedInboxRead(identity, result)
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		return c.malformedDrain(identity, result)
+		return c.malformedInboxRead(identity, result)
 	}
 	data, err := io.ReadAll(io.LimitReader(f, 4097))
 	if err != nil {
-		return c.malformedDrain(identity, result)
+		return c.malformedInboxRead(identity, result)
 	}
 	fields := strings.Fields(string(data))
-	if len(data) > 4096 || len(fields) != 9 || fields[0] != "drain" || fields[1] != "1" || !oneOf(fields[8], "ok", "partial") || (fields[3] != "-" && !earGenerationPattern.MatchString(fields[3])) || (fields[4] != "-" && !earGenerationPattern.MatchString(fields[4])) {
-		return c.malformedDrain(identity, result)
+	if len(data) > 4096 || len(fields) != 9 || fields[0] != "drain" || fields[1] != "1" || !oneOf(fields[8], "ok", "partial") || (fields[3] != "-" && !queueDigestPattern.MatchString(fields[3])) || (fields[4] != "-" && !queueDigestPattern.MatchString(fields[4])) {
+		return c.malformedInboxRead(identity, result)
 	}
 	for _, value := range fields[5:8] {
 		if _, err := parseNonnegativeInt64(value); err != nil {
-			return c.malformedDrain(identity, result)
+			return c.malformedInboxRead(identity, result)
 		}
 	}
 	at, err := parseNonnegativeInt64(fields[2])
 	if err != nil {
-		return c.malformedDrain(identity, result)
+		return c.malformedInboxRead(identity, result)
 	}
 	result.LastDrain, result.LastDrainBefore, result.LastDrainAfter, result.LastDrainStatus = at, fields[3], fields[4], fields[8]
 	result.Token = fmt.Sprintf("%d:%x", info.ModTime().UnixNano(), sha256.Sum256(data))
 	return result
 }
 
-func (c *conduit) malformedDrain(identity string, result earDrainStamp) earDrainStamp {
-	if c.drainedWarned == nil {
-		c.drainedWarned = make(map[string]bool)
+func (c *notifier) malformedInboxRead(identity string, result inboxReadMarker) inboxReadMarker {
+	if c.inboxReadWarned == nil {
+		c.inboxReadWarned = make(map[string]bool)
 	}
-	if !c.drainedWarned[identity] && c.logger != nil {
+	if !c.inboxReadWarned[identity] && c.logger != nil {
 		c.logger.Printf("malformed drained stamp ignored: %s", identity)
-		c.drainedWarned[identity] = true
+		c.inboxReadWarned[identity] = true
 	}
 	return result
 }
 
-func (c *conduit) readTurnStamp(identity string) conduitTurnStamp {
-	var result conduitTurnStamp
+func (c *notifier) readTurnMarker(identity string) turnMarker {
+	var result turnMarker
 	f, err := openRegular(filepath.Join(c.home, "run", "turns", identity))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -972,7 +974,7 @@ func (c *conduit) readTurnStamp(identity string) conduitTurnStamp {
 	return result
 }
 
-func (c *conduit) malformedTurn(identity string, result conduitTurnStamp) conduitTurnStamp {
+func (c *notifier) malformedTurn(identity string, result turnMarker) turnMarker {
 	if c.turnsWarned == nil {
 		c.turnsWarned = make(map[string]bool)
 	}
@@ -995,7 +997,7 @@ func linkFreshAge(home string, now time.Time) int64 {
 	return age
 }
 
-func writeEarAtomic(home, destination string, data []byte) error {
+func writeListenerAtomic(home, destination string, data []byte) error {
 	tmpDir := filepath.Join(home, "tmp")
 	if err := os.MkdirAll(tmpDir, 0700); err != nil {
 		return err

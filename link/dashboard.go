@@ -31,12 +31,12 @@ import (
 var dashboardAssets embed.FS
 
 const (
-	dashboardMaxRows       = 512
-	dashboardLetterRows    = 50
-	dashboardStreamRows    = 20
-	dashboardLetterBodyMax = 256 << 10
-	dashboardStreamBodyMax = 64 << 10
-	dashboardTruncated     = "\n[truncated]\n"
+	dashboardMaxRows        = 512
+	dashboardMessageRows    = 50
+	dashboardStreamRows     = 20
+	dashboardMessageBodyMax = 256 << 10
+	dashboardStreamBodyMax  = 64 << 10
+	dashboardTruncated      = "\n[truncated]\n"
 )
 
 type dashboardOptions struct {
@@ -45,32 +45,32 @@ type dashboardOptions struct {
 	withText bool
 }
 
-type dashboardFleet struct {
-	APIVersion  int                `json:"apiVersion"`
-	Nodes       []dashboardNode    `json:"nodes"`
-	Sessions    []dashboardSession `json:"sessions"`
-	Watchers    []dashboardWatcher `json:"watchers"`
-	Streams     []dashboardStream  `json:"streams"`
-	Letters     []dashboardLetter  `json:"letters,omitempty"`
-	Self        dashboardSelf      `json:"self"`
-	GeneratedAt int64              `json:"generatedAt"`
+type dashboardCluster struct {
+	APIVersion  int                 `json:"apiVersion"`
+	Nodes       []dashboardNode     `json:"nodes"`
+	Sessions    []dashboardSession  `json:"sessions"`
+	Watchers    []dashboardWatchdog `json:"watchers"`
+	Streams     []dashboardStream   `json:"streams"`
+	Letters     []dashboardMessage  `json:"letters,omitempty"`
+	Self        dashboardSelf       `json:"self"`
+	GeneratedAt int64               `json:"generatedAt"`
 }
 
 type dashboardNode struct {
-	Node         string          `json:"node"`
-	Hub          bool            `json:"hub"`
-	State        string          `json:"state"`
-	SnapshotAge  *int64          `json:"snapshotAge"`
-	WrittenAt    *int64          `json:"writtenAt"`
-	Skew         *int64          `json:"skew"`
-	Complete     *bool           `json:"complete"`
-	Components   []earsComponent `json:"components"`
-	Capabilities []string        `json:"capabilities"`
-	Gateway      any             `json:"gateway"`
-	Mailbox      []string        `json:"mailbox"`
-	LinkAge      *int64          `json:"linkAge"`
-	Identities   []earsIdentity  `json:"identities"`
-	Progressing  bool            `json:"progressing"`
+	Node         string              `json:"node"`
+	Hub          bool                `json:"hub"`
+	State        string              `json:"state"`
+	SnapshotAge  *int64              `json:"snapshotAge"`
+	WrittenAt    *int64              `json:"writtenAt"`
+	Skew         *int64              `json:"skew"`
+	Complete     *bool               `json:"complete"`
+	Components   []listenerComponent `json:"components"`
+	Capabilities []string            `json:"capabilities"`
+	Gateway      any                 `json:"gateway"`
+	Mailbox      []string            `json:"mailbox"`
+	LinkAge      *int64              `json:"linkAge"`
+	Identities   []listenerIdentity  `json:"identities"`
+	Progressing  bool                `json:"progressing"`
 }
 
 type dashboardPending struct {
@@ -99,7 +99,7 @@ type dashboardSession struct {
 	Stance          string           `json:"stance,omitempty"`
 }
 
-type dashboardWatcher struct {
+type dashboardWatchdog struct {
 	Name    string `json:"name"`
 	Node    string `json:"node"`
 	Owner   string `json:"owner"`
@@ -125,7 +125,7 @@ type dashboardStreamEntry struct {
 	Body    string `json:"body"`
 }
 
-type dashboardLetter struct {
+type dashboardMessage struct {
 	Identity     string `json:"identity"`
 	ID           string `json:"id"`
 	From         string `json:"from"`
@@ -149,22 +149,22 @@ type dashboardSelf struct {
 }
 
 type dashboardConfig struct {
-	self      string
-	mailboxes []string
-	ttl       int64
+	self          string
+	upstreamNodes []string
+	ttl           int64
 }
 
 type dashboardServer struct {
-	home        string
-	tokenSum    [sha256.Size]byte
-	withText    bool
-	logger      *log.Logger
-	warnMu      sync.Mutex
-	warned      map[string]bool
-	assets      http.Handler
-	requests    chan struct{}
-	progressMu  sync.Mutex
-	generations map[string]int64
+	home              string
+	tokenSum          [sha256.Size]byte
+	withText          bool
+	logger            *log.Logger
+	warnMu            sync.Mutex
+	warned            map[string]bool
+	assets            http.Handler
+	requests          chan struct{}
+	progressMu        sync.Mutex
+	snapshotSequences map[string]int64
 }
 
 func runDashboard(args []string) int {
@@ -239,7 +239,7 @@ func newDashboardHandler(home, token string, withText bool, logger *log.Logger) 
 	if err != nil {
 		return nil, err
 	}
-	server := &dashboardServer{home: home, tokenSum: sha256.Sum256([]byte(token)), withText: withText, logger: logger, warned: make(map[string]bool), assets: http.FileServer(http.FS(assets)), requests: make(chan struct{}, 32), generations: make(map[string]int64)}
+	server := &dashboardServer{home: home, tokenSum: sha256.Sum256([]byte(token)), withText: withText, logger: logger, warned: make(map[string]bool), assets: http.FileServer(http.FS(assets)), requests: make(chan struct{}, 32), snapshotSequences: make(map[string]int64)}
 	return http.HandlerFunc(server.serveHTTP), nil
 }
 
@@ -271,18 +271,18 @@ func (s *dashboardServer) serveHTTP(response http.ResponseWriter, request *http.
 	}
 	switch request.URL.Path {
 	case "/api/v1/fleet":
-		fleet, err := s.readFleet()
+		cluster, err := s.readCluster()
 		if err != nil {
 			s.warn("fleet", err)
 			http.Error(writer, "could not read fleet", http.StatusInternalServerError)
 			return
 		}
 		response.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(writer).Encode(fleet); err != nil {
+		if err := json.NewEncoder(writer).Encode(cluster); err != nil {
 			s.warn("fleet-response", err)
 		}
 	case "/api/v1/letter":
-		s.serveLetter(writer, request)
+		s.serveMessage(writer, request)
 	case "/", "/index.html", "/app.js", "/app.css":
 		s.assets.ServeHTTP(writer, request)
 	default:
@@ -417,7 +417,7 @@ func readDashboardConfig(home string) (dashboardConfig, error) {
 			if len(fields) < 2 {
 				return dashboardConfig{}, errors.New("invalid config mailbox")
 			}
-			config.mailboxes = append(config.mailboxes, fields[1:]...)
+			config.upstreamNodes = append(config.upstreamNodes, fields[1:]...)
 		case "ttl":
 			if len(fields) != 2 || ttlSet {
 				return dashboardConfig{}, errors.New("invalid config ttl")
@@ -432,39 +432,39 @@ func readDashboardConfig(home string) (dashboardConfig, error) {
 	if !validNode(config.self) {
 		return dashboardConfig{}, errors.New("config self is missing or invalid")
 	}
-	for _, mailbox := range config.mailboxes {
-		if !validNode(mailbox) {
+	for _, upstreamNode := range config.upstreamNodes {
+		if !validNode(upstreamNode) {
 			return dashboardConfig{}, errors.New("config mailbox is invalid")
 		}
 	}
 	return config, nil
 }
 
-type dashboardEarAt struct {
+type dashboardListenerAt struct {
 	node        string
-	snapshot    *earsSnapshot
+	snapshot    *listenerSnapshot
 	state       string
 	age         int64
 	skew        int64
 	progressing bool
 }
 
-func (s *dashboardServer) readEarSnapshots(now time.Time) map[string]dashboardEarAt {
-	result := make(map[string]dashboardEarAt)
+func (s *dashboardServer) readListenerSnapshots(now time.Time) map[string]dashboardListenerAt {
+	result := make(map[string]dashboardListenerAt)
 	entries, err := dashboardReadDir(s.home, "presence")
 	if err != nil {
 		return result
 	}
 	for _, entry := range entries {
-		node, ok := earSnapshotNode(entry.Name())
+		node, ok := listenerSnapshotNode(entry.Name())
 		if !ok || entry.Type()&os.ModeSymlink != 0 || !entry.Type().IsRegular() {
 			continue
 		}
 		path := filepath.Join(s.home, "presence", entry.Name())
-		snapshot, err := parseEars(path)
+		snapshot, err := parseListenerSnapshot(path)
 		if err != nil {
 			s.warn("ear:"+entry.Name(), err)
-			result[node] = dashboardEarAt{node: node, state: "invalid"}
+			result[node] = dashboardListenerAt{node: node, state: "invalid"}
 			continue
 		}
 		age := now.Unix() - snapshot.WrittenAt
@@ -482,12 +482,12 @@ func (s *dashboardServer) readEarSnapshots(now time.Time) map[string]dashboardEa
 			state = "fresh"
 		}
 		s.progressMu.Lock()
-		previous, seen := s.generations[node]
+		previous, seen := s.snapshotSequences[node]
 		progressing := seen && snapshot.Generation > previous
-		s.generations[node] = snapshot.Generation
+		s.snapshotSequences[node] = snapshot.Generation
 		s.progressMu.Unlock()
 		copy := snapshot
-		result[node] = dashboardEarAt{node: node, snapshot: &copy, state: state, age: age, skew: skew, progressing: progressing}
+		result[node] = dashboardListenerAt{node: node, snapshot: &copy, state: state, age: age, skew: skew, progressing: progressing}
 	}
 	return result
 }
@@ -508,11 +508,11 @@ func splitAddress(address string) (string, string, bool) {
 	return identity, node, ok && validNode(identity) && validNode(node) && !strings.Contains(node, "@")
 }
 
-func skipFleetIdentity(identity string) bool {
+func skipClusterIdentity(identity string) bool {
 	return identity == "conduit" || identity == "khala" || identity == "gateway" || identity == "operator"
 }
 
-func pendingState(identity earsIdentity) string {
+func pendingState(identity listenerIdentity) string {
 	if identity.PendingRing == 0 {
 		return "empty"
 	}
@@ -525,39 +525,39 @@ func pendingState(identity earsIdentity) string {
 	return "new-since-drain"
 }
 
-func (s *dashboardServer) readFleet() (dashboardFleet, error) {
+func (s *dashboardServer) readCluster() (dashboardCluster, error) {
 	config, err := readDashboardConfig(s.home)
 	if err != nil {
-		return dashboardFleet{}, err
+		return dashboardCluster{}, err
 	}
 	now := time.Now()
-	fleet := dashboardFleet{APIVersion: 1, Self: dashboardSelf{Node: config.self, Mailbox: config.mailboxes, Version: linkVersion}, GeneratedAt: now.Unix()}
+	cluster := dashboardCluster{APIVersion: 1, Self: dashboardSelf{Node: config.self, Mailbox: config.upstreamNodes, Version: linkVersion}, GeneratedAt: now.Unix()}
 	sessions := make(map[string]*dashboardSession)
 	nodeSet := map[string]bool{config.self: true}
-	hubs := make(map[string]bool)
-	for _, mailbox := range config.mailboxes {
-		hubs[mailbox] = true
+	upstreams := make(map[string]bool)
+	for _, upstreamNode := range config.upstreamNodes {
+		upstreams[upstreamNode] = true
 	}
-	earsByNode := s.readEarSnapshots(now)
-	for node, ear := range earsByNode {
+	snapshotsByNode := s.readListenerSnapshots(now)
+	for node, snapshotRow := range snapshotsByNode {
 		nodeSet[node] = true
-		if ear.snapshot != nil {
-			for _, mailbox := range ear.snapshot.Mailboxes {
-				hubs[mailbox] = true
+		if snapshotRow.snapshot != nil {
+			for _, upstreamNode := range snapshotRow.snapshot.Mailboxes {
+				upstreams[upstreamNode] = true
 			}
 		}
 	}
-	s.readPresence(config, now, sessions, nodeSet, &fleet)
-	s.readMinds(now, sessions, nodeSet)
-	for _, watcher := range fleet.Watchers {
-		delete(sessions, watcher.Name+"@"+watcher.Node)
+	s.readPresence(config, now, sessions, nodeSet, &cluster)
+	s.readStatuses(now, sessions, nodeSet)
+	for _, watchdog := range cluster.Watchers {
+		delete(sessions, watchdog.Name+"@"+watchdog.Node)
 	}
-	for node, ear := range earsByNode {
-		if ear.snapshot == nil {
+	for node, snapshotRow := range snapshotsByNode {
+		if snapshotRow.snapshot == nil {
 			continue
 		}
-		for _, identity := range ear.snapshot.Identities {
-			if skipFleetIdentity(identity.Name) {
+		for _, identity := range snapshotRow.snapshot.Identities {
+			if skipClusterIdentity(identity.Name) {
 				continue
 			}
 			session := sessions[identity.Name+"@"+node]
@@ -565,7 +565,7 @@ func (s *dashboardServer) readFleet() (dashboardFleet, error) {
 				continue
 			}
 			session.PrincipalType = identity.Principal
-			session.Listening = ear.state == "fresh" && identity.Listening
+			session.Listening = snapshotRow.state == "fresh" && identity.Listening
 			session.Route, session.Reason = identity.Route, identity.Reason
 			session.PendingByClass = dashboardPending{Ring: identity.PendingRing, Info: identity.PendingInfo, Operator: identity.PendingOperator}
 			session.PendingState = pendingState(identity)
@@ -578,7 +578,7 @@ func (s *dashboardServer) readFleet() (dashboardFleet, error) {
 	}
 	sort.Strings(addresses)
 	for _, address := range addresses[:min(len(addresses), dashboardMaxRows)] {
-		fleet.Sessions = append(fleet.Sessions, *sessions[address])
+		cluster.Sessions = append(cluster.Sessions, *sessions[address])
 	}
 	nodes := make([]string, 0, len(nodeSet))
 	for node := range nodeSet {
@@ -586,19 +586,19 @@ func (s *dashboardServer) readFleet() (dashboardFleet, error) {
 	}
 	sort.Strings(nodes)
 	for _, node := range nodes[:min(len(nodes), dashboardMaxRows)] {
-		item := dashboardNode{Node: node, Hub: hubs[node], State: "absent", Components: []earsComponent{}, Capabilities: []string{}, Gateway: nil, Mailbox: []string{}, Identities: []earsIdentity{}}
-		if ear, ok := earsByNode[node]; ok {
-			item.State, item.Progressing = ear.state, ear.progressing
-			if ear.snapshot != nil {
-				item.SnapshotAge, item.WrittenAt, item.Skew = int64Pointer(ear.age), int64Pointer(ear.snapshot.WrittenAt), int64Pointer(ear.skew)
-				item.Complete = boolPointer(ear.snapshot.Complete)
-				item.Components = append(item.Components, ear.snapshot.Components...)
-				item.Mailbox = append(item.Mailbox, ear.snapshot.Mailboxes...)
-				if ear.snapshot.LinkAge >= 0 {
-					item.LinkAge = int64Pointer(ear.snapshot.LinkAge)
+		item := dashboardNode{Node: node, Hub: upstreams[node], State: "absent", Components: []listenerComponent{}, Capabilities: []string{}, Gateway: nil, Mailbox: []string{}, Identities: []listenerIdentity{}}
+		if snapshotRow, ok := snapshotsByNode[node]; ok {
+			item.State, item.Progressing = snapshotRow.state, snapshotRow.progressing
+			if snapshotRow.snapshot != nil {
+				item.SnapshotAge, item.WrittenAt, item.Skew = int64Pointer(snapshotRow.age), int64Pointer(snapshotRow.snapshot.WrittenAt), int64Pointer(snapshotRow.skew)
+				item.Complete = boolPointer(snapshotRow.snapshot.Complete)
+				item.Components = append(item.Components, snapshotRow.snapshot.Components...)
+				item.Mailbox = append(item.Mailbox, snapshotRow.snapshot.Mailboxes...)
+				if snapshotRow.snapshot.LinkAge >= 0 {
+					item.LinkAge = int64Pointer(snapshotRow.snapshot.LinkAge)
 				}
-				for _, identity := range ear.snapshot.Identities {
-					if !skipFleetIdentity(identity.Name) {
+				for _, identity := range snapshotRow.snapshot.Identities {
+					if !skipClusterIdentity(identity.Name) {
 						item.Identities = append(item.Identities, identity)
 					}
 				}
@@ -609,20 +609,20 @@ func (s *dashboardServer) readFleet() (dashboardFleet, error) {
 				item.LinkAge = int64Pointer(age)
 			}
 		}
-		fleet.Nodes = append(fleet.Nodes, item)
+		cluster.Nodes = append(cluster.Nodes, item)
 	}
 	localIdentities := s.localIdentities()
-	fleet.Streams = s.readStreams(localIdentities)
+	cluster.Streams = s.readStreams(localIdentities)
 	if s.withText {
-		fleet.Letters = s.readLetters(localIdentities, now)
+		cluster.Letters = s.readMessages(localIdentities, now)
 	}
-	return fleet, nil
+	return cluster, nil
 }
 
 func int64Pointer(value int64) *int64 { return &value }
 func boolPointer(value bool) *bool    { return &value }
 
-func (s *dashboardServer) readPresence(config dashboardConfig, now time.Time, sessions map[string]*dashboardSession, nodeSet map[string]bool, fleet *dashboardFleet) {
+func (s *dashboardServer) readPresence(config dashboardConfig, now time.Time, sessions map[string]*dashboardSession, nodeSet map[string]bool, cluster *dashboardCluster) {
 	entries, err := dashboardReadDir(s.home, "presence")
 	if err != nil {
 		return
@@ -634,14 +634,14 @@ func (s *dashboardServer) readPresence(config dashboardConfig, now time.Time, se
 		}
 		switch {
 		case strings.HasSuffix(name, ".watcher"):
-			if watcher, ok := s.readWatcher(strings.TrimSuffix(name, ".watcher")); ok && len(fleet.Watchers) < dashboardMaxRows {
-				fleet.Watchers = append(fleet.Watchers, watcher)
+			if watchdog, ok := s.readWatchdog(strings.TrimSuffix(name, ".watcher")); ok && len(cluster.Watchers) < dashboardMaxRows {
+				cluster.Watchers = append(cluster.Watchers, watchdog)
 			}
 		case strings.HasSuffix(name, ".watching"), strings.HasSuffix(name, ".ear"):
 			continue
 		default:
 			identity, node, ok := splitAddress(name)
-			if !ok || skipFleetIdentity(identity) {
+			if !ok || skipClusterIdentity(identity) {
 				continue
 			}
 			data, _, err := dashboardReadFile(s.home, 256, "presence", name)
@@ -669,55 +669,55 @@ func (s *dashboardServer) readPresence(config dashboardConfig, now time.Time, se
 			}
 		}
 	}
-	sort.Slice(fleet.Watchers, func(i, j int) bool {
-		if fleet.Watchers[i].Node != fleet.Watchers[j].Node {
-			return fleet.Watchers[i].Node < fleet.Watchers[j].Node
+	sort.Slice(cluster.Watchers, func(i, j int) bool {
+		if cluster.Watchers[i].Node != cluster.Watchers[j].Node {
+			return cluster.Watchers[i].Node < cluster.Watchers[j].Node
 		}
-		return fleet.Watchers[i].Name < fleet.Watchers[j].Name
+		return cluster.Watchers[i].Name < cluster.Watchers[j].Name
 	})
 }
 
-func (s *dashboardServer) readWatcher(address string) (dashboardWatcher, bool) {
+func (s *dashboardServer) readWatchdog(address string) (dashboardWatchdog, bool) {
 	name, node, ok := splitAddress(address)
-	if !ok || skipFleetIdentity(name) {
-		return dashboardWatcher{}, false
+	if !ok || skipClusterIdentity(name) {
+		return dashboardWatchdog{}, false
 	}
 	data, truncated, err := dashboardReadFile(s.home, 4096, "presence", address+".watcher")
 	if err != nil || truncated {
-		return dashboardWatcher{}, false
+		return dashboardWatchdog{}, false
 	}
 	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
 	if len(lines) != 5 && len(lines) != 6 {
-		return dashboardWatcher{}, false
+		return dashboardWatchdog{}, false
 	}
 	first := strings.Fields(lines[0])
 	stateFields := strings.Fields(lines[4])
 	if len(first) != 1 || first[0] == "retired" || len(stateFields) == 0 || !oneOf(stateFields[0], "active", "silent") {
-		return dashboardWatcher{}, false
+		return dashboardWatchdog{}, false
 	}
 	declared, err1 := strconv.ParseInt(first[0], 10, 64)
-	cadence, err2 := strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
+	heartbeatInterval, err2 := strconv.ParseInt(strings.TrimSpace(lines[1]), 10, 64)
 	last, err3 := strconv.ParseInt(strings.TrimSpace(lines[3]), 10, 64)
-	if err1 != nil || err2 != nil || err3 != nil || declared < 0 || cadence < 0 || last < 0 {
-		return dashboardWatcher{}, false
+	if err1 != nil || err2 != nil || err3 != nil || declared < 0 || heartbeatInterval < 0 || last < 0 {
+		return dashboardWatchdog{}, false
 	}
 	var since *int64
 	if len(lines) == 6 {
 		value, err := strconv.ParseInt(strings.TrimSpace(lines[5]), 10, 64)
 		if err != nil || value < 0 {
-			return dashboardWatcher{}, false
+			return dashboardWatchdog{}, false
 		}
 		since = int64Pointer(value)
 	}
-	return dashboardWatcher{Name: name, Node: node, Owner: strings.TrimSpace(lines[2]), Cadence: cadence, Last: last, State: stateFields[0], Since: since}, true
+	return dashboardWatchdog{Name: name, Node: node, Owner: strings.TrimSpace(lines[2]), Cadence: heartbeatInterval, Last: last, State: stateFields[0], Since: since}, true
 }
 
-type dashboardMind struct {
+type dashboardStatus struct {
 	model, effort, role, charge, focus, stance, freshness string
 	active                                                bool
 }
 
-func (s *dashboardServer) readMinds(now time.Time, sessions map[string]*dashboardSession, nodeSet map[string]bool) {
+func (s *dashboardServer) readStatuses(now time.Time, sessions map[string]*dashboardSession, nodeSet map[string]bool) {
 	nodes, err := dashboardReadDir(s.home, "minds")
 	if err != nil {
 		return
@@ -733,28 +733,28 @@ func (s *dashboardServer) readMinds(now time.Time, sessions map[string]*dashboar
 		}
 		for _, identityEntry := range identities {
 			identity := identityEntry.Name()
-			if !identityEntry.IsDir() || !validNode(identity) || skipFleetIdentity(identity) {
+			if !identityEntry.IsDir() || !validNode(identity) || skipClusterIdentity(identity) {
 				continue
 			}
-			mind, ok := s.readCurrentMind(node, identity, now)
+			sessionStatus, ok := s.readCurrentStatus(node, identity, now)
 			if !ok {
 				continue
 			}
 			session := ensureDashboardSession(sessions, identity+"@"+node)
-			session.Model, session.Effort, session.Role, session.Charge = mind.model, mind.effort, mind.role, mind.charge
-			session.Freshness = mind.freshness
-			if s.withText && mind.active {
-				session.Focus, session.Stance = mind.focus, mind.stance
+			session.Model, session.Effort, session.Role, session.Charge = sessionStatus.model, sessionStatus.effort, sessionStatus.role, sessionStatus.charge
+			session.Freshness = sessionStatus.freshness
+			if s.withText && sessionStatus.active {
+				session.Focus, session.Stance = sessionStatus.focus, sessionStatus.stance
 			}
 			nodeSet[node] = true
 		}
 	}
 }
 
-func (s *dashboardServer) readCurrentMind(node, identity string, now time.Time) (dashboardMind, bool) {
+func (s *dashboardServer) readCurrentStatus(node, identity string, now time.Time) (dashboardStatus, bool) {
 	entries, err := dashboardReadDir(s.home, "minds", node, identity)
 	if err != nil {
-		return dashboardMind{}, false
+		return dashboardStatus{}, false
 	}
 	var names []string
 	for _, entry := range entries {
@@ -763,16 +763,16 @@ func (s *dashboardServer) readCurrentMind(node, identity string, now time.Time) 
 		}
 	}
 	if len(names) == 0 {
-		return dashboardMind{}, false
+		return dashboardStatus{}, false
 	}
 	sort.Slice(names, func(i, j int) bool { return compareGenerations(names[i], names[j]) > 0 })
 	data, _, err := dashboardReadFile(s.home, 64<<10, "minds", node, identity, names[0])
 	if err != nil {
-		return dashboardMind{}, false
+		return dashboardStatus{}, false
 	}
 	headers, _ := parseHeaderBody(data)
 	if headers["Session"] != identity || headers["Node"] != node || !oneOf(headers["State"], "active", "cleared") {
-		return dashboardMind{}, false
+		return dashboardStatus{}, false
 	}
 	active := headers["State"] == "active"
 	declared, _ := strconv.ParseInt(headers["Declared-Focus"], 10, 64)
@@ -786,7 +786,7 @@ func (s *dashboardServer) readCurrentMind(node, identity string, now time.Time) 
 	if !active {
 		freshness = "cleared"
 	}
-	return dashboardMind{model: headers["Model"], effort: headers["Effort"], role: headers["Role"], charge: headers["Charge"], focus: headers["Focus"], stance: headers["Stance"], freshness: freshness, active: active}, true
+	return dashboardStatus{model: headers["Model"], effort: headers["Effort"], role: headers["Role"], charge: headers["Charge"], focus: headers["Focus"], stance: headers["Stance"], freshness: freshness, active: active}, true
 }
 
 func compareGenerations(left, right string) int {
@@ -811,7 +811,7 @@ func (s *dashboardServer) localIdentities() []string {
 	}
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() && validNode(entry.Name()) && !skipFleetIdentity(entry.Name()) {
+		if entry.IsDir() && validNode(entry.Name()) && !skipClusterIdentity(entry.Name()) {
 			names = append(names, entry.Name())
 		}
 	}
@@ -908,8 +908,8 @@ func (s *dashboardServer) streamUnread(identity, stream string, entries []dashbo
 	return count
 }
 
-func (s *dashboardServer) readLetters(localIdentities []string, now time.Time) []dashboardLetter {
-	var result []dashboardLetter
+func (s *dashboardServer) readMessages(localIdentities []string, now time.Time) []dashboardMessage {
+	var result []dashboardMessage
 	for _, identity := range localIdentities {
 		for _, state := range []string{"new", "cur"} {
 			entries, err := dashboardReadDir(s.home, "inbox", identity, state)
@@ -930,18 +930,18 @@ func (s *dashboardServer) readLetters(localIdentities []string, now time.Time) [
 				}
 				epoch, _ := strconv.ParseInt(strings.SplitN(entry.Name(), ".", 2)[0], 10, 64)
 				age := max(int64(0), now.Unix()-epoch)
-				result = append(result, dashboardLetter{Identity: identity, ID: entry.Name(), From: headers["From"], Date: headers["Date"], Type: headers["Type"], Urgency: headers["Urgency"], Subject: headers["Subject"], State: state, Age: age})
+				result = append(result, dashboardMessage{Identity: identity, ID: entry.Name(), From: headers["From"], Date: headers["Date"], Type: headers["Type"], Urgency: headers["Urgency"], Subject: headers["Subject"], State: state, Age: age})
 			}
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return compareMessageIDs(result[i].ID, result[j].ID) > 0 })
-	if len(result) > dashboardLetterRows {
-		result = result[:dashboardLetterRows]
+	if len(result) > dashboardMessageRows {
+		result = result[:dashboardMessageRows]
 	}
 	return result
 }
 
-func (s *dashboardServer) serveLetter(response http.ResponseWriter, request *http.Request) {
+func (s *dashboardServer) serveMessage(response http.ResponseWriter, request *http.Request) {
 	if !s.withText {
 		http.NotFound(response, request)
 		return
@@ -957,7 +957,7 @@ func (s *dashboardServer) serveLetter(response http.ResponseWriter, request *htt
 		return
 	}
 	for _, state := range []string{"new", "cur"} {
-		data, truncated, err := dashboardReadFile(s.home, dashboardLetterBodyMax+(64<<10), "inbox", identity, state, id)
+		data, truncated, err := dashboardReadFile(s.home, dashboardMessageBodyMax+(64<<10), "inbox", identity, state, id)
 		if err != nil {
 			continue
 		}
@@ -965,8 +965,8 @@ func (s *dashboardServer) serveLetter(response http.ResponseWriter, request *htt
 		if headers["Id"] != id {
 			continue
 		}
-		if truncated || len(body) > dashboardLetterBodyMax {
-			body = truncateString(body, dashboardLetterBodyMax) + dashboardTruncated
+		if truncated || len(body) > dashboardMessageBodyMax {
+			body = truncateString(body, dashboardMessageBodyMax) + dashboardTruncated
 		}
 		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(response, body)

@@ -1,9 +1,9 @@
 package main
 
-// Advisory letter triage (review/jev-triage-r1.md). The conduit asks the TypeSafe
-// System One API three yes/no questions about each new `Type: message` letter and
+// Advisory message triage (review/jev-triage-r1.md). The notifier asks the TypeSafe
+// System One API three yes/no questions about each new `Type: message` message and
 // caches the answers under $KHALA_HOME/run/triage/<identity>/ (node-local, never
-// replicated). The doorbell never waits for a judgment: frames only read the
+// replicated). The inbox notification never waits for a judgment: frames only read the
 // in-memory copy of the cache. Without $KHALA_HOME/triage.conf nothing happens.
 
 import (
@@ -185,7 +185,7 @@ func loadTriageConf(home string) (*triageConf, string) {
 	return c, ""
 }
 
-// triageEntry is the cache file <letter-id>.json. A success entry carries the three
+// triageEntry is the cache file <message-id>.json. A success entry carries the three
 // probabilities and the digest of the state that was sent; an error entry carries
 // only id, error and askedAt.
 type triageEntry struct {
@@ -226,7 +226,7 @@ func triageTag(e *triageEntry, c *triageConf) string {
 	return strings.Join(tags, ",")
 }
 
-// triageMemo is the conduit's in-memory view of one letter in new/.
+// triageMemo is the notifier's in-memory view of one message in new/.
 type triageMemo struct {
 	size, mtime int64
 	kind        string
@@ -319,9 +319,9 @@ func (t *triageEngine) enabled() bool {
 	return t.conf != nil
 }
 
-// scan is one conduit pass: refresh the conf, then (when on) enqueue unjudged
-// message letters of every identity, re-derive tags, and drop cache files of
-// letters that are in neither new/ nor cur/.
+// scan is one notifier pass: refresh the conf, then (when on) enqueue unjudged
+// messages of every identity, re-derive tags, and drop cache files of
+// messages that are in neither new/ nor cur/.
 func (t *triageEngine) scan() {
 	t.refresh()
 	if !t.enabled() {
@@ -374,7 +374,7 @@ func (t *triageEngine) observe(identity string) {
 		m := t.memo[key]
 		t.mu.Unlock()
 		if m == nil || m.size != info.Size() || m.mtime != info.ModTime().UnixNano() {
-			kind, state, err := readTriageLetter(path)
+			kind, state, err := readTriageMessage(path)
 			if err != nil {
 				continue
 			}
@@ -506,16 +506,16 @@ func (t *triageEngine) collectGarbage() {
 	}
 }
 
-// readTriageLetter returns the envelope Type and, for messages, the exact state
+// readTriageMessage returns the message Type header and, for messages, the exact state
 // bytes that are sent (and hashed into the digest).
-func readTriageLetter(path string) (string, []byte, error) {
+func readTriageMessage(path string) (string, []byte, error) {
 	f, err := openRegular(path)
 	if err != nil {
 		return "", nil, err
 	}
 	defer f.Close()
 	r := bufio.NewReader(f)
-	var letter struct {
+	var messageItem struct {
 		From    string `json:"from"`
 		To      string `json:"to"`
 		Subject string `json:"subject"`
@@ -541,13 +541,13 @@ func readTriageLetter(path string) (string, []byte, error) {
 			case "Type":
 				kind = value
 			case "From":
-				letter.From = value
+				messageItem.From = value
 			case "To":
-				letter.To = value
+				messageItem.To = value
 			case "Subject":
-				letter.Subject = value
+				messageItem.Subject = value
 			case "In-Reply-To":
-				letter.IsReply = value != ""
+				messageItem.IsReply = value != ""
 			}
 		}
 		if err != nil {
@@ -562,8 +562,8 @@ func readTriageLetter(path string) (string, []byte, error) {
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
 		return "", nil, err
 	}
-	letter.Body = string(cutUTF8(body[:n]))
-	state, err := json.Marshal(map[string]any{"letter": letter})
+	messageItem.Body = string(cutUTF8(body[:n]))
+	state, err := json.Marshal(map[string]any{"letter": messageItem})
 	if err != nil {
 		return "", nil, err
 	}
@@ -609,9 +609,9 @@ func (t *triageEngine) judge(job triageJob) {
 	if conf == nil {
 		return
 	}
-	kind, state, err := readTriageLetter(job.path)
+	kind, state, err := readTriageMessage(job.path)
 	if err != nil || kind != "message" {
-		return // the letter moved or changed; the next scan decides again
+		return // the message moved or changed; the next scan decides again
 	}
 	sum := sha256.Sum256(state)
 	digest := hex.EncodeToString(sum[:])
@@ -645,7 +645,6 @@ func (t *triageEngine) judge(job triageJob) {
 		if writeErr := writeAtomicJSON(path, triageErrorEntry{ID: job.id, Error: err.Error(), AskedAt: askedAt}, 0600); writeErr != nil {
 			t.logger.Printf("triage: write error entry %s/%s failed: %v", job.identity, job.id, writeErr)
 		}
-		_ = os.Remove(filepath.Join(cacheDir, job.id+".tag"))
 		t.store(job, failed, "")
 		return
 	}
@@ -661,21 +660,39 @@ func (t *triageEngine) judge(job triageJob) {
 	if current == nil {
 		current = conf
 	}
-	tag := triageTag(entry, current)
-	if err := writeAtomicText(filepath.Join(cacheDir, job.id+".tag"), tag+"\n"); err != nil {
-		t.logger.Printf("triage: write tag %s/%s failed: %v", job.identity, job.id, err)
-		tag = ""
-	}
-	t.store(job, entry, tag)
+	t.store(job, entry, triageTag(entry, current))
 }
 
+// store records a judgment in the memo first and only then makes it visible as
+// the .tag file (tag "" removes it). Frames render from the memo, so a reader
+// that sees the file never gets a frame that still counts the letter pending.
+// tagOnDisk follows the file only once the write succeeded, so a failed write
+// is retried by the next observe.
 func (t *triageEngine) store(job triageJob, entry *triageEntry, tag string) {
+	key := job.identity + "/" + job.id
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if m := t.memo[job.identity+"/"+job.id]; m != nil {
+	if m := t.memo[key]; m != nil {
 		m.entry = entry
+	}
+	t.mu.Unlock()
+	path := filepath.Join(t.home, "run", "triage", job.identity, job.id+".tag")
+	var err error
+	if tag == "" {
+		if err = os.Remove(path); os.IsNotExist(err) {
+			err = nil
+		}
+	} else {
+		err = writeAtomicText(path, tag+"\n")
+	}
+	if err != nil {
+		t.logger.Printf("triage: write tag %s failed: %v", key, err)
+		return
+	}
+	t.mu.Lock()
+	if m := t.memo[key]; m != nil {
 		m.tagOnDisk = tag
 	}
+	t.mu.Unlock()
 }
 
 // logOnce logs one line per distinct error string per hour.
@@ -748,20 +765,20 @@ func (t *triageEngine) ask(conf *triageConf, state []byte) (*triageEntry, error)
 		TimeSensitive: values[2], InputTokens: decoded.Usage.InputTokens}, nil
 }
 
-// frameLine is the doorbell's advisory summary, or "" when triage is off. It only
+// frameLine is the inbox notification's advisory summary, or "" when triage is off. It only
 // reads the in-memory cache and never waits for a judgment.
-func (t *triageEngine) frameLine(identity string, letters []pendingLetter) string {
+func (t *triageEngine) frameLine(identity string, messages []pendingMessage) string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.conf == nil {
 		return ""
 	}
 	var action, urgent, reply, fyi, pending int
-	for _, letter := range letters {
-		if letter.kind != "message" {
+	for _, messageItem := range messages {
+		if messageItem.kind != "message" {
 			continue
 		}
-		m := t.memo[identity+"/"+letter.id]
+		m := t.memo[identity+"/"+messageItem.id]
 		if m == nil || m.entry == nil || m.entry.Error != "" || m.entry.Digest != m.digest {
 			pending++
 			continue

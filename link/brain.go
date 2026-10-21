@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-type brain struct {
+type coreCLI struct {
 	path   string
 	home   string
 	logger *log.Logger
@@ -21,15 +21,15 @@ type brain struct {
 	remote bool
 }
 
-func newBrain(path, home string, logger *log.Logger, ownerValue ...bool) *brain {
+func newCoreCLI(path, home string, logger *log.Logger, ownerValue ...bool) *coreCLI {
 	owner := true
 	if len(ownerValue) > 0 {
 		owner = ownerValue[0]
 	}
-	return &brain{path: path, home: home, logger: logger, dirty: make(chan struct{}, 1), remote: !owner}
+	return &coreCLI{path: path, home: home, logger: logger, dirty: make(chan struct{}, 1), remote: !owner}
 }
 
-func (b *brain) trigger() {
+func (b *coreCLI) trigger() {
 	if b.remote {
 		if err := b.writeTrigger(); err != nil {
 			b.logger.Printf("write dial reconcile trigger failed: %v", err)
@@ -42,9 +42,9 @@ func (b *brain) trigger() {
 	}
 }
 
-func (b *brain) ownsReconcile() bool { return !b.remote }
+func (b *coreCLI) ownsReconcile() bool { return !b.remote }
 
-func (b *brain) writeTrigger() error {
+func (b *coreCLI) writeTrigger() error {
 	tmpDir := filepath.Join(b.home, "tmp")
 	if err := os.MkdirAll(tmpDir, 0700); err != nil {
 		return err
@@ -81,7 +81,7 @@ func (b *brain) writeTrigger() error {
 	return nil
 }
 
-func (b *brain) reconcile(scanGate bool) error {
+func (b *coreCLI) reconcile(scanGate bool) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	cmd := exec.Command(b.path, "reconcile")
@@ -98,7 +98,7 @@ func (b *brain) reconcile(scanGate bool) error {
 	return cmd.Run()
 }
 
-func (b *brain) run(ctx context.Context) {
+func (b *coreCLI) run(ctx context.Context) {
 	if b.remote {
 		return
 	}
@@ -125,11 +125,11 @@ func (b *brain) run(ctx context.Context) {
 			}
 		}
 		for {
-			// Once a reconcile pass owns the bash brain lock, let that pass finish.
-			// Killing it on link shutdown would strand brain.lock.d until the bash
+			// Once a reconcile pass owns the state lock, let that pass finish.
+			// Killing it on relay shutdown would strand `brain.lock.d` until the bash
 			// stale timeout, blocking the store-and-forward path we must preserve.
 			if err := b.reconcile(false); err != nil && ctx.Err() == nil {
-				b.logger.Printf("brain reconcile failed: %v", err)
+				b.logger.Printf("core CLI reconcile failed: %v", err)
 			}
 			if ctx.Err() != nil {
 				return

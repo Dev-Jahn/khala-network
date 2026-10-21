@@ -21,7 +21,7 @@ import (
 
 var implVersion = "0.5.0"
 
-const linkVersion = "0.9.10"
+const linkVersion = "0.9.11"
 
 type options struct {
 	serve     bool
@@ -37,11 +37,13 @@ func run(args []string) int {
 	if len(args) > 0 {
 		switch args[0] {
 		case "conduit":
-			return runConduit(args[1:])
+			return runNotifier(args[1:])
 		case "runtime":
 			return runRuntime(args[1:])
 		case "dashboard":
 			return runDashboard(args[1:])
+		case "gateway":
+			return runGateway(args[1:])
 		case "version":
 			if len(args) != 1 {
 				return fatalf("version takes no arguments")
@@ -54,12 +56,12 @@ func run(args []string) int {
 	if err != nil {
 		return fatalf("%v", err)
 	}
-	brainPath := os.Getenv("KHALA_BRAIN")
-	if brainPath == "" {
+	coreCLIPath := os.Getenv("KHALA_BRAIN")
+	if coreCLIPath == "" {
 		return fatalf("KHALA_BRAIN is missing or empty; launch through the khala link wrapper")
 	}
-	if !filepath.IsAbs(brainPath) {
-		return fatalf("KHALA_BRAIN must be the wrapper's absolute path, got %q", brainPath)
+	if !filepath.IsAbs(coreCLIPath) {
+		return fatalf("KHALA_BRAIN must be the wrapper's absolute path, got %q", coreCLIPath)
 	}
 	home, err := khalaHome()
 	if err != nil {
@@ -96,7 +98,7 @@ func run(args []string) int {
 			return fatalf("recover stale link tmp files: %v", err)
 		}
 		rw := readWriter{Reader: os.Stdin, Writer: os.Stdout}
-		_, err = runPump(ctx, rw, home, "serve", cfg.self, opts.servePeer, brainPath, nil, opts.maxBytes, cfg.retainDays, opts.scan, newLogOnceSet(), logger)
+		_, err = runRelayLoop(ctx, rw, home, "serve", cfg.self, opts.servePeer, coreCLIPath, nil, opts.maxBytes, cfg.retainDays, opts.scan, newLogOnceSet(), logger)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, io.EOF) {
 			logger.Printf("serve stopped: %v", err)
 			return fatalf("serve stopped: %v", err)
@@ -143,14 +145,14 @@ func run(args []string) int {
 	if err != nil && !localOnly {
 		return fatalf("%v", err)
 	}
-	nodeBrain := newBrain(brainPath, home, logger, true)
-	nodeBrainDone := make(chan struct{})
+	nodeCoreCLI := newCoreCLI(coreCLIPath, home, logger, true)
+	nodeCoreCLIDone := make(chan struct{})
 	go func() {
-		nodeBrain.run(ctx)
-		close(nodeBrainDone)
+		nodeCoreCLI.run(ctx)
+		close(nodeCoreCLIDone)
 	}()
 	if localOnly {
-		nodeBrain.trigger()
+		nodeCoreCLI.trigger()
 	}
 	periodicDone := make(chan struct{})
 	if localOnly {
@@ -163,7 +165,7 @@ func run(args []string) int {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					nodeBrain.trigger()
+					nodeCoreCLI.trigger()
 				}
 			}
 		}()
@@ -174,9 +176,9 @@ func run(args []string) int {
 		stop()
 		<-periodicDone
 		select {
-		case <-nodeBrainDone:
+		case <-nodeCoreCLIDone:
 		case <-time.After(10 * time.Second):
-			logger.Printf("node reconcile still running after link shutdown; leaving it to release brain.lock.d")
+			logger.Printf("node reconcile still running after relay shutdown; leaving it to release brain.lock.d")
 		}
 	}()
 	if localOnly {
@@ -184,7 +186,7 @@ func run(args []string) int {
 		<-ctx.Done()
 		return 0
 	}
-	if err := dialForever(ctx, home, cfg.self, brainPath, nodeBrain, cfg.retainDays, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
+	if err := dialForever(ctx, home, cfg.self, coreCLIPath, nodeCoreCLI, cfg.retainDays, opts, endpoints, logger); err != nil && !errors.Is(err, context.Canceled) {
 		return fatalf("dial stopped: %v", err)
 	}
 	return 0
@@ -357,7 +359,7 @@ func terminatePrior(home string, logger *log.Logger) error {
 	return syscall.Kill(pid, syscall.SIGTERM)
 }
 
-func dialForever(ctx context.Context, home, self, brainPath string, nodeBrain *brain, retainDays uint64, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
+func dialForever(ctx context.Context, home, self, coreCLIPath string, nodeCoreCLI *coreCLI, retainDays uint64, opts options, endpoints []dialEndpoint, logger *log.Logger) error {
 	attempt := 0
 	index := 0
 	expiredOfferLogs := newLogOnceSet()
@@ -365,7 +367,7 @@ func dialForever(ctx context.Context, home, self, brainPath string, nodeBrain *b
 		endpoint := endpoints[index%len(endpoints)]
 		index++
 		started := time.Now()
-		err := runCarrier(ctx, home, self, brainPath, nodeBrain, retainDays, opts, endpoint, expiredOfferLogs, logger)
+		err := runTransport(ctx, home, self, coreCLIPath, nodeCoreCLI, retainDays, opts, endpoint, expiredOfferLogs, logger)
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -388,8 +390,8 @@ func dialForever(ctx context.Context, home, self, brainPath string, nodeBrain *b
 	}
 }
 
-func runCarrier(ctx context.Context, home, self, brainPath string, nodeBrain *brain, retainDays uint64, opts options, endpoint dialEndpoint, expiredOfferLogs *logOnceSet, logger *log.Logger) error {
-	cmd, err := carrierCommand(brainPath, opts, endpoint, self)
+func runTransport(ctx context.Context, home, self, coreCLIPath string, nodeCoreCLI *coreCLI, retainDays uint64, opts options, endpoint dialEndpoint, expiredOfferLogs *logOnceSet, logger *log.Logger) error {
+	cmd, err := transportCommand(coreCLIPath, opts, endpoint, self)
 	if err != nil {
 		return err
 	}
@@ -412,9 +414,9 @@ func runCarrier(ctx context.Context, home, self, brainPath string, nodeBrain *br
 	stderrDone := make(chan struct{})
 	go func() { logStderr(logger, stderr); close(stderrDone) }()
 	rw := readWriter{Reader: stdout, Writer: stdin}
-	_, pumpErr := runPump(ctx, rw, home, "dial", self, endpoint.node, brainPath, nodeBrain, opts.maxBytes, retainDays, opts.scan, expiredOfferLogs, logger)
-	// Carrier cleanup is deliberately process-group scoped. It never signals a
-	// user session; only the child carrier started immediately above.
+	_, relayLoopErr := runRelayLoop(ctx, rw, home, "dial", self, endpoint.node, coreCLIPath, nodeCoreCLI, opts.maxBytes, retainDays, opts.scan, expiredOfferLogs, logger)
+	// Transport cleanup is deliberately process-group scoped. It never signals a
+	// user session; only the child transport started immediately above.
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	_ = stdin.Close()
 	waited := make(chan error, 1)
@@ -423,18 +425,18 @@ func runCarrier(ctx context.Context, home, self, brainPath string, nodeBrain *br
 	select {
 	case waitErr = <-waited:
 	case <-time.After(2 * time.Second):
-		logger.Printf("carrier process group %d ignored TERM for 2s; sending KILL", cmd.Process.Pid)
+		logger.Printf("transport process group %d ignored TERM for 2s; sending KILL", cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		waitErr = <-waited
 	}
 	<-stderrDone
-	if pumpErr != nil {
-		return pumpErr
+	if relayLoopErr != nil {
+		return relayLoopErr
 	}
 	return waitErr
 }
 
-func carrierCommand(brainPath string, opts options, endpoint dialEndpoint, self string) (*exec.Cmd, error) {
+func transportCommand(coreCLIPath string, opts options, endpoint dialEndpoint, self string) (*exec.Cmd, error) {
 	if endpoint.address == "direct-test-carrier" {
 		exe, err := os.Executable()
 		if err != nil {
@@ -443,7 +445,7 @@ func carrierCommand(brainPath string, opts options, endpoint dialEndpoint, self 
 		args := []string{"--serve", "--peer", self, "--max-object-bytes", strconv.FormatInt(opts.maxBytes, 10)}
 		cmd := exec.Command(exe, args...)
 		serveHome := os.Getenv("KHALA_LINK_TEST_SERVE_HOME")
-		cmd.Env = replaceEnv(os.Environ(), map[string]string{"KHALA_HOME": serveHome, "KHALA_BRAIN": brainPath})
+		cmd.Env = replaceEnv(os.Environ(), map[string]string{"KHALA_HOME": serveHome, "KHALA_BRAIN": coreCLIPath})
 		return cmd, nil
 	}
 	cmd := exec.Command("ssh", "-T", "-o", "BatchMode=yes", endpoint.address,
