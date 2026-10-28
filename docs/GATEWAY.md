@@ -219,10 +219,7 @@ once per user per hour); messages from other chats are ignored silently.
 - Attachments and images from Telegram.
 - Reaction on delivery, reopening closed topics, a second gateway for failover.
 - The CLI does not yet reserve `user`. Until the B-CLI lane lands, `khala send
-  --as user` prints `khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요` on
-  stderr and succeeds, and any session could in principle name itself `user`.
-  The gateway itself sets `KHALA_SESSION=user` (no `--as`), so it does not
-  trigger that warning.
+  --as user` succeeds, and any session could in principle name itself `user`.
 
 ## Measurements to record on the first live run
 
@@ -236,6 +233,6 @@ Design §8. Fill in the result and the date.
 | 4 | Emoji set usable with `setMessageReaction` in a group (not used yet) | |
 | 5 | Topic count limit (create 60 topics) | |
 | 6 | Whether 20 posts/minute is per group or per topic | |
-| 7 | Whether Claude Code still gates non-marketplace channels behind a flag | |
+| 7 | Whether Claude Code still gates non-marketplace channels behind a flag | Moot (2026-10-28): khala no longer ships a Claude Code channel; sessions are notified through their inbox socket |
 | 8 | What is lost when the gateway is stopped for more than 24 hours (Telegram keeps unconfirmed updates for 24 h) | |
 | 9 | End-to-end timings: phone → `inbox/new` → notification → session reads → reply → topic | |

@@ -314,21 +314,13 @@ or through the system `perl`'s `setsid()` where `setsid` is missing (macOS).
 Any other value is an error. The test suites pin `detached`, so a run on a live
 node never touches its real launchd or systemd services.
 
-The plugin also provides an opt-in Claude Code Channel display adapter. Start
-an interactive session with
-`claude --dangerously-load-development-channels plugin:khala@jahns-cc-marketplace`;
-when its channel child is live, the notifier sends the one outstanding inbox notification
-there instead of the CC inbox socket, rendering a short `← khala · sender: …`
-without the socket protocol header and exposing `khala_drain` / `khala_reply`.
-The child survives `--resume` and `/reload-plugins`, re-attaching when the session changes and trusting the parent's registry over a stale environment session id.
-A failed channel attempt is logged and journaled before that attempt falls back
-to the socket. On macOS the notifier and the channel child must agree on a
-process start string; since 0.9.8 the relay reads it under the C locale, so a
-launchd notifier and a session running in another locale no longer disagree
-(the symptom was every inbox notification logging "channel pid/start mismatch" and
-arriving as a socket peer message instead of the short channel line). Channel events are always `next`, so `--later` is represented as
-`later="1"` metadata for the model to defer rather than changing the channel
-queue priority.
+A Claude Code session receives inbox notifications only through its inbox
+socket. The opt-in MCP channel adapter of 0.9.11 and earlier
+(`--dangerously-load-development-channels plugin:khala@jahns-cc-marketplace`,
+tools `khala_drain` / `khala_reply`) is gone: read with `khala inbox --drain`
+and answer with `khala send --reply-to <Id>`. Drop that flag from launch
+commands; Claude Code still starts with it, but only to show its
+development-channel confirmation.
 
 Inbox notifications reach a session that bypasses permission prompts only when Claude
 Code's `crossSessionInbound` is `accept`; `node ensure` says so, once, when it
@@ -369,7 +361,7 @@ Since 0.9.7 a registration carries a `harness` field (`claude` when absent).
 `khala-link runtime register --harness codex …` registers a session that has no
 Claude Code inbox socket: the notifier verifies it by its channel socket alone
 (`register-channel --verified`), sends inbox notifications only through that channel, and never
-falls back to a socket. `khala status` shows `codex:<version>` and
+falls back to a socket. `register-channel` refuses a Claude registration. `khala status` shows `codex:<version>` and
 `codex-channel-v1`; the `.ear` listener snapshot shows `cc=codex:<version>` and
 `route=channel`. Pass `--kind interactive` (or `--receive-opt-in`) explicitly,
 because `auto` looks for a Claude Code ancestor. `khala watch`, `bind --release`

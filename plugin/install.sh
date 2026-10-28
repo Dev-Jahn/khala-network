@@ -5,7 +5,7 @@ set -u
 
 umask 077
 
-KHALA_MIN_CLAUDE_VERSION=2.1.229
+KHALA_MIN_CLAUDE_VERSION=2.1.239
 KHALA_MARKETPLACE=Dev-Jahn/jahns-cc-marketplace
 KHALA_PLUGIN=khala@jahns-cc-marketplace
 KHALA_NAME=

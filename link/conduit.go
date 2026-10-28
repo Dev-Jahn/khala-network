@@ -65,7 +65,6 @@ type notifierState struct {
 	nextAttempt              time.Time
 	lastInboxReadToken       string
 	failures                 int
-	echoLogged               bool
 }
 
 type pendingMessage struct {
@@ -98,6 +97,7 @@ type notifier struct {
 	statesMu                sync.Mutex
 	states                  map[string]*notifierState
 	verificationReasons     map[string]string
+	resumeLogged            map[string]int
 	listenerMu              sync.Mutex
 	listenerInterval        time.Duration
 	snapshotSequence        int64
@@ -628,7 +628,6 @@ func (c *notifier) observeQueueDigest(identity, instance string, messages []pend
 		state.firstSeen = time.Now()
 		state.attemptIndex = 0
 		state.notificationsSent = 0
-		state.echoLogged = false
 		changed = true
 	}
 	snapshot := *state
@@ -646,13 +645,40 @@ func (c *notifier) pruneVerificationReasons(regs map[string]sessionRegistration)
 			delete(c.verificationReasons, instance)
 		}
 	}
+	for instance := range c.resumeLogged {
+		if _, exists := regs[instance]; !exists {
+			delete(c.resumeLogged, instance)
+		}
+	}
 }
 
-// loggedReason is the verification failure worth a log line. A Codex worker (an
-// exec lane) is never rung — its mail enters the turn through hooks (D18) — so
-// registering without a receive opt-in is how it is meant to be, not a fault.
+// logResumed says once per instance and chosen pid which process of a session
+// open more than once is rung, and which are not.
+func (c *notifier) logResumed(reg sessionRegistration, pid int, others []int) {
+	if c.resumeLogged == nil {
+		c.resumeLogged = make(map[string]int)
+	}
+	if c.resumeLogged[reg.InstanceID] == pid {
+		return
+	}
+	c.resumeLogged[reg.InstanceID] = pid
+	pids := strconv.Itoa(pid)
+	for _, other := range others {
+		pids += "," + strconv.Itoa(other)
+	}
+	c.logger.Printf("registration %s (%s): Claude session %s is open in pids %s; ringing the newest, %d; the others will not be rung",
+		reg.InstanceID, reg.Identity, reg.ClaudeSessionID, pids, pid)
+}
+
+// loggedReason is the verification failure worth a log line. A worker with no
+// doorbell of its own — a Codex exec lane, or a Claude Code subagent, which is
+// registered without a socket — is never rung: its mail enters its turn
+// through hooks (D18). Registering without a receive opt-in is how it is meant
+// to be, not a fault. A Claude worker with a socket (a `claude -p` session)
+// still logs it.
 func loggedReason(reg sessionRegistration, reason string) string {
-	if reg.Harness == "codex" && reg.Kind == "worker" && reason == "non-interactive registration lacks opt-in" {
+	if reg.Kind == "worker" && reason == "non-interactive registration lacks opt-in" &&
+		(reg.Harness == "codex" || reg.SocketPath == "") {
 		return ""
 	}
 	return reason
@@ -678,7 +704,14 @@ func (c *notifier) logVerification(instance string, verified bool, reason string
 
 func (c *notifier) verifyRegistration(reg sessionRegistration, registries []claudeRegistry) (sessionRegistration, bool, string) {
 	resolved := reg
-	if registry, ok := matchingRegistry(resolved, registries); ok {
+	registry, ok := matchingRegistry(resolved, registries)
+	if !ok {
+		var others []int
+		if registry, others, ok = newestSessionRegistry(resolved, registries); ok {
+			c.logResumed(resolved, registry.PID, others)
+		}
+	}
+	if ok {
 		resolved.PID = registry.PID
 		resolved.SocketPath = registry.Socket
 		resolved.CCVersion = firstNonempty(resolved.CCVersion, registry.Version)
@@ -737,10 +770,12 @@ func (c *notifier) verifyRegistration(reg sessionRegistration, registries []clau
 }
 
 // healLease copies a verified registration's pid/pidStart into the identity
-// lease it owns when the lease recorded none. On `claude --resume` the Claude
-// registry file can land after the hook's binds, so the lease captured pid 0;
-// the notification gate then never matches (measured 2026-08-16, ink resume). Only the
-// same instance/epoch/session is healed; nothing else about the lease changes.
+// lease it owns when they differ. On `claude --resume` the Claude registry
+// file can land after the hook's binds, so the lease captured pid 0; the
+// notification gate then never matches (measured 2026-08-16, ink resume). A
+// session resumed twice moves its registration to the newer process, and the
+// lease follows (D18 r3). Only the same instance/epoch/session is healed;
+// nothing else about the lease changes.
 func (c *notifier) healLease(reg sessionRegistration) {
 	if reg.PID <= 1 || reg.PIDStart == "" || reg.LeaseEpoch == 0 {
 		return
@@ -777,10 +812,7 @@ func leaseNeedsHeal(lease identityLease, reg sessionRegistration) bool {
 		lease.Epoch != reg.LeaseEpoch || lease.ClaudeSessionID != reg.ClaudeSessionID {
 		return false
 	}
-	if lease.PID == reg.PID && lease.PIDStart == reg.PIDStart {
-		return false
-	}
-	return lease.PID <= 1 || lease.PID == reg.PID
+	return lease.PID != reg.PID || lease.PIDStart != reg.PIDStart
 }
 
 func (c *notifier) reclaimLeases(regs map[string]sessionRegistration, verified map[string]bool) {
@@ -1071,7 +1103,6 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 		state.outstandingNotifications = 0
 		state.outstandingWritten = time.Time{}
 		state.failures = 0
-		state.echoLogged = false
 		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 			state.nextAttempt = now
 		} else {
@@ -1090,7 +1121,6 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 		state.firstSeen = now
 		state.attemptIndex = 0
 		state.notificationsSent = 0
-		state.echoLogged = false
 		if state.outstandingNotifications == 0 {
 			if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 				state.nextAttempt = now
@@ -1155,47 +1185,23 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 			}
 			return
 		}
-		if reg.ChannelSocket != "" {
+		switch {
+		case reg.Harness != "codex":
+			journal.Via = "socket"
+			deliveryErr = writeNotification(reg.SocketPath, sessionToken(reg), frame)
+		case reg.ChannelSocket == "":
+			journal.Via = "channel"
+			deliveryErr = errors.New("Codex channel is not bound")
+		default:
+			journal.Via = "channel"
 			deliveryErr = c.verifyChannelSocket(reg)
 			if deliveryErr == nil {
 				deliveryErr = writeChannelNotification(reg.ChannelSocket, c.channelRequest(pendingDigest, attemptID, retry, messages))
 			}
-			if deliveryErr == nil {
-				journal.Via = "channel"
-				if !reg.ChannelVerified && reg.Harness != "codex" {
-					info, socketErr := os.Lstat(reg.SocketPath)
-					if socketErr == nil && info.Mode()&os.ModeSymlink == 0 && info.Mode()&os.ModeSocket != 0 {
-						deliveryErr = writeNotification(reg.SocketPath, frame)
-						if deliveryErr == nil {
-							journal.Via = "channel+socket"
-							c.statesMu.Lock()
-							if !state.echoLogged {
-								c.logger.Printf("channel written; socket ring echoed (opt-in unverified)")
-								state.echoLogged = true
-							}
-							c.statesMu.Unlock()
-						} else {
-							c.logger.Printf("channel written but socket echo %s failed: %v", reg.InstanceID, deliveryErr)
-						}
-					}
-				}
-			} else {
+			if deliveryErr != nil {
 				journal.ChannelError = deliveryErr.Error()
-				if reg.Harness == "codex" {
-					journal.Via = "channel"
-					c.logger.Printf("Codex channel doorbell %s failed: %v", reg.InstanceID, deliveryErr)
-				} else {
-					c.logger.Printf("channel doorbell %s failed: %v; falling back to socket", reg.InstanceID, deliveryErr)
-					journal.Via = "socket"
-					deliveryErr = writeNotification(reg.SocketPath, frame)
-				}
+				c.logger.Printf("Codex channel doorbell %s failed: %v", reg.InstanceID, deliveryErr)
 			}
-		} else if reg.Harness == "codex" {
-			journal.Via = "channel"
-			deliveryErr = errors.New("Codex channel is not bound")
-		} else {
-			journal.Via = "socket"
-			deliveryErr = writeNotification(reg.SocketPath, frame)
 		}
 		if deliveryErr != nil {
 			journal.Status = "failed"
@@ -1318,9 +1324,6 @@ func (c *notifier) restoreState(identity, instance, pendingDigest string) *notif
 				state.firstSeen = firstSeen
 			}
 			latestCurrent = item
-			if item.journal.Via == "channel+socket" {
-				state.echoLogged = true
-			}
 		}
 	}
 	if latestCurrent.at.IsZero() {
@@ -1428,6 +1431,9 @@ func notificationDisplay(messages []pendingMessage) ([]string, []string) {
 	return from, subjects
 }
 
+// channelRequest is the Codex receiver's wire format (khala-network-codex
+// lib/channel.mjs); its content, including the stale khala_drain hint, is kept
+// byte-for-byte.
 func (c *notifier) channelRequest(pendingDigest, attempt string, retry int, messages []pendingMessage) map[string]any {
 	from, subjects := notificationDisplay(messages)
 	mail, alerts, urgent := messageCounts(messages)
@@ -1586,7 +1592,19 @@ func compareMessageIDs(left, right string) int {
 	return strings.Compare(left, right)
 }
 
-func writeNotification(socketPath string, frame map[string]any) error {
+// sessionToken is the auth token for reg's session socket, or "" when the
+// token on file came with another socket.
+func sessionToken(reg sessionRegistration) string {
+	if reg.TokenSocket != reg.SocketPath {
+		return ""
+	}
+	return reg.MessagingToken
+}
+
+// writeNotification writes one frame to a Claude session socket, after the
+// auth line when there is a token (required on native Windows, accepted
+// elsewhere). The socket never answers, so nothing is read.
+func writeNotification(socketPath, token string, frame map[string]any) error {
 	connection, err := net.DialTimeout("unix", socketPath, 250*time.Millisecond)
 	if err != nil {
 		return err
@@ -1595,11 +1613,22 @@ func writeNotification(socketPath string, frame map[string]any) error {
 	if err := connection.SetWriteDeadline(time.Now().Add(250 * time.Millisecond)); err != nil {
 		return err
 	}
-	data, err := json.Marshal(frame)
+	var data []byte
+	if token != "" {
+		auth, err := json.Marshal(struct {
+			Type  string `json:"type"`
+			Token string `json:"token"`
+		}{"auth", token})
+		if err != nil {
+			return err
+		}
+		data = append(auth, '\n')
+	}
+	line, err := json.Marshal(frame)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
+	data = append(append(data, line...), '\n')
 	for len(data) > 0 {
 		written, err := connection.Write(data)
 		if err != nil {
