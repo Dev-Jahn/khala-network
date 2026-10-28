@@ -647,10 +647,11 @@ identity name=ink principal=session listening=no route=none phase=ready cc=2.1.2
   claudeSessionId 일치`). 그 외 전부 `no`.
 - **프로세스 시작 문자열**(pidStart·channelPIDStart)은 linux는 `/proc/<pid>/stat` 22번째 필드, darwin은 `ps -o lstart=`를
   **C 로케일로 고정해** 읽는다(0.9.8). darwin에서 호출자 로케일대로 읽으면 launchd 아래 알림 데몬과 세션 로케일(ko_KR)의
-  채널 자식이 같은 pid에 다른 문자열을 남겨 채널 검증이 영구 실패하고 소켓으로 후퇴했다(mini clawd, 2026-09-07).
-- `route=socket|channel|channel+socket|none` — 참고용: `maybeRing`이 지금 택할 경로(link/conduit.go:853-886의
-  선택 그대로: 채널 소켓이 있고 검증됐으면 `channel`, 있지만 미검증이면 `channel+socket`(소켓 보조 전송), 없으면
-  `socket`); `listening=no`면 `none`.
+  훅·채널 프로세스가 같은 pid에 다른 문자열을 남겨 검증이 영구 실패한다(mini clawd, 2026-09-07: 당시 Claude MCP 채널
+  자식의 검증이 실패해 소켓으로 후퇴했다).
+- `route=socket|channel|channel+socket|none` — 참고용: `maybeNotify`가 지금 택할 경로. `harness=codex` 등록이면
+  `channel`, 그 밖(Claude)은 `socket`; `listening=no`면 `none`. `channel+socket`(미검증 Claude MCP 채널 + 소켓 보조
+  전송)은 0.9.11 이하 노드만 쓴다. 독자는 계속 받아들이고, 그 뒤의 작성자는 쓰지 않는다(D18 r3, Claude MCP 채널 폐기).
 - `reason=-|noreg|boot|phase|optin|pid|session|socket|registry|lease` — `verifyRegistration`의 사유 순서
   (link/conduit.go:442-494) + `lease`(검증됐지만 lease 튜플 불일치) + `noreg`.
 - `phase=ready|starting|-`, `cc=<CC 버전|codex:<Codex 버전>|->` — 값 문법 `[A-Za-z0-9._:+-]{1,64}`에 맞지 않으면 `-`.
@@ -730,8 +731,8 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
   쓰기(tmp+mv). `--mail-only`/`--notices-only`, 아무것도 출력하지 않은 수신함 읽기도 쓴다. list/read는 쓰지 않는다.
 - 대기열 다이제스트: 수신함 읽기 시작 직후(lock 획득 뒤)와 끝(쓰기 직전)에 `khala-link runtime pending-generation
   --identity <name>`(0.9.1, 읽기 전용; `letterGeneration`과 같은 코드로 전체 64 hex + 건수 출력, 수신 알림 대상 집합이
-  비면 `-`)을 부른다. **호출 위생**: stderr는 캡처해 버린다(0.8.x 바이너리의 "unknown subcommand"가 수신함 읽기
-  출력 = 세션의 `khala_drain` 결과에 섞이면 안 된다), 실패는 종류 불문 두 값 모두 `-`, 수신함 읽기당 stderr 한 줄 이하.
+  비면 `-`)을 부른다. **호출 위생**: stderr는 캡처해 버린다(0.8.x 바이너리의 "unknown subcommand"가 세션이 읽는 수신함
+  읽기 출력에 섞이면 안 된다), 실패는 종류 불문 두 값 모두 `-`, 수신함 읽기당 stderr 한 줄 이하.
   Go 쪽 `pending-generation`은 `inbox/<identity>/new`만 읽고 `runtimeRoot()`(mkdir/chmod)도 lock도 건드리지
   않는다(대시보드와 같은 원칙). bash에 SHA-256 대기열 다이제스트를 재구현하지 않는다.
 - `ok` = 요청한 모든 이동이 성공; `partial` = 일부 상태 변경이 커밋된 뒤 실패(rc 비0이어도 마커는 쓴다);
@@ -771,8 +772,8 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
 
 - 획득 거부 지점: `session_name`(→ `KHALA_SESSION`·`.khala-session`·`--as`·`watch --session`·`mind`/`profile`/
   `join`/`bind`), `notify --as`, `watcher declare|beat <name>`, `watcher declare --owner`(주체 참조로 검증: 세션 또는
-  `khala-gateway@<node>` 허용), Go `runtime register|bind`(최종 강제점; `register-channel`은 세션 주체에만 부착),
-  hooks·channel server의 중복 검증기에는 조기 진단만. 메시지 `예약된 이름입니다: <name>`, rc 1.
+  `khala-gateway@<node>` 허용), Go `runtime register|bind`(최종 강제점; `register-channel`은 세션 주체의 `codex` 등록에만 부착),
+  hooks의 중복 검증기에는 조기 진단만. 메시지 `예약된 이름입니다: <name>`, rc 1.
 - **정리 경로는 예외**: `runtime release`, `watcher retire`, `retire`는 이미 존재하는 예약 이름을 지울 수 있다.
 - 수신자 거부: `send`/`notify`의 `To:` 세션 부분이 `conduit|khala|gateway|operator`면 거부; `khala-gateway`는
   허용(0.9.x에서는 메시지가 스풀에 머물다 만료된다 — B 전까지 아무도 그 이름을 얻지 못하므로).
@@ -782,7 +783,9 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
 - Go `runtime register|bind`의 `--harness` 허용 집합 = `claude`(기본; 필드 없음과 동치) + `codex`(0.9.7). `codex`는
   채널 전용 등록(§3.1 harness 항목); `--kind`는 그대로 적용되므로 수신하려면 `interactive`를 명시하거나
   `--receive-opt-in`이 필요하다(`auto`는 조상에서 `claude`를 찾으므로 Codex 아래에서는 `unknown`). `runtime
-  watch-ready`도 `codex` 등록은 채널 소켓으로 판정한다. `--session-id`의 환경 기본값 순서는 `KHALA_HARNESS_SESSION_ID`
+  watch-ready`도 `codex` 등록은 채널 소켓으로 판정한다. `runtime register-channel`은 `codex` 등록만 받고 Claude
+  등록은 거부한다(D18 r3: Claude의 경로는 소켓 하나; 구버전 MCP 자식이 남긴 채널 필드는 알림 데몬·`.ear`·`status`·
+  `watch-ready`가 무시한다). `--session-id`의 환경 기본값 순서는 `KHALA_HARNESS_SESSION_ID`
   → `KHALA_CLAUDE_SESSION_ID` → `CLAUDE_CODE_SESSION_ID`(CLI `watch`와 Go `register|release|watch-ready` 공통; 0.9.7).
   불변식: 훅과 같은 `--kind auto` 등록이 여전히 성공하고 `--kind gateway`는 거부된다. gateway 주체는 0.10.0에
   별도 등록 경로를 갖는다(Claude 레지스트리·소켓 검증을 흉내 내지 않는다).
@@ -843,6 +846,22 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
   store-and-forward). "쓴 적 있음" = `presence/<addr>`(heartbeat)·`.watching`·`.watcher`, 그 노드 `conduit@<node>.ear`의
   `identity name=<name>` 레코드, 그리고 이 노드 주소면 부모 기록·lease 파일·등록. `--request-id` 발신도 같다.
   `user`(게이트웨이의 유저)와 `khala-gateway`는 presence 없이 받으므로 경고하지 않는다.
+
+#### D18 r3 세션 소켓 (`review/d18-subagent-inbound-r1.md` r3 결정 2·3)
+
+- **인증 줄**: `runtime register|bind`는 명시한 `--socket`이 자기 환경의 `CLAUDE_CODE_MESSAGING_SOCKET`과 같을 때만(SessionStart
+  훅의 등록) 환경의 `CLAUDE_CODE_MESSAGING_TOKEN`을 등록(0600)의 `messagingToken`에, 그 소켓을 `messagingTokenSocket`에
+  둔다. argv로는 받지 않고, 환경에 토큰이 없으면 둘 다 비운다. conduit은 등록의 소켓이 `messagingTokenSocket`과 같을 때만
+  프레임 앞에 `{"type":"auth","token":"…"}` 한 줄을 붙여 한 번에 쓴다. native Windows는 필수(문서), macOS는 토큰이 없거나
+  틀려도 받는다(CC 2.1.312 실측) — 그래서 토큰이 없으면 예전처럼 프레임 한 줄이다. 토큰은 등록 파일 밖(`runtime status`·`.ear`·
+  저널·로그·argv)에 나오지 않는다. 설치 하한은 2.1.239다.
+- **이중 resume**: 같은 세션을 두 프로세스가 `claude --resume`하면 둘째 SessionStart가 같은 등록을 다시 쓴다. 기존 등록과
+  다른 명시 `--socket`이 오고 `--pid`가 없으면 옛 pid를 버리고 새 소켓의 Claude 레지스트리에서 pid를 다시 찾는다(lease도
+  같은 인스턴스 안에서 따라간다). 0.9.11 이하가 남긴 등록(옛 pid + 새 소켓, `.ear` `reason=registry`)은 conduit이 고친다:
+  어느 레지스트리와도 맞지 않는 Claude 등록은 같은 `sessionId`의 살아 있는 레지스트리가 **둘 이상**이면 `startedAt`(ms)이
+  가장 큰 쪽의 pid·소켓을 택한다. 단 그 등록의 pid나 소켓이 그 레지스트리들 중 하나를 가리킬 때만이고, `startedAt`이 같으면
+  고르지 않는다(세션이 한 번만 열려 있으면 명시 `--socket`을 덮지 않는다). 고른 pid와 나머지 pid는 인스턴스·고른 pid마다 conduit 로그에 한 번 남고, `healLease`는 같은
+  인스턴스·epoch·세션 안에서 lease의 pid를 등록에 맞춘다. `.ear` 사유 열거형은 그대로다.
 
 클러스터 설정 (한 줄 = 한 사실):
 

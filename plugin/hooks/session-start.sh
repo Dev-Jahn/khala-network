@@ -224,4 +224,5 @@ rm -f "$khala_join_out" "$khala_join_err"
 printf 'khala: %s@%s — registration ready, lease %s, 편지 %s건·알림 %s건 드레인\n' \
     "$KHALA_RESOLVED_SESSION" "$KHALA_NODE" "$khala_hook_owner" \
     "$khala_drained_letters" "$khala_drained_notices"
+printf '%s\n' 'khala: subagent에게 자기 주소를 주려면 Agent 지시문에 단독 줄 KHALA_SESSION=<name>을 넣으세요 (khala 스킬 "Subagent mailboxes": 보내기 --as <name>, 답장 기다리기 khala watch)'
 exit 0

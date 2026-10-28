@@ -308,6 +308,7 @@ func parseListenerIdentity(fields []string) (listenerIdentity, error) {
 		return listenerIdentity{}, fmt.Errorf("invalid listening value")
 	}
 	identity.Listening = values["listening"] == "yes"
+	// route=channel+socket comes only from 0.9.11 and older nodes (the removed Claude MCP channel).
 	if !oneOf(identity.Principal, "session", "watcher", "gateway") || !oneOf(identity.Route, "socket", "channel", "channel+socket", "none") || !oneOf(identity.Reason, "-", "noreg", "boot", "phase", "optin", "pid", "session", "socket", "registry", "lease") || !oneOf(identity.Phase, "ready", "starting", "-") || !oneOf(identity.LastDrainStatus, "ok", "partial", "-") {
 		return listenerIdentity{}, fmt.Errorf("invalid identity enum")
 	}
@@ -797,13 +798,9 @@ func (c *notifier) buildListenerIdentityBase(identity string, registrations []se
 		default:
 			row.Listening = true
 			row.Reason = "-"
-			switch {
-			case selected.ChannelSocket != "" && selected.ChannelVerified:
+			row.Route = "socket"
+			if selected.Harness == "codex" {
 				row.Route = "channel"
-			case selected.ChannelSocket != "":
-				row.Route = "channel+socket"
-			default:
-				row.Route = "socket"
 			}
 		}
 	}

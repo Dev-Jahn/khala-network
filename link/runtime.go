@@ -29,6 +29,8 @@ type sessionRegistration struct {
 	PIDStart           string `json:"pidStart"`
 	ClaudeSessionID    string `json:"claudeSessionId"`
 	SocketPath         string `json:"socketPath,omitempty"`
+	MessagingToken     string `json:"messagingToken,omitempty"`
+	TokenSocket        string `json:"messagingTokenSocket,omitempty"`
 	ChannelSocket      string `json:"channelSocket,omitempty"`
 	ChannelPID         int    `json:"channelPID,omitempty"`
 	ChannelPIDStart    string `json:"channelPIDStart,omitempty"`
@@ -73,7 +75,7 @@ type claudeRegistry struct {
 	Name      string
 	Version   string
 	Socket    string
-	Cwd       string
+	StartedAt int // epoch ms
 }
 
 func runRuntime(args []string) int {
@@ -92,10 +94,6 @@ func runRuntime(args []string) int {
 		err = runtimeStatus(args[1:])
 	case "root":
 		err = runtimePrintRoot(args[1:])
-	case "whoami":
-		err = runtimeWhoami(args[1:])
-	case "session":
-		err = runtimeSession(args[1:])
 	case "register-channel":
 		err = runtimeRegisterChannel(args[1:])
 	case "watch-ready":
@@ -108,6 +106,8 @@ func runRuntime(args []string) int {
 		err = runtimeNativeWarning(args[1:])
 	case "pending-generation":
 		err = runtimePendingQueueDigest(args[1:])
+	case "holders":
+		err = runtimeHolders(args[1:])
 	default:
 		err = fmt.Errorf("unknown runtime command %q", args[0])
 	}
@@ -341,10 +341,10 @@ func processStart(pid int, bootID string) (string, error) {
 }
 
 // processStartCommand reads a process start time on darwin. `ps -o lstart=`
-// renders the timestamp in the caller's locale, so a channel child spawned
-// under a Korean-locale session and a notifier under launchd (no LANG) would
-// record two different strings for one process and never match. The locale
-// is pinned so every writer and reader produces the same bytes.
+// renders the timestamp in the caller's locale, so a hook or Codex bridge
+// running under a Korean-locale session and a notifier under launchd (no LANG)
+// would record two different strings for one process and never match. The
+// locale is pinned so every writer and reader produces the same bytes.
 func processStartCommand(pid int) *exec.Cmd {
 	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
 	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C", "LC_TIME=C")
@@ -463,7 +463,7 @@ func loadClaudeRegistries() ([]claudeRegistry, error) {
 			Name:      jsonString(raw, "name"),
 			Version:   jsonString(raw, "version"),
 			Socket:    jsonString(raw, "messagingSocketPath"),
-			Cwd:       jsonString(raw, "cwd"),
+			StartedAt: jsonInt(raw, "startedAt"),
 		}
 		if registry.PID > 1 && registry.Socket != "" {
 			result = append(result, registry)
@@ -503,6 +503,38 @@ func matchingRegistry(reg sessionRegistration, registries []claudeRegistry) (cla
 		return candidate, true
 	}
 	return claudeRegistry{}, false
+}
+
+// newestSessionRegistry resolves a Claude registration no single registry
+// matches because `claude --resume` left its session open in two or more live
+// processes: the last started wins, provided the registration still points
+// into the session by pid or socket. It also returns the other live pids. A
+// tie on startedAt has no winner.
+func newestSessionRegistry(reg sessionRegistration, registries []claudeRegistry) (claudeRegistry, []int, bool) {
+	if reg.Harness == "codex" || reg.ClaudeSessionID == "" {
+		return claudeRegistry{}, nil, false
+	}
+	var live []claudeRegistry
+	linked := false
+	for _, candidate := range registries {
+		if candidate.SessionID != reg.ClaudeSessionID || syscall.Kill(candidate.PID, 0) != nil {
+			continue
+		}
+		live = append(live, candidate)
+		linked = linked || candidate.PID == reg.PID || candidate.Socket == reg.SocketPath
+	}
+	if !linked || len(live) < 2 {
+		return claudeRegistry{}, nil, false
+	}
+	sort.Slice(live, func(i, j int) bool { return live[i].StartedAt > live[j].StartedAt })
+	if live[0].StartedAt == live[1].StartedAt {
+		return claudeRegistry{}, nil, false
+	}
+	var others []int
+	for _, candidate := range live[1:] {
+		others = append(others, candidate.PID)
+	}
+	return live[0], others, true
 }
 
 func loadRegistrations(root, bootID string) (map[string]sessionRegistration, error) {
@@ -567,81 +599,7 @@ func runtimePrintRoot(args []string) error {
 	return nil
 }
 
-// runtimeSession prints "<claudeSessionId>\t<cwd>" for the nearest ancestor
-// (starting at --pid itself) that Claude Code registered in its sessions
-// directory. A plugin MCP child is spawned by the session process, so this is
-// how it learns which session and project it belongs to without trusting env.
-func runtimeSession(args []string) error {
-	fs := flag.NewFlagSet("runtime session", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	pid := fs.Int("pid", os.Getppid(), "")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || *pid <= 1 {
-		return errors.New("session needs --pid N")
-	}
-	registries, err := loadClaudeRegistries()
-	if err != nil {
-		return err
-	}
-	byPID := make(map[int]claudeRegistry, len(registries))
-	for _, registry := range registries {
-		byPID[registry.PID] = registry
-	}
-	for cursor, hops := *pid, 0; cursor > 1 && hops < 32; hops++ {
-		if registry, ok := byPID[cursor]; ok && registry.SessionID != "" {
-			fmt.Fprintf(os.Stdout, "%s\t%s\n", registry.SessionID, registry.Cwd)
-			return nil
-		}
-		parent, err := processParent(cursor)
-		if err != nil || parent == cursor {
-			break
-		}
-		cursor = parent
-	}
-	return errors.New("no ancestor is a registered Claude session")
-}
-
-func runtimeWhoami(args []string) error {
-	fs := flag.NewFlagSet("runtime whoami", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	identity := fs.String("identity", "", "")
-	sessionID := fs.String("session-id", "", "")
-	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validNode(*identity) || *sessionID == "" {
-		return errors.New("whoami needs a valid --identity and --session-id")
-	}
-	root, err := runtimeRoot()
-	if err != nil {
-		return err
-	}
-	bootID, err := currentBootID()
-	if err != nil {
-		return err
-	}
-	regs, err := loadRegistrations(root, bootID)
-	if err != nil {
-		return err
-	}
-	var instance string
-	for _, reg := range regs {
-		if reg.Identity != *identity || reg.ClaudeSessionID != *sessionID {
-			continue
-		}
-		if instance != "" && instance != reg.InstanceID {
-			return errors.New("multiple registrations match identity and Claude session id")
-		}
-		instance = reg.InstanceID
-	}
-	if instance == "" {
-		return errors.New("no registration matches identity and Claude session id")
-	}
-	fmt.Fprintln(os.Stdout, instance)
-	return nil
-}
-
 func runtimeRegisterChannel(args []string) error {
-	if len(args) == 1 && args[0] == "--help" {
-		fmt.Fprintln(os.Stdout, "usage: khala-link runtime register-channel --instance ID --session-id ID --channel-socket PATH --caller-pid PID [--verified|--clear]")
-		return nil
-	}
 	fs := flag.NewFlagSet("runtime register-channel", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	instance := fs.String("instance", "", "")
@@ -649,7 +607,6 @@ func runtimeRegisterChannel(args []string) error {
 	channelSocket := fs.String("channel-socket", "", "")
 	callerPID := fs.Int("caller-pid", os.Getppid(), "")
 	verified := fs.Bool("verified", false, "")
-	clearChannel := fs.Bool("clear", false, "")
 	if err := fs.Parse(args); err != nil || fs.NArg() != 0 || !validInstanceID(*instance) || *sessionID == "" {
 		return errors.New("register-channel needs a valid --instance and --session-id")
 	}
@@ -668,25 +625,11 @@ func runtimeRegisterChannel(args []string) error {
 		if !isSessionKind(reg.Kind) {
 			return fmt.Errorf("registration kind %q is not a session kind", reg.Kind)
 		}
+		if reg.Harness != "codex" {
+			return errors.New("register-channel is for Codex registrations; a Claude session receives through its inbox socket")
+		}
 		if reg.ClaudeSessionID != *sessionID {
 			return errors.New("channel caller Claude session id does not match registration")
-		}
-		if *clearChannel {
-			if reg.ChannelPID == 0 {
-				return nil
-			}
-			callerStart, err := processStart(*callerPID, bootID)
-			if err != nil {
-				return fmt.Errorf("read channel caller pid start: %w", err)
-			}
-			if reg.ChannelPID != *callerPID || reg.ChannelPIDStart != callerStart {
-				return nil // a stale child must not clear its replacement
-			}
-			reg.ChannelSocket = ""
-			reg.ChannelPID = 0
-			reg.ChannelPIDStart = ""
-			reg.ChannelVerified = false
-			return nil
 		}
 		if *callerPID <= 1 || *channelSocket == "" {
 			return errors.New("register-channel needs --channel-socket and --caller-pid")
@@ -851,6 +794,13 @@ func runtimeRegister(args []string, publicBind bool) error {
 			return fmt.Errorf("record parent: %w", err)
 		}
 	}
+	// A second `claude --resume` of a registered session brings its own socket
+	// and no pid: find the pid again from that socket's registry rather than
+	// keep the process the session was open in before.
+	if exists && reg.SocketPath != "" && flagPassed(fs, "socket") && *socketPath != "" &&
+		*socketPath != reg.SocketPath && *pid <= 1 {
+		reg.PID, reg.PIDStart = 0, ""
+	}
 	// A socket inherited from the environment (CLAUDE_CODE_MESSAGING_SOCKET
 	// reaches every Bash child of a session) must not replace the socket an
 	// existing registration already binds — a session running `khala bind` on
@@ -872,6 +822,15 @@ func runtimeRegister(args []string, publicBind bool) error {
 		reg.PID = registry.PID
 		reg.SocketPath = registry.Socket
 		reg.CCVersion = firstNonempty(reg.CCVersion, registry.Version)
+	}
+	// The session socket's auth token is read from the environment, never argv,
+	// and kept only beside the socket it came with: an explicit --socket naming
+	// this process's own CLAUDE_CODE_MESSAGING_SOCKET (the SessionStart hook).
+	if flagPassed(fs, "socket") && *socketPath != "" && *socketPath == os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET") {
+		reg.MessagingToken, reg.TokenSocket = "", ""
+		if token := os.Getenv("CLAUDE_CODE_MESSAGING_TOKEN"); token != "" {
+			reg.MessagingToken, reg.TokenSocket = token, *socketPath
+		}
 	}
 	if reg.PID <= 1 && publicBind {
 		reg.PID = *callerPID
@@ -1251,7 +1210,7 @@ func runtimeStatus(args []string) error {
 			socket = "yes"
 		}
 		channel := "-"
-		if reg.ChannelSocket != "" {
+		if reg.Harness == "codex" && reg.ChannelSocket != "" {
 			channel = "yes"
 		}
 		native := firstNonempty(reg.NativeStatus, "-")
@@ -1372,9 +1331,6 @@ func runtimeWatchReady(args []string) error {
 		(*sessionID != "" && reg.ClaudeSessionID == *sessionID) || processIsAncestor(reg.PID, *callerPID)
 	if !own {
 		return errors.New("verified registration belongs to another session")
-	}
-	if reg.ChannelSocket != "" && !reg.ChannelVerified {
-		return errors.New("conduit path unverified")
 	}
 	return nil
 }

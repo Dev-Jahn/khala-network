@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.11
+KHALA_VERSION=0.9.12
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -4185,10 +4185,14 @@ cmd_send() {
     fi
     send_node=$(self_node) || return 1
     send_session=$(session_name "$send_as" "$send_as_set") || return 1
-    if [ "$send_as_set" -eq 1 ]; then
-        printf '%s\n' 'khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요' >&2
-    fi
     send_from=$send_session@$send_node
+    # --as is how a session (a subagent with its own mailbox, a lane) sends as
+    # itself; only a declared watcher sending mail is pointed at notify.
+    if [ "$send_as_set" -eq 1 ] && \
+        watchdog_marker_registered "$KHALA_ROOT/presence/$send_from.watcher"; then
+        printf 'khala send --as: 선언된 watcher(%s)의 알림은 khala notify로 보내세요\n' \
+            "$send_from" >&2
+    fi
     if [ -n "$send_request_id" ]; then
         cmd_send_request || return $?
         [ "${send_to#*@}" != "$send_node" ] || leave_reconcile_trigger
@@ -5663,20 +5667,12 @@ cmd_watch() {
     watch_interval=$(normalize_integer "$watch_interval")
     watch_max_wait=$(normalize_integer "$watch_max_wait")
     watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
-    if find_link_binary; then
-        watch_ready_error=$("$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
-            --instance "${KHALA_SESSION_INSTANCE-}" \
-            --session-id "${KHALA_HARNESS_SESSION_ID-${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}}" \
-            --caller-pid "$$" 2>&1)
-        if [ "$?" -eq 0 ]; then
-            printf '%s\n' 'conduit has the ear'
-            return 0
-        fi
-        case "$watch_ready_error" in
-            *'conduit path unverified'*)
-                printf '%s\n' 'watch: conduit path unverified; watching directly' >&2
-                ;;
-        esac
+    if find_link_binary && "$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
+        --instance "${KHALA_SESSION_INSTANCE-}" \
+        --session-id "${KHALA_HARNESS_SESSION_ID-${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}}" \
+        --caller-pid "$$" >/dev/null 2>&1; then
+        printf '%s\n' 'conduit has the ear'
+        return 0
     fi
     watch_self=$(self_node) || {
         error "설정을 확인하거나 khala init 먼저 실행하세요."
@@ -5725,16 +5721,20 @@ cmd_watch() {
     trap 'watch_marker_cleanup INT' INT
     trap 'watch_marker_cleanup TERM' TERM
 
+    # The loop runs every second so a letter that lands in the inbox wakes the
+    # watch within a second whatever the link state; the sync work keeps its own
+    # cadence below.
     watch_marker_refreshed=0
+    watch_synced=0
     while :; do
         watch_now=$(date +%s) || {
             error "현재 시각을 읽지 못했습니다"
             return 1
         }
-        # Marker refresh follows the configured interval, not the loop interval: in relay
-        # mode the loop runs at 1s and the relay distributes every content
-        # change across the cluster (measured 1Hz presence noise, 57/60s). The
-        # freshness rule (interval + ttl) needs one refresh per interval.
+        # Marker refresh follows the configured interval, not the 1s loop: the
+        # relay distributes every content change across the cluster (measured
+        # 1Hz presence noise, 57/60s). The freshness rule (interval + ttl)
+        # needs one refresh per interval.
         if [ "$watch_marker_refreshed" -eq 0 ] || \
             [ "$((watch_now - watch_marker_refreshed))" -ge "$watch_interval" ]; then
             if refresh_watching_marker; then
@@ -5753,13 +5753,19 @@ cmd_watch() {
             [ "$((watch_now - watch_link_mtime))" -lt "$TTL_LINK" ]; then
             watch_link_fresh=1
         fi
+        # With a fresh link the relay carries the mail and a local reconcile per
+        # pass is enough; without one, the full sync runs once per interval.
         if [ "$watch_link_fresh" -eq 1 ]; then
             SYNC_FAILED=0
             if ! reconcile_cycle; then
                 error "reconcile 실패; watch를 계속합니다"
             fi
-        elif ! run_sync_cycles; then
-            error "sync 실패; watch를 계속합니다"
+        elif [ "$watch_synced" -eq 0 ] || \
+            [ "$((watch_now - watch_synced))" -ge "$watch_interval" ]; then
+            watch_synced=$watch_now
+            if ! run_sync_cycles; then
+                error "sync 실패; watch를 계속합니다"
+            fi
         fi
 
         watch_count=0
@@ -5797,26 +5803,17 @@ cmd_watch() {
         fi
         rm -f "$watch_stream_rows"
 
-        if [ "$watch_link_fresh" -eq 1 ]; then
-            watch_sleep=1
-        else
-            watch_sleep=$watch_interval
-        fi
         if [ "$watch_max_wait" -gt 0 ]; then
             watch_now=$(date +%s) || {
                 error "현재 시각을 읽지 못했습니다"
                 return 1
             }
-            watch_remaining=$((watch_max_wait - (watch_now - watch_started)))
-            if [ "$watch_remaining" -le 0 ]; then
+            if [ "$((watch_now - watch_started))" -ge "$watch_max_wait" ]; then
                 error "기한 내 새 편지 없음"
                 return 3
             fi
-            if [ "$watch_remaining" -lt "$watch_sleep" ]; then
-                watch_sleep=$watch_remaining
-            fi
         fi
-        sleep "$watch_sleep"
+        sleep 1
     done
 }
 
