@@ -80,6 +80,9 @@ func newNotifierFixture(t *testing.T) *notifierFixture {
 	// A suite run from inside a codex lane must not look like one.
 	t.Setenv("CODEX_THREAD_ID", "")
 	t.Setenv("KHALA_PARENT", "")
+	// Nor may a run from inside a Claude session bind or ring that session.
+	t.Setenv("CLAUDE_CODE_MESSAGING_SOCKET", "")
+	t.Setenv("CLAUDE_CODE_MESSAGING_TOKEN", "")
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		t.Fatal(err)
@@ -107,16 +110,17 @@ func newNotifierFixture(t *testing.T) *notifierFixture {
 
 func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 	t.Setenv("KHALA_CONDUIT_TEST_REWRITE_AFTER", "10ms,20ms,40ms,80ms")
-	for _, route := range []string{"socket", "channel", "channel+socket"} {
+	for _, route := range []string{"socket", "channel"} {
 		t.Run(route, func(t *testing.T) {
 			f := newNotifierFixture(t)
 			f.notifier.backoff = []time.Duration{time.Millisecond}
 			reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
 			f.writeLease("ink", &reg, "owned", 3)
 			var channelDeliveries *atomic.Int64
-			if route != "socket" {
+			if route == "channel" {
+				reg.Harness = "codex"
 				channelDeliveries = f.addChannel(&reg)
-				reg.ChannelVerified = route == "channel"
+				reg.ChannelVerified = true
 			}
 			lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
 
@@ -156,11 +160,7 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 			}
 			if route == "channel" {
 				if socket := f.deliveries[reg.InstanceID].Load(); socket != 0 {
-					t.Fatalf("verified channel echoed %d socket frames", socket)
-				}
-			} else if route == "channel+socket" {
-				if socket := f.deliveries[reg.InstanceID].Load(); socket != written {
-					t.Fatalf("channel frames=%d socket echoes=%d", written, socket)
+					t.Fatalf("Codex channel also wrote %d socket frames", socket)
 				}
 			}
 			entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
@@ -1383,42 +1383,50 @@ func TestConduitReclaimsReleasedLeaseAndAttemptsDelivery(t *testing.T) {
 	}
 }
 
-func TestUnverifiedChannelEchoesSocketRing(t *testing.T) {
-	f := newNotifierFixture(t)
-	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
-	f.writeLease("ink", &reg, "owned", 3)
-	f.stageMessage("ink")
-
-	channelDeliveries := f.addChannel(&reg)
-
-	messages := f.notifier.pending("ink")
-	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	f.notifier.maybeNotify("ink", lease, reg, messages)
-	if !waitForTest(time.Second, func() bool {
-		return channelDeliveries.Load() == 1 && f.deliveries[reg.InstanceID].Load() == 1
-	}) {
-		t.Fatalf("unverified channel did not use both paths: channel=%d socket=%d logs=%s",
-			channelDeliveries.Load(), f.deliveries[reg.InstanceID].Load(), f.logs.String())
-	}
-	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("delivery journal entries=%d err=%v", len(entries), err)
-	}
-	var journal deliveryJournal
-	if err := readJSON(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID, entries[0].Name()), &journal); err != nil {
-		t.Fatal(err)
-	}
-	if journal.Status != "written" || journal.Via != "channel+socket" {
-		t.Fatalf("journal status=%q via=%q, want written/channel+socket", journal.Status, journal.Via)
-	}
-	if got := strings.Count(f.logs.String(), "channel written; socket ring echoed (opt-in unverified)"); got != 1 {
-		t.Fatalf("echo log count=%d want 1; logs=%s", got, f.logs.String())
+// A Claude registration may still carry the channel fields an older plugin's
+// MCP child wrote; that route is gone (D18 r3). The socket alone is rung and
+// journaled as via=socket, and watch-ready does not depend on those fields.
+func TestClaudeRegistrationIgnoresLegacyChannel(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verified=%t", verified), func(t *testing.T) {
+			f := newNotifierFixture(t)
+			reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+			channelDeliveries := f.addChannel(&reg)
+			reg.ChannelVerified = verified
+			writeRegistrationForTest(t, f.runtime, reg)
+			f.writeLease("ink", &reg, "owned", 3)
+			f.stageMessage("ink")
+			lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
+			f.notifier.maybeNotify("ink", lease, reg, f.notifier.pending("ink"))
+			if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
+				t.Fatalf("socket was not rung; logs=%s", f.logs.String())
+			}
+			time.Sleep(100 * time.Millisecond)
+			if got := channelDeliveries.Load(); got != 0 {
+				t.Fatalf("legacy Claude channel received %d requests", got)
+			}
+			entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
+			if err != nil || len(entries) != 1 {
+				t.Fatalf("delivery journal entries=%d err=%v", len(entries), err)
+			}
+			var journal deliveryJournal
+			if err := readJSON(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID, entries[0].Name()), &journal); err != nil {
+				t.Fatal(err)
+			}
+			if journal.Status != "written" || journal.Via != "socket" || journal.ChannelError != "" {
+				t.Fatalf("journal=%+v, want written via socket", journal)
+			}
+			if err := runtimeWatchReady([]string{"--identity", "ink", "--instance", reg.InstanceID}); err != nil {
+				t.Fatalf("legacy channel fields blocked watch-ready: %v", err)
+			}
+		})
 	}
 }
 
-func TestVerifiedChannelDoesNotEchoSocketRing(t *testing.T) {
+func TestCodexChannelDoesNotRingSocket(t *testing.T) {
 	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
+	reg.Harness = "codex"
 	f.writeLease("ink", &reg, "owned", 3)
 	f.stageMessage("ink")
 	channelDeliveries := f.addChannel(&reg)
@@ -1428,11 +1436,11 @@ func TestVerifiedChannelDoesNotEchoSocketRing(t *testing.T) {
 	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
 	f.notifier.maybeNotify("ink", lease, reg, messages)
 	if !waitForTest(time.Second, func() bool { return channelDeliveries.Load() == 1 }) {
-		t.Fatal("verified channel did not receive the doorbell")
+		t.Fatal("Codex channel did not receive the doorbell")
 	}
 	time.Sleep(100 * time.Millisecond)
 	if got := f.deliveries[reg.InstanceID].Load(); got != 0 {
-		t.Fatalf("verified channel echoed %d socket rings, want 0", got)
+		t.Fatalf("Codex channel also rang the socket %d times", got)
 	}
 	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
 	if err != nil || len(entries) != 1 {
@@ -1599,7 +1607,7 @@ func TestRuntimeReservedIdentities(t *testing.T) {
 	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", reserved.InstanceID+".json"), reserved, 0600); err != nil {
 		t.Fatal(err)
 	}
-	err := runtimeRegisterChannel([]string{"--instance", reserved.InstanceID, "--session-id", reserved.ClaudeSessionID, "--clear"})
+	err := runtimeRegisterChannel([]string{"--instance", reserved.InstanceID, "--session-id", reserved.ClaudeSessionID})
 	if err == nil || err.Error() != `reserved identity "gateway"` {
 		t.Fatalf("runtime register-channel err=%v", err)
 	}
@@ -1644,7 +1652,7 @@ func TestRuntimeRegisterAcceptsAutoAndWorkerAndRefusesGatewayKind(t *testing.T) 
 	if err := writeAtomicJSON(filepath.Join(f.runtime, "sessions", nonSession.InstanceID+".json"), nonSession, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := runtimeRegisterChannel([]string{"--instance", nonSession.InstanceID, "--session-id", nonSession.ClaudeSessionID, "--clear"}); err == nil || !strings.Contains(err.Error(), "not a session kind") {
+	if err := runtimeRegisterChannel([]string{"--instance", nonSession.InstanceID, "--session-id", nonSession.ClaudeSessionID}); err == nil || !strings.Contains(err.Error(), "not a session kind") {
 		t.Fatalf("register-channel non-session err=%v", err)
 	}
 }

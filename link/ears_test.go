@@ -169,7 +169,7 @@ func TestBuildEarModelUsesLeaseSelectionRouteDrainAndOldestPending(t *testing.T)
 	}
 	older := f.addRegistration("shared", "older", "interactive", false, time.Now().Add(-2*time.Hour), 7)
 	newer := f.addRegistration("shared", "newer", "interactive", false, time.Now().Add(-time.Hour), 7)
-	_ = f.addChannel(&older)
+	_ = f.addChannel(&older) // a legacy MCP channel on a Claude registration: route stays socket
 	regs := map[string]sessionRegistration{"older": older, "newer": newer}
 	lease := identityLease{BootID: f.bootID, Identity: "shared", InstanceID: older.InstanceID, Epoch: older.LeaseEpoch, PID: older.PID, PIDStart: older.PIDStart, ClaudeSessionID: older.ClaudeSessionID, State: "owned"}
 	messageItem := f.stageMessageData("shared", "1700000000.1.1.sender@alpha", "From: sender@alpha\nType: message\nSubject: private-sentinel\n\nbody-sentinel\n")
@@ -186,7 +186,7 @@ func TestBuildEarModelUsesLeaseSelectionRouteDrainAndOldestPending(t *testing.T)
 		t.Fatal(err)
 	}
 	row := model.Identities[0]
-	if len(model.Identities) != 1 || row.Name != "shared" || !row.Listening || row.Route != "channel+socket" || row.OldestPending != oldest.Unix() || row.LastDrain != 1700000010 || row.LastDrainBefore != testQueueDigest || row.LastDrainAfter != "-" || row.LastDrainStatus != "partial" {
+	if len(model.Identities) != 1 || row.Name != "shared" || !row.Listening || row.Route != "socket" || row.OldestPending != oldest.Unix() || row.LastDrain != 1700000010 || row.LastDrainBefore != testQueueDigest || row.LastDrainAfter != "-" || row.LastDrainStatus != "partial" {
 		t.Fatalf("rows=%+v", model.Identities)
 	}
 	lease.Epoch++

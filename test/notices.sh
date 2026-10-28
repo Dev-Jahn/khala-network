@@ -277,16 +277,21 @@ KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/retention.err" ||
 [ ! -s "$RIG/retention.err" ] || die "alert expiry was not silent"
 printf 'ok P4 — alert expiry, archive retention, and unread-mail truth\n'
 
-# P9: send compatibility hint and empty KHALA_SESSION resolution.
+# P9: send --as hint for declared watchers only, and empty KHALA_SESSION resolution.
 home=$RIG/session
 init_home "$home"
 # A recipient some session has used, so the hint is the only stderr line
 # (an unseen address adds the D18 warning).
 date +%s > "$home/presence/reader@alpha"
-KHALA_HOME=$home "$KHALA" send reader@alpha --as machine -m body \
+KHALA_HOME=$home "$KHALA" send reader@alpha --as worker -m body \
     >"$RIG/send-as.out" 2>"$RIG/send-as.err" || die "send --as failed"
-[ "$(cat "$RIG/send-as.err")" = 'khala send --as: 세션이 아닌 발신자라면 khala notify를 쓰세요' ] ||
-    die "send --as hint differs or is not exactly one line"
+[ ! -s "$RIG/send-as.err" ] || die "send --as as a session printed: $(cat "$RIG/send-as.err")"
+KHALA_HOME=$home "$KHALA" watcher declare machine --cadence 0 --owner reader >/dev/null ||
+    die "watcher declare machine failed"
+KHALA_HOME=$home "$KHALA" send reader@alpha --as machine -m body \
+    >"$RIG/send-as-watcher.out" 2>"$RIG/send-as-watcher.err" || die "send --as a watcher failed"
+[ "$(cat "$RIG/send-as-watcher.err")" = 'khala send --as: 선언된 watcher(machine@alpha)의 알림은 khala notify로 보내세요' ] ||
+    die "watcher send --as hint differs or is not exactly one line"
 project=$RIG/project
 mkdir -p "$project"
 printf 'file-session\n' > "$project/.khala-session"

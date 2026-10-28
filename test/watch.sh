@@ -350,16 +350,54 @@ grep -Fq "$stale_watch_id" "$TEST_DIR/stale-watch.out" || fail 12 "reclaimed wat
 [ ! -e "$HOME_LOCAL/run/watch.stale-watch.lock.d" ] || fail 12 "reclaimed watch lock remained"
 pass 12 "a stale singleton lock is reclaimed loudly and watch proceeds"
 
-# 13. All existing suites remain green without modification.
+# 13. Without a fresh relay link, at the default 30 s interval, a letter that lands
+# in the inbox wakes the watch within about a second: the inbox is looked at every
+# second, only the sync work waits for the interval.
+rm -f "$HOME_LOCAL/run/link.fresh"
+KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session prompt --max-wait 20 \
+    >"$TEST_DIR/prompt-watch.out" 2>"$TEST_DIR/prompt-watch.err" &
+ACTIVE_PID=$!
+sleep 3
+[ "$(sed -n '2p' "$HOME_LOCAL/presence/prompt@alpha.watching" 2>/dev/null)" = 30 ] || \
+    fail 13 "prompt watch is not armed at the default interval"
+# Same-node delivery: send queues the letter and leaves reconcile.trigger; the
+# reconcile the node daemons run on that trigger moves it into the inbox.
+if ! prompt_id=$(KHALA_HOME="$HOME_LOCAL" KHALA_SESSION=sender \
+    "$KHALA" send prompt@alpha -m "wake now" 2>"$TEST_DIR/prompt-send.err"); then
+    fail 13 "prompt send failed: $(tr '\n' ' ' < "$TEST_DIR/prompt-send.err")"
+fi
+if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" reconcile \
+    >"$TEST_DIR/prompt-reconcile.out" 2>"$TEST_DIR/prompt-reconcile.err"; then
+    fail 13 "prompt reconcile failed: $(tr '\n' ' ' < "$TEST_DIR/prompt-reconcile.err")"
+fi
+[ -f "$HOME_LOCAL/inbox/prompt/new/$prompt_id" ] || fail 13 "reconcile did not deliver the letter"
+prompt_delivered=$(date +%s) || fail 13 "could not read delivery time"
+if wait "$ACTIVE_PID"; then
+    prompt_status=0
+else
+    prompt_status=$?
+fi
+ACTIVE_PID=
+prompt_ended=$(date +%s) || fail 13 "could not read wake time"
+prompt_latency=$((prompt_ended - prompt_delivered))
+[ "$prompt_status" -eq 0 ] || fail 13 "prompt watch exited $prompt_status"
+[ "$prompt_latency" -le 3 ] || fail 13 "watch woke ${prompt_latency}s after the letter landed"
+[ "$(sed -n '1p' "$TEST_DIR/prompt-watch.out")" = 'wake: delivery' ] || \
+    fail 13 "prompt watch did not report wake: delivery"
+prompt_line=$(printf '%s\t%s' "$prompt_id" 'sender@alpha')
+grep -Fqx "$prompt_line" "$TEST_DIR/prompt-watch.out" || fail 13 "prompt output omitted Id or From"
+pass 13 "without a fresh link a landed letter wakes the watch in ${prompt_latency}s at the default interval"
+
+# 14. All existing suites remain green without modification.
 for regression_suite in local-roundtrip exchange-roundtrip hardening; do
     if ! bash "$ROOT/test/$regression_suite.sh" \
         >"$TEST_DIR/$regression_suite.out" 2>"$TEST_DIR/$regression_suite.err"; then
-        fail 13 "$regression_suite regression failed: $(tr '\n' ' ' < "$TEST_DIR/$regression_suite.err")"
+        fail 14 "$regression_suite regression failed: $(tr '\n' ' ' < "$TEST_DIR/$regression_suite.err")"
     fi
     grep -q '^RESULT: PASS$' "$TEST_DIR/$regression_suite.out" || \
-        fail 13 "$regression_suite did not report PASS"
+        fail 14 "$regression_suite did not report PASS"
 done
-pass 13 "all three existing suites pass unchanged"
+pass 14 "all three existing suites pass unchanged"
 
 printf 'RESULT: PASS\n'
 printf 'watch honesty, singleton lifecycle, exchange, routing isolation, and regressions passed\n'

@@ -12,6 +12,8 @@ def main() -> None:
     parser.add_argument("socket_path")
     parser.add_argument("output_path")
     parser.add_argument("ready_path")
+    parser.add_argument("--all-lines", action="store_true",
+                        help="record every line of a connection, not just the first")
     args = parser.parse_args()
 
     try:
@@ -42,12 +44,14 @@ def main() -> None:
                 continue
             with connection:
                 payload = b""
-                while b"\n" not in payload:
+                while args.all_lines or b"\n" not in payload:
                     chunk = connection.recv(65536)
                     if not chunk:
                         break
                     payload += chunk
-                if payload:
+                if args.all_lines:
+                    output.write(payload.decode("utf-8"))
+                elif payload:
                     output.write(payload.split(b"\n", 1)[0].decode("utf-8") + "\n")
 
     listener.close()

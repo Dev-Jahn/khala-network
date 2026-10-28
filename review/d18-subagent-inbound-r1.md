@@ -136,3 +136,46 @@ codex 훅을 바꾸면 노드마다 신뢰 해시를 다시 받아야 한다(`~/
 2. 끝난 레인의 편지는 **띄운 메인(parent)에게 알림**(4.3안 그대로).
 3. Claude 메인 경로는 **소켓 하나**. MCP 채널(`plugin/channel/`, 채널 등록·검증·echo 분기)은 **폐기**.
 4. **hippo 수정 포함**(4.1안: 레인 신원·parent 주입, Claude 환경 변수 제거, `.khala-codex-session`으로 resume 재바인드).
+
+## r3 — 2단계 + Claude 하위 작업자 확정 (2026-10-28)
+
+유저 결정(10-28): 4.5(2단계)와 4.6(Claude 하위 작업자)을 khala 한 번의 릴리스로 묶는다. 근거: CC 2.1.312 실측
+(`~/.kd18-harness/evidence/cc-subagent-spike/`)과 코드 목록(정본 `8b77348` 기준).
+
+**실측 요지 (CC 2.1.312)**
+- 하위 작업자의 `PostToolUse` 입력에는 `agent_id`·`agent_type`이 붙는다. `session_id`·`transcript_path`는 메인 것이다.
+  JSON `additionalContext`는 **그 하위 작업자 모델에만** 들어가고 메인 전사에는 흔적이 없다(3/3). 평문 stdout은 아무 모델에도 안 들어간다.
+- `SubagentStart` 입력: `agent_id, agent_type, cwd, hook_event_name, prompt_id, session_id, transcript_path` — 지시문·이름 없음.
+  `additionalContext`는 하위 작업자에게 들어간다.
+- `SubagentStop`의 `{"decision":"block","reason":…}`은 하위 작업자를 이어 가게 한다(4회 연속까지 확인, `stop_hook_active`는 두 번째부터 true).
+- 하위 작업자의 Bash 환경은 메인과 **이름·길이까지 같다**. 하위 작업자를 가리키는 변수는 없다 → 신원은 훅이 `agent_id`로 묶어야 한다.
+- 메인의 `PreToolUse(Agent)`에 `tool_use_id`와 지시문 전체가 있고, `<transcript dir>/<session>/subagents/agent-<id>.meta.json`의
+  `toolUseId`가 같은 값이다 → 지시문의 선언과 `agent_id`를 잇는 고리.
+- 하위 작업자는 터미널에서 기본이 백그라운드다. 백그라운드도 위 사실이 같다.
+- 세션 소켓: `-p` 세션도 연다. macOS에서는 토큰이 없거나 틀려도 받는다(커널로 상대 프로세스를 식별). 30 s 무입력이면 닫는다.
+  `CLAUDE_CODE_MESSAGING_TOKEN`은 SessionStart 훅 환경에도 있다.
+
+**결정**
+1. **(A) MCP 채널 폐기.** `plugin/.mcp.json`, `plugin/channel/**`, Claude 전용 채널 분기(`runtime whoami/session`, `register-channel --clear/--help`,
+   echo, 채널 실패 뒤 소켓 폴백, "conduit path unverified")를 지운다. `khala_drain`/`khala_reply` 도구도 함께 사라지고 CLI(`khala inbox --drain`,
+   `khala send --reply-to`)로 대신한다. **Codex 경로(`harness=codex`, `channels/<instance>.sock`, `codex-channel-v1`, `register-channel --verified`)는
+   그대로**다. `register-channel`은 Claude 등록을 거부한다. `.ear`의 `channel+socket` 문법은 구버전 노드용으로 읽기만 남긴다.
+2. **(B) 소켓 인증 줄 + 하한.** SessionStart가 넘긴 `--socket`이 환경의 `CLAUDE_CODE_MESSAGING_SOCKET`과 같을 때만 그 토큰을 등록(0600)에
+   소켓 경로와 짝지어 저장하고, conduit은 그 소켓에 쓸 때 `{"type":"auth","token":…}` 줄을 먼저 보낸다. 토큰은 argv·status·`.ear`에 나오지 않는다.
+   설치 하한 2.1.229 → **2.1.239**.
+3. **(C) 이중 resume.** 등록 시: 기존 등록과 다른 명시 `--socket`이 오고 pid가 없으면 pid를 새 소켓의 레지스트리에서 다시 찾는다. conduit:
+   같은 sessionId의 살아 있는 레지스트리가 여럿이면 `startedAt`이 가장 큰 쪽을 골라 울리고, 나머지는 conduit 로그에 한 번 경고한다.
+   `.ear` 사유 열거형은 바꾸지 않는다.
+4. **구버전 우회**: `healLease`·`ps lstart`·세션 id 별칭은 **유지**(이중 resume이 healLease에 기대고, lstart는 다른 용도가 많다).
+   채널 자식의 stale 세션 id 보정은 (A)와 함께 사라진다.
+5. **(D) Claude 하위 작업자 수신.**
+   - **신원 선언**: 메인이 Agent 지시문에 단독 줄 `KHALA_SESSION=<name>`을 넣는다(khala 이름 규칙). 같은 줄은 하위 작업자가 명령 앞에 붙여
+     쓰는 형태와도 같다. 서로 다른 이름이 둘 이상이면 묶지 않고 메인에 알린다. 선언이 없으면 아무것도 하지 않는다.
+   - **묶기**: 메인 `PreToolUse`(matcher `Agent`)가 `tool_use_id → name`을 보류 기록한다. 하위 작업자의 첫 훅(`SubagentStart`, meta.json이 아직
+     없으면 첫 `PostToolUse`)이 meta.json의 `toolUseId`로 `agent_id → name`을 확정하고, `--harness claude --kind worker --receive-opt-in=false`,
+     pid=Claude 프로세스로 등록하며 parent=메인 신원을 기록한다. 이름의 lease를 다른 살아 있는 세션이 가졌으면 묶지 않고 알린다.
+   - **배달**: `PostToolUse`(모든 도구)는 `agent_id`가 없거나 묶이지 않았으면 출력 0으로 끝난다(sh, fork 최소). 묶인 하위 작업자의 미읽음이 있으면
+     codex 레인과 같은 한도로 drain해서 `additionalContext`로 넣는다. `SubagentStart`는 신원과 보내는 법(`--as <name>`)을 알려 준다.
+     `SubagentStop`은 미읽음이 있을 때만 block, 최대 3회. 그 뒤 등록을 풀어 이후 편지는 기존 parent 알림(4.3)으로 메인에 간다.
+     메인 SessionEnd는 그 세션의 하위 작업자 등록을 정리한다.
+   - 하위 작업자가 `--as`를 빼먹으면 메인 이름으로 나간다. 막을 길이 없으므로(환경이 같다) 시작 안내문에 명시한다.

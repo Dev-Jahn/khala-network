@@ -91,7 +91,7 @@ cat > "$SHIM/claude" <<'EOF'
 set -u
 printf '%s\n' "$*" >> "$KHALA_TEST_CLAUDE_LOG"
 if [ "$#" -eq 1 ] && [ "$1" = --version ]; then
-    printf '%s (Claude Code)\n' "${KHALA_TEST_CLAUDE_VERSION:-2.1.235}"
+    printf '%s (Claude Code)\n' "${KHALA_TEST_CLAUDE_VERSION:-2.1.239}"
     exit 0
 fi
 if [ "$#" -ge 3 ] && [ "$1 $2" = 'plugin marketplace' ] && [ "$3" = add ]; then
@@ -296,20 +296,20 @@ if HOME=$MISSING_HOME PATH=/usr/bin:/bin sh "$INSTALL" --name hub --bootstrap \
     > "$RIG/missing.out" 2> "$RIG/missing.err"; then
     fail 5 'missing Claude Code unexpectedly succeeded'
 fi
-grep -q 'Claude Code 2.1.229 or newer is required' "$RIG/missing.err" || \
+grep -q 'Claude Code 2.1.239 or newer is required' "$RIG/missing.err" || \
     fail 5 'missing Claude Code error lacks install/update pointer'
 pass 5 'missing Claude Code fails before touching node state with a concise version pointer'
 
 OLD_HOME=$RIG/old-claude-home
 mkdir -p "$OLD_HOME"
-if HOME=$OLD_HOME PATH=$SHIM:/usr/bin:/bin KHALA_TEST_CLAUDE_VERSION=2.1.228 \
+if HOME=$OLD_HOME PATH=$SHIM:/usr/bin:/bin KHALA_TEST_CLAUDE_VERSION=2.1.238 \
     KHALA_TEST_CLAUDE_LOG=$OLD_HOME/claude.argv sh "$INSTALL" --name hub --bootstrap \
     > "$RIG/old.out" 2> "$RIG/old.err"; then
     fail 5 'old Claude Code unexpectedly succeeded'
 fi
-grep -q 'Claude Code 2.1.228 is too old' "$RIG/old.err" || fail 5 'old-version error lacks detected version'
-grep -q '2.1.229 or newer' "$RIG/old.err" || fail 5 'old-version error lacks required version'
-pass 5a 'Claude Code below 2.1.229 fails with detected and required versions'
+grep -q 'Claude Code 2.1.238 is too old' "$RIG/old.err" || fail 5 'old-version error lacks detected version'
+grep -q '2.1.239 or newer' "$RIG/old.err" || fail 5 'old-version error lacks required version'
+pass 5a 'Claude Code below 2.1.239 fails with detected and required versions'
 
 # Preflight also refuses a host with neither downloader.
 NODL_SHIM=$RIG/no-downloader-shim

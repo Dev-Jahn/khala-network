@@ -135,6 +135,38 @@ func TestLegacyClaudeStillRequiresItsSocketAndRegistry(t *testing.T) {
 	}
 }
 
+// Only a Codex registration may attach a channel (D18 r3); a Claude session's
+// one route is its inbox socket. Everything else about the call is valid.
+func TestRegisterChannelRefusesClaudeRegistration(t *testing.T) {
+	f := newNotifierFixture(t)
+	for _, harness := range []string{"", "claude", "codex"} {
+		instance := "harness-" + firstNonempty(harness, "none")
+		reg := withHarness(t, f.addRegistration("ink-"+firstNonempty(harness, "none"), instance, "interactive", false, time.Now(), 1), harness)
+		f.addChannel(&reg)
+		registered := reg
+		registered.ChannelSocket, registered.ChannelPID, registered.ChannelPIDStart = "", 0, ""
+		writeRegistrationForTest(t, f.runtime, registered)
+		err := runtimeRegisterChannel([]string{"--instance", instance, "--session-id", reg.ClaudeSessionID,
+			"--channel-socket", reg.ChannelSocket, "--caller-pid", strconv.Itoa(os.Getpid()), "--verified"})
+		var stored sessionRegistration
+		if readErr := readJSON(filepath.Join(f.runtime, "sessions", instance+".json"), &stored); readErr != nil {
+			t.Fatal(readErr)
+		}
+		if harness == "codex" {
+			if err != nil || stored.ChannelSocket != reg.ChannelSocket || !stored.ChannelVerified {
+				t.Fatalf("Codex register-channel err=%v stored=%+v", err, stored)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), "a Claude session receives through its inbox socket") {
+			t.Fatalf("harness %q register-channel err=%v", harness, err)
+		}
+		if stored.ChannelSocket != "" || stored.ChannelVerified {
+			t.Fatalf("refused Claude registration was changed: %+v", stored)
+		}
+	}
+}
+
 func TestCodexRuntimeRegisterAndRelease(t *testing.T) {
 	f := newNotifierFixture(t)
 	args := []string{"--identity", "codex", "--instance", "codex-owned", "--session-id", "codex-thread", "--harness", "codex", "--kind", "interactive", "--pid", strconv.Itoa(os.Getpid())}

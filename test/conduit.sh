@@ -87,18 +87,20 @@ runtime_env() {
 start_listener() {
     listener_name=$1
     listener_session=$2
+    listener_mode=${3-}
     listener_socket=$RIG/$listener_name.sock
     listener_output=$RIG/$listener_name.frames
     listener_ready=$RIG/$listener_name.ready
-    "$RIG/venv/bin/python" "$LISTENER" "$listener_socket" "$listener_output" \
-        "$listener_ready" >"$RIG/$listener_name.listener.out" \
+    "$RIG/venv/bin/python" "$LISTENER" ${listener_mode:+"$listener_mode"} "$listener_socket" \
+        "$listener_output" "$listener_ready" >"$RIG/$listener_name.listener.out" \
         2>"$RIG/$listener_name.listener.err" &
     LISTENER_PID=$!
     PIDS="$PIDS $LISTENER_PID"
     wait_file "$listener_ready" 100 || fail setup "$listener_name listener did not bind"
     mkdir -p "$RIG/cc-sessions"
-    printf '{"pid":%s,"sessionId":"%s","name":"%s","version":"2.1.233","messagingSocketPath":"%s"}\n' \
-        "$LISTENER_PID" "$listener_session" "$listener_session" "$listener_socket" \
+    listener_started=$("$RIG/venv/bin/python" -c 'import time; print(time.time_ns() // 1000000)')
+    printf '{"pid":%s,"sessionId":"%s","name":"%s","version":"2.1.233","messagingSocketPath":"%s","startedAt":%s}\n' \
+        "$LISTENER_PID" "$listener_session" "$listener_session" "$listener_socket" "$listener_started" \
         > "$RIG/cc-sessions/$LISTENER_PID.json"
     LISTENER_SOCKET=$listener_socket
     LISTENER_OUTPUT=$listener_output
@@ -181,31 +183,49 @@ trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 (uv venv --python 3.13 "$RIG/venv" >/dev/null) || fail setup "test Python venv failed"
 (cd "$ROOT/link" && CGO_ENABLED=0 "$GO" build -o "$BIN" .) || fail setup "Go build failed"
 
-# H20 — a live channel child replaces the CC socket inbox notification for the
-# generation. A dead channel is recorded and falls back to the CC socket for
-# the next generation, never delivering through both paths.
+# H20 — a Codex registration (harness codex, the khala-network-codex bridge) is
+# rung only through its verified channel socket, never through a Claude socket,
+# even one inherited in its environment. A dead channel is journaled as a failed
+# attempt with no fallback. register-channel refuses a Claude registration.
 H20_HOME=$RIG/h20-home
 init_home "$H20_HOME"
-start_listener h20-cc h20-session
+start_listener h20-cc h20-claude-session
 H20_CC_PID=$LISTENER_PID
 H20_CC_SOCKET=$LISTENER_SOCKET
 H20_CC_FRAMES=$LISTENER_OUTPUT
-H20_REG=$(register_session "$H20_HOME" channelled h20-session "$H20_CC_PID" \
-    "$H20_CC_SOCKET" interactive ready) || fail H20 "ready registration failed"
-H20_INSTANCE=$(printf '%s\n' "$H20_REG" | sed -n 's/^instance //p')
+H20_CLAUDE_REG=$(register_session "$H20_HOME" claudeside h20-claude-session "$H20_CC_PID" \
+    "$H20_CC_SOCKET" interactive ready) || fail H20 "Claude registration failed"
+H20_CLAUDE_INSTANCE=$(printf '%s\n' "$H20_CLAUDE_REG" | sed -n 's/^instance //p')
+if runtime_env "$BIN" runtime register-channel --instance "$H20_CLAUDE_INSTANCE" \
+    --session-id h20-claude-session --channel-socket "$RUNTIME_BASE/channels/$H20_CLAUDE_INSTANCE.sock" \
+    --caller-pid "$H20_CC_PID" --verified >/dev/null 2>"$RIG/h20-claude.err"; then
+    fail H20 "register-channel accepted a Claude registration"
+fi
+grep -q 'a Claude session receives through its inbox socket' "$RIG/h20-claude.err" || \
+    fail H20 "Claude refusal is unclear: $(cat "$RIG/h20-claude.err")"
+sleep 300 &
+H20_CODEX_PID=$!
+PIDS="$PIDS $H20_CODEX_PID"
+H20_INSTANCE=0123456789abcdef01234567
 start_channel_listener h20 "$H20_INSTANCE"
 H20_CHANNEL_PID=$CHANNEL_LISTENER_PID
 H20_CHANNEL_SOCKET=$CHANNEL_SOCKET
 H20_CHANNEL_FRAMES=$CHANNEL_OUTPUT
+runtime_env KHALA_HOME="$H20_HOME" CLAUDE_CODE_MESSAGING_SOCKET="$H20_CC_SOCKET" \
+    "$BIN" runtime register --identity channelled --instance "$H20_INSTANCE" \
+    --session-id h20-thread --harness codex --kind interactive --phase ready \
+    --pid "$H20_CODEX_PID" --caller-pid "$H20_CHANNEL_PID" --cc-version 0.153.4 \
+    >"$RIG/h20-register.out" || fail H20 "Codex registration failed"
+grep -qx 'owner yes' "$RIG/h20-register.out" || fail H20 "Codex registration does not own its lease"
 runtime_env "$BIN" runtime register-channel --instance "$H20_INSTANCE" \
-    --session-id h20-session --channel-socket "$H20_CHANNEL_SOCKET" \
+    --session-id h20-thread --channel-socket "$H20_CHANNEL_SOCKET" \
     --caller-pid "$H20_CHANNEL_PID" --verified >/dev/null || fail H20 "channel registration failed"
 stage_letter "$H20_HOME" channelled 20 reel@bw2 "Priority: later"
 start_conduit "$H20_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H20_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H20_CHANNEL_FRAMES" 1 40 || fail H20 "live channel did not receive inbox notification"
 sleep 0.15
-[ "$(line_count "$H20_CC_FRAMES")" -eq 0 ] || fail H20 "CC socket also received successful channel generation"
+[ "$(line_count "$H20_CC_FRAMES")" -eq 0 ] || fail H20 "a Claude socket received the Codex inbox notification"
 uv run --no-project python - "$H20_CHANNEL_FRAMES" <<'PY' || fail H20 "channel request JSON/shape invalid"
 import json, sys
 request = json.loads(open(sys.argv[1], encoding="utf-8").readline())
@@ -227,8 +247,21 @@ grep -R -q '"via":"channel"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE"
     fail H20 "channel delivery journal omitted via=channel"
 runtime_env KHALA_HOME="$H20_HOME" "$BIN" runtime status > "$RIG/h20-status.out" || \
     fail H20 "runtime status failed"
-grep -q $'SOCKET\tCHANNEL\tCC_VERSION' "$RIG/h20-status.out" || fail H20 "status omitted CHANNEL column"
-grep -q $'channelled\t.*\tyes\tyes\t2.1.233' "$RIG/h20-status.out" || fail H20 "status did not show the registered channel"
+grep -q $'SOCKET\tCHANNEL\tCC_VERSION\tADAPTER' "$RIG/h20-status.out" || fail H20 "status omitted CHANNEL column"
+grep -q $'^channelled\t.*\t-\tyes\tcodex:0.153.4\tcodex-channel-v1\t' "$RIG/h20-status.out" || \
+    fail H20 "status did not show the Codex channel"
+grep -q $'^claudeside\t.*\tyes\t-\t2.1.233\tsocket-v1\t' "$RIG/h20-status.out" || \
+    fail H20 "status did not show the Claude socket alone"
+H20_EAR=$H20_HOME/presence/conduit@alpha.ear
+h20_wait=0
+while ! grep -q '^identity name=channelled principal=session listening=yes route=channel phase=ready cc=codex:0.153.4 ' \
+    "$H20_EAR" 2>/dev/null && [ "$h20_wait" -lt 100 ]; do
+    sleep 0.05
+    h20_wait=$((h20_wait + 1))
+done
+[ "$h20_wait" -lt 100 ] || fail H20 "listener snapshot did not show route=channel cc=codex:"
+grep -q '^identity name=claudeside principal=session listening=yes route=socket ' "$H20_EAR" || \
+    fail H20 "listener snapshot did not show the Claude socket route"
 
 mkdir -p "$H20_HOME/run/drained"
 mkdir -p "$H20_HOME/inbox/channelled/cur"
@@ -236,23 +269,23 @@ mv "$H20_HOME/inbox/channelled/new/1700000000.1.20.sender@alpha" "$H20_HOME/inbo
 printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H20_HOME/run/drained/channelled"
 stop_pid "$H20_CHANNEL_PID"
 stage_letter "$H20_HOME" channelled 21 clawd@mini
-wait_lines "$H20_CC_FRAMES" 1 40 || fail H20 "dead channel did not fall back to CC socket"
+h20_wait=0
+while ! grep -R -q '"status":"failed"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" 2>/dev/null && \
+    [ "$h20_wait" -lt 100 ]; do
+    sleep 0.05
+    h20_wait=$((h20_wait + 1))
+done
+[ "$h20_wait" -lt 100 ] || fail H20 "dead channel attempt was not journaled as failed"
+sleep 0.3
+[ "$(line_count "$H20_CC_FRAMES")" -eq 0 ] || fail H20 "dead channel fell back to a Claude socket"
 [ "$(line_count "$H20_CHANNEL_FRAMES")" -eq 1 ] || fail H20 "dead channel recorded another request"
-uv run --no-project python - "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" <<'PY' || \
-    fail H20 "socket fallback journal omitted channelError"
-import glob, json, os, sys
-journals = []
-for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
-    with open(path, encoding="utf-8") as journal_file:
-        journals.append(json.load(journal_file))
-latest = max(journals, key=lambda journal: journal["attemptedAt"])
-assert latest["via"] == "socket", latest
-assert latest["status"] == "written", latest
-assert latest["channelError"], latest
-PY
-grep -q 'channel doorbell.*failed' "$H20_HOME/log/conduit.log" || fail H20 "channel failure was not logged"
-pass H20 "live channel replaces the socket; dead channel is journaled and falls back once"
+grep -R -q '"via":"socket"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" && \
+    fail H20 "a Codex attempt was journaled via socket"
+grep -q "registration $H20_INSTANCE not verified: Codex channel socket is invalid" "$H20_HOME/log/conduit.log" || \
+    fail H20 "dead channel was not logged"
+pass H20 "Codex rings only its channel; a dead channel fails without fallback; Claude cannot register a channel"
 stop_pid "$H20_CONDUIT_PID"
+stop_pid "$H20_CODEX_PID"
 stop_pid "$H20_CC_PID"
 
 # H1/H2 — durable new/ remains authoritative and generations coalesce.
@@ -657,6 +690,102 @@ stop_pid "$H4_CONDUIT_PID"
 stop_pid "$OWNER_PID"
 stop_pid "$CLAIM_PID"
 
+# H25 — the session socket's auth token (D18 r3 B). The bind SessionStart makes
+# (explicit --socket = its own CLAUDE_CODE_MESSAGING_SOCKET) keeps the token from
+# the environment in the 0600 registration; the conduit writes the auth line
+# before the frame, and a session without a token gets the frame alone. The
+# token appears nowhere else: not in runtime status, .ear, journals or the log.
+H25_HOME=$RIG/h25-home
+init_home "$H25_HOME"
+H25_TOKEN=h25tokensentinel0123456789abcdef
+start_listener h25 h25-session --all-lines
+H25_PID=$LISTENER_PID; H25_SOCKET=$LISTENER_SOCKET; H25_FRAMES=$LISTENER_OUTPUT
+H25_REG=$(runtime_env KHALA_HOME="$H25_HOME" KHALA_SESSION=sealed \
+    CLAUDE_CODE_MESSAGING_SOCKET="$H25_SOCKET" CLAUDE_CODE_MESSAGING_TOKEN="$H25_TOKEN" \
+    "$KHALA" bind --register ready --session-id h25-session --pid 0 --socket "$H25_SOCKET" \
+    --kind interactive --cc-version 2.1.312) || fail H25 "registration failed"
+H25_INSTANCE=$(printf '%s\n' "$H25_REG" | sed -n 's/^instance //p')
+start_listener h25-plain h25-plain-session --all-lines
+H25_PLAIN_PID=$LISTENER_PID; H25_PLAIN_FRAMES=$LISTENER_OUTPUT
+register_session "$H25_HOME" plain h25-plain-session 0 "$LISTENER_SOCKET" interactive ready >/dev/null || \
+    fail H25 "plain registration failed"
+stage_letter "$H25_HOME" sealed 25
+stage_letter "$H25_HOME" plain 26
+start_conduit "$H25_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s KHALA_CONDUIT_TEST_REWRITE_AFTER=30s \
+    KHALA_CONDUIT_TEST_EAR_INTERVAL=30s
+H25_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H25_FRAMES" 2 60 || fail H25 "the session with a token was not rung"
+wait_lines "$H25_PLAIN_FRAMES" 1 60 || fail H25 "the session without a token was not rung"
+wait_file "$H25_HOME/presence/conduit@alpha.ear" 100 || fail H25 "snapshot was not written"
+uv run --no-project python - "$H25_FRAMES" "$H25_PLAIN_FRAMES" "$H25_TOKEN" \
+    "$RUNTIME_BASE/sessions/$H25_INSTANCE.json" <<'PY' || fail H25 "frames or registration wrong"
+import json, os, sys
+sealed = open(sys.argv[1], encoding="utf-8").read().splitlines()
+plain = open(sys.argv[2], encoding="utf-8").read().splitlines()
+assert len(sealed) == 2 and sealed[0] == '{"type":"auth","token":"%s"}' % sys.argv[3], sealed
+assert json.loads(sealed[1])["message"]["content"].startswith("KHALA-CONDUIT/1"), sealed
+assert len(plain) == 1 and json.loads(plain[0])["message"]["content"].startswith("KHALA-CONDUIT/1"), plain
+assert os.stat(sys.argv[4]).st_mode & 0o777 == 0o600
+assert json.load(open(sys.argv[4]))["messagingToken"] == sys.argv[3]
+PY
+runtime_env KHALA_HOME="$H25_HOME" "$BIN" runtime status > "$RIG/h25-status.out" || fail H25 "runtime status failed"
+grep -q '^sealed' "$RIG/h25-status.out" || fail H25 "runtime status lacks the identity"
+! grep -qF "$H25_TOKEN" "$RIG/h25-status.out" || fail H25 "runtime status leaked the token"
+h25_leaks=$(grep -rlF "$H25_TOKEN" "$RUNTIME_BASE" "$H25_HOME")
+[ "$h25_leaks" = "$RUNTIME_BASE/sessions/$H25_INSTANCE.json" ] || fail H25 "token outside the registration: $h25_leaks"
+pass H25 "SessionStart's socket token rides the auth line before the frame and lives only in the 0600 registration"
+stop_pid "$H25_CONDUIT_PID"
+stop_pid "$H25_PID"
+stop_pid "$H25_PLAIN_PID"
+runtime_env KHALA_HOME="$H25_HOME" "$BIN" runtime release --session-id h25-session >/dev/null &&
+    runtime_env KHALA_HOME="$H25_HOME" "$BIN" runtime release --session-id h25-plain-session >/dev/null ||
+    fail H25 "releasing the dead registrations failed"
+
+# H26 — one session open in two processes (`claude --resume S` twice; windows
+# jahns-vsr, D18 r1 §1). The second SessionStart (its own socket, no pid)
+# re-points the registration at the newer process. A registration an older
+# release left instead (old pid, new socket — "Claude registry pid/socket
+# mismatch" forever) is repaired by the conduit: it rings only the process
+# whose registry started last, the lease follows, the other pid is logged once.
+H26_HOME=$RIG/h26-home
+init_home "$H26_HOME"
+start_listener h26-old h26-session
+H26_OLD_PID=$LISTENER_PID; H26_OLD_SOCKET=$LISTENER_SOCKET; H26_OLD_FRAMES=$LISTENER_OUTPUT
+start_listener h26-new h26-session
+H26_NEW_PID=$LISTENER_PID; H26_NEW_SOCKET=$LISTENER_SOCKET; H26_NEW_FRAMES=$LISTENER_OUTPUT
+h26_pids() {
+    uv run --no-project python - "$RUNTIME_BASE/sessions/$H26_INSTANCE.json" \
+        "$RUNTIME_BASE/identities/twice.lease" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))["pid"], json.load(open(sys.argv[2]))["pid"])
+PY
+}
+H26_REG=$(register_session "$H26_HOME" twice h26-session 0 "$H26_OLD_SOCKET" interactive ready) || \
+    fail H26 "first SessionStart registration failed"
+H26_INSTANCE=$(printf '%s\n' "$H26_REG" | sed -n 's/^instance //p')
+register_session "$H26_HOME" twice h26-session 0 "$H26_NEW_SOCKET" interactive ready >/dev/null || \
+    fail H26 "second SessionStart registration failed"
+[ "$(h26_pids)" = "$H26_NEW_PID $H26_NEW_PID" ] || fail H26 "second SessionStart kept the old process ($(h26_pids))"
+register_session "$H26_HOME" twice h26-session "$H26_OLD_PID" "$H26_NEW_SOCKET" interactive ready >/dev/null || \
+    fail H26 "mixed registration failed"
+[ "$(h26_pids)" = "$H26_OLD_PID $H26_OLD_PID" ] || fail H26 "precondition: mixed state not built ($(h26_pids))"
+stage_letter "$H26_HOME" twice 27
+start_conduit "$H26_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s KHALA_CONDUIT_TEST_REWRITE_AFTER=30s
+H26_CONDUIT_PID=$CONDUIT_PID
+wait_lines "$H26_NEW_FRAMES" 1 60 || fail H26 "the newest process was not rung"
+sleep 0.3
+[ "$(line_count "$H26_OLD_FRAMES")" -eq 0 ] || fail H26 "the older process was rung"
+[ "$(h26_pids)" = "$H26_NEW_PID $H26_NEW_PID" ] || \
+    fail H26 "registration and lease did not follow the newest process ($(h26_pids))"
+[ "$(grep -c "pids $H26_NEW_PID,$H26_OLD_PID; ringing the newest" "$H26_HOME/log/conduit.log")" -eq 1 ] || \
+    fail H26 "the other pid was not logged exactly once"
+pass H26 "a session open twice rings only its newest process, by registration or by conduit repair"
+stop_pid "$H26_CONDUIT_PID"
+stop_pid "$H26_OLD_PID"
+stop_pid "$H26_NEW_PID"
+runtime_env KHALA_HOME="$H26_HOME" "$BIN" runtime release --session-id h26-session >/dev/null ||
+    fail H26 "releasing the dead registration failed"
+
 # H7/H9 are hook-level gates: no identity refuses; non-owner never reads the inbox;
 # ready registration survives an inbox-read lock deadline.
 H7_HOME=$RIG/h7-home
@@ -785,33 +914,11 @@ H10_INSTANCE=$(printf '%s\n' "$H10_REG" | sed -n 's/^instance //p')
 start_conduit "$H10_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
 H10_CONDUIT_PID=$CONDUIT_PID
 wait_i=0
-while ! grep -R -q '"conduitVerified":true' "$RUNTIME_BASE/sessions" 2>/dev/null && \
+while ! grep -q '"conduitVerified":true' "$RUNTIME_BASE/sessions/$H10_INSTANCE.json" 2>/dev/null && \
     [ "$wait_i" -lt 40 ]; do
     sleep 0.05
     wait_i=$((wait_i + 1))
 done
-start_channel_listener h10 "$H10_INSTANCE"
-H10_CHANNEL_PID=$CHANNEL_LISTENER_PID
-H10_CHANNEL_SOCKET=$CHANNEL_SOCKET
-runtime_env "$BIN" runtime register-channel --instance "$H10_INSTANCE" \
-    --session-id h10-session --channel-socket "$H10_CHANNEL_SOCKET" \
-    --caller-pid "$H10_CHANNEL_PID" >/dev/null || fail H10 "unverified channel registration failed"
-KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
-    KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
-    "$KHALA" watch --session watcher --interval 1 --max-wait 3 \
-    >"$RIG/h10-unverified.out" 2>"$RIG/h10-unverified.err" &
-H10_WATCH_PID=$!
-PIDS="$PIDS $H10_WATCH_PID"
-sleep 0.2
-kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified channel made watch retreat"
-grep -Fqx 'watch: conduit path unverified; watching directly' "$RIG/h10-unverified.err" || \
-    fail H10 "direct-watch explanation missing"
-stage_letter "$H10_HOME" watcher 10
-wait "$H10_WATCH_PID" || fail H10 "direct watch did not wake on a message"
-grep -q '^1$' "$RIG/h10-unverified.out" || fail H10 "direct watch output missing message count"
-runtime_env "$BIN" runtime register-channel --instance "$H10_INSTANCE" \
-    --session-id h10-session --channel-socket "$H10_CHANNEL_SOCKET" \
-    --caller-pid "$H10_CHANNEL_PID" --verified >/dev/null || fail H10 "verified channel registration failed"
 KHALA_HOME=$H10_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
     KHALA_SESSION=watcher KHALA_SESSION_INSTANCE=$H10_INSTANCE \
     "$KHALA" watch --session watcher --interval 1 --max-wait 1 >"$RIG/h10.out" 2>"$RIG/h10.err" || \
@@ -828,8 +935,7 @@ kill -0 "$H10_WATCH_PID" 2>/dev/null || fail H10 "unverified watch retreated ear
 stage_letter "$H10_HOME" legacy 10
 wait "$H10_WATCH_PID" || fail H10 "legacy watch did not wake on a message"
 grep -q '^1$' "$RIG/h10-legacy.out" || fail H10 "legacy watch output missing message count"
-pass H10 "watch keeps watching directly for an unverified channel and yields for a verified path"
-stop_pid "$H10_CHANNEL_PID"
+pass H10 "watch yields for a verified socket path and watches directly without one"
 stop_pid "$H10_CONDUIT_PID"
 stop_pid "$H10_PID"
 
@@ -1208,4 +1314,4 @@ bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
     "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
 
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H24 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'
+printf 'Conduit H1-H26 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'

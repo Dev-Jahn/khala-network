@@ -165,11 +165,7 @@ if khala_resolve_session 0 1 >"$TEST_DIR/reserved-hook.out"; then
 fi
 grep -Fqx 'khala: 예약된 이름입니다: khala-gateway' "$TEST_DIR/reserved-hook.out" ||
     fail 7 "hook reserved-name diagnostic differs"
-for reserved_identity in conduit khala khala-gateway gateway operator; do
-    grep -Fq "'$reserved_identity'" "$ROOT/plugin/channel/server.ts" ||
-        fail 7 "channel server reserved list omits $reserved_identity"
-done
-pass 7 "hook and channel server diagnose the complete reserved identity set early"
+pass 7 "hook diagnoses a reserved identity early"
 
 printf 'RESULT: PASS\n'
 printf 'pruning, isolation, spool hygiene, and regressions passed\n'

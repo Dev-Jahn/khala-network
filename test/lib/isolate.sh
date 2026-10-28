@@ -95,7 +95,7 @@ for isolate_name in $(compgen -e); do
     case "$isolate_name" in
         # Suite knobs a caller sets on purpose; no product code reads them.
         KHALA_TEST_ISOLATION_BASE | KHALA_TEST_ROOT | KHALA_UNDER_TEST | \
-            KHALA_CHANNEL_SERVER | KHALA_LINK_TEST_KEEP_RIG) ;;
+            KHALA_LINK_TEST_KEEP_RIG) ;;
         CLAUDE_* | KHALA_*) unset "$isolate_name" ;;
         # A codex lane running the suites is not the session under test: with
         # it set, every Claude-path bind would be refused as a codex session.
