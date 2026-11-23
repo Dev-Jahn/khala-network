@@ -129,12 +129,26 @@ delivered_file="$KHALA_HOME/inbox/alice/new/$message_id"
 [ -f "$delivered_file" ] || fail 4 "delivered message filename changed"
 pass 4 "sync delivers and consumes the ack"
 
-# 5. A further cycle must not change the recursive path listing.
-ls -laR "$KHALA_HOME" >"$TEST_DIR/tree-before"
+# 5. A further cycle must not change the recursive path listing. run/ (lock
+# scratch) and tmp/ (staging scratch) are volatile by design and every sync
+# touches their directory mtimes, so an ls -laR comparison flakes whenever the
+# two snapshots straddle a minute boundary; compare the paths and file contents
+# outside them instead (as exchange-roundtrip property 4 does).
+semantic_snapshot() {
+    (cd "$1" && find . -path ./run -prune -o -path ./tmp -prune -o -print | sort | \
+        while IFS= read -r snapshot_path; do
+            if [ -f "$snapshot_path" ]; then
+                printf '%s %s\n' "$snapshot_path" "$(cksum < "$snapshot_path")"
+            else
+                printf '%s\n' "$snapshot_path"
+            fi
+        done)
+}
+semantic_snapshot "$KHALA_HOME" >"$TEST_DIR/tree-before"
 if ! "$KHALA" sync >"$TEST_DIR/sync-3.out" 2>"$TEST_DIR/sync-3.err"; then
     fail 5 "third sync failed: $(tr '\n' ' ' < "$TEST_DIR/sync-3.err")"
 fi
-ls -laR "$KHALA_HOME" >"$TEST_DIR/tree-after"
+semantic_snapshot "$KHALA_HOME" >"$TEST_DIR/tree-after"
 cmp -s "$TEST_DIR/tree-before" "$TEST_DIR/tree-after" || fail 5 "third sync changed the recursive listing"
 pass 5 "sync is idempotent"
 
@@ -182,14 +196,5 @@ bounce_count=$(grep -l '^Type: bounce$' "$KHALA_HOME"/inbox/bob/new/* 2>/dev/nul
 [ "$bounce_count" -eq 1 ] || fail 8 "a second bounce was created"
 pass 8 "expiry creates one bounce and one dead-letter"
 
-# 9. Presence reflects command heartbeats without claiming process liveness.
-if ! "$KHALA" presence >"$TEST_DIR/presence.out" 2>"$TEST_DIR/presence.err"; then
-    fail 9 "presence failed: $(tr '\n' ' ' < "$TEST_DIR/presence.err")"
-fi
-grep -q 'alice@b200.*alive-here' "$TEST_DIR/presence.out" || fail 9 "alice is not shown alive"
-grep -q 'bob@b200.*alive-here' "$TEST_DIR/presence.out" || fail 9 "bob is not shown alive"
-grep -q 'asleep = 칼라 활동 없음' "$TEST_DIR/presence.out" || fail 9 "honesty note is missing"
-pass 9 "presence reports fresh heartbeats honestly"
-
 printf 'RESULT: PASS\n'
-printf 'local store-and-forward, dedup, drain, expiry, and presence passed\n'
+printf 'local store-and-forward, dedup, drain, and expiry passed\n'

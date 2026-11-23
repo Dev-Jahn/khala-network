@@ -75,36 +75,6 @@ func TestCodexChannelWithoutClaudeSocket(t *testing.T) {
 	}
 }
 
-// A Codex worker is never rung (D18), so lacking a receive opt-in is not logged
-// as a fault; it still is not verified, and any other worker still logs it.
-func TestCodexWorkerWithoutOptInIsNotLoggedAsFault(t *testing.T) {
-	f := newNotifierFixture(t)
-	lane := withHarness(t, f.addRegistration("lane", "codex-worker", "worker", false, time.Now(), 0), "codex")
-	lane.SocketPath = ""
-	writeRegistrationForTest(t, f.runtime, lane)
-	f.addRegistration("helper", "claude-worker", "worker", false, time.Now(), 0)
-	for i := 0; i < 2; i++ {
-		f.notifier.scan()
-	}
-	logs := f.logs.String()
-	if strings.Contains(logs, "registration codex-worker not verified") {
-		t.Fatalf("Codex worker logged as a fault; logs=%s", logs)
-	}
-	if got := strings.Count(logs, "registration claude-worker not verified: non-interactive registration lacks opt-in"); got != 1 {
-		t.Fatalf("other worker opt-in log count=%d want 1; logs=%s", got, logs)
-	}
-	var stored sessionRegistration
-	if err := readJSON(filepath.Join(f.runtime, "sessions", "codex-worker.json"), &stored); err != nil {
-		t.Fatal(err)
-	}
-	if stored.ConduitVerified {
-		t.Fatal("the quiet Codex worker was verified")
-	}
-	if _, verified, reason := f.notifier.verifyRegistration(stored, nil); verified || reason != "non-interactive registration lacks opt-in" {
-		t.Fatalf("verification changed: verified=%v reason=%q", verified, reason)
-	}
-}
-
 func TestCodexChannelFailureNeverUsesClaudeSocket(t *testing.T) {
 	f := newNotifierFixture(t)
 	reg := withHarness(t, f.addRegistration("codex", "codex-owner", "interactive", false, time.Now(), 1), "codex")

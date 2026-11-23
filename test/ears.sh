@@ -16,6 +16,11 @@ die() {
     exit 1
 }
 
+# Modification time in epoch seconds: GNU stat -c, else BSD/macOS stat -f.
+file_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
 init_home() {
     init_target=$1
     init_node=${2-alpha}
@@ -215,8 +220,8 @@ property_c3() {
     fresh=$home/presence/conduit@fresh.ear
     printf 'malformed\n' > "$old"
     write_ear "$fresh" fresh 1 "$(date +%s)" 60 running yes
-    touch -d '2 days ago' "$old" || die "old touch failed"
-    touch -d 'next hour' "$fresh" || die "fresh touch failed"
+    touch -t 200001010000 "$old" || die "old touch failed"
+    touch -t 209901010000 "$fresh" || die "fresh touch failed"
     KHALA_HOME=$home "$KHALA" reconcile >"$RIG/c3.out" 2>"$RIG/c3.err" ||
         die "retention reconcile failed"
     [ ! -e "$old" ] || die "aged listener snapshot survived retain 0"
@@ -279,12 +284,12 @@ property_c4() {
         >"$RIG/c4-mail.out" 2>"$RIG/c4-mail.err" || die "mail-only inbox read failed"
     assert_stamp_matches_summary "$stamp" "$RIG/c4-mail.out" || return 1
     grep -Eq '^drain 1 [0-9]+ - - 1 0 0 ok$' "$stamp" || die "mail-only inbox-read marker differs"
-    stamp_before=$(stat -c %Y "$stamp")
+    stamp_before=$(file_mtime "$stamp")
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox read 1.1.1.sender@beta >/dev/null ||
         die "read failed"
     KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox list >/dev/null ||
         die "second list failed"
-    [ "$(stat -c %Y "$stamp")" = "$stamp_before" ] || die "read/list touched inbox-read marker"
+    [ "$(file_mtime "$stamp")" = "$stamp_before" ] || die "read/list touched inbox-read marker"
 
     write_letter "$home/inbox/reader/new/2.1.1.sender@beta" \
         2.1.1.sender@beta notice || die "alert fixture failed"
@@ -336,6 +341,7 @@ property_c4() {
         4.1.1.sender@beta message || die "second partial fixture failed"
     partial_shim=$RIG/c4-partial-shim
     mkdir -p "$partial_shim"
+    real_mv=$(command -v mv) || die "mv not found"
     printf '%s\n' '#!/bin/sh' \
         'case "$1:$2" in *inbox/reader/new/*:*)' \
         '  count=0; [ ! -f "$MV_COUNT" ] || count=$(cat "$MV_COUNT")' \
@@ -343,7 +349,7 @@ property_c4() {
         '  [ "$count" -lt 2 ] || exit 71' \
         'esac' \
         'case "$2" in */run/drained/reader) [ -d "$KHALA_HOME/run/brain.lock.d" ] || exit 72 ;; esac' \
-        'exec /usr/bin/mv "$@"' > "$partial_shim/mv"
+        "exec '$real_mv' \"\$@\"" > "$partial_shim/mv"
     chmod 755 "$partial_shim/mv"
     if MV_COUNT=$RIG/c4-mv-count PATH=$partial_shim:/usr/bin:/bin KHALA_HOME=$home \
         KHALA_SESSION=reader "$KHALA" inbox --drain >"$RIG/c4-partial.out" \
@@ -400,9 +406,9 @@ property_c5() {
     cmp -s "$existing" "$RIG/c5-generation-20" || die "lower generation replaced existing"
 
     cp "$existing" "$incoming"
-    before_mtime=$(stat -c %Y "$existing")
+    before_mtime=$(file_mtime "$existing")
     KHALA_HOME=$spoke "$KHALA" sync >/dev/null 2>"$RIG/c5-equal.err" || die "equal generation sync failed"
-    [ "$(stat -c %Y "$existing")" = "$before_mtime" ] || die "equal identical incoming was reinstalled"
+    [ "$(file_mtime "$existing")" = "$before_mtime" ] || die "equal identical incoming was reinstalled"
 
     write_ear "$incoming" beta 20 "$now" 60 running yes \
         'identity name=different principal=session listening=no route=none reason=lease'
@@ -427,7 +433,7 @@ property_c5() {
     install_started=$(date +%s)
     KHALA_HOME=$spoke "$KHALA" sync >/dev/null 2>"$RIG/c5-higher.err" || die "higher generation sync failed"
     cmp -s "$existing" "$incoming" || die "higher generation did not replace existing"
-    [ "$(stat -c %Y "$existing")" -ge "$install_started" ] || die "install did not use local mtime"
+    [ "$(file_mtime "$existing")" -ge "$install_started" ] || die "install did not use local mtime"
 }
 
 expect_reserved() {

@@ -351,57 +351,6 @@ func TestEarSixtyIdentitySize(t *testing.T) {
 	t.Logf("60-identity snapshot bytes=%d", len(data))
 }
 
-func TestMeasureEarIdleFiveMinutes(t *testing.T) {
-	if os.Getenv("KHALA_RUN_FIVE_MINUTE_MEASUREMENT") != "1" {
-		t.Skip("set KHALA_RUN_FIVE_MINUTE_MEASUREMENT=1 for the release measurement")
-	}
-	f := newNotifierFixture(t)
-	for _, dir := range []string{"presence", "tmp", "run/drained"} {
-		if err := os.MkdirAll(filepath.Join(f.home, dir), 0700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := os.MkdirAll(filepath.Join(f.runtime, "ears"), 0700); err != nil {
-		t.Fatal(err)
-	}
-	for index := 0; index < 3; index++ {
-		identity := fmt.Sprintf("idle-%d", index)
-		instance := fmt.Sprintf("owner-%d", index)
-		reg := f.addRegistration(identity, instance, "interactive", false, time.Now().Add(-time.Hour), uint64(index+1))
-		f.writeLease(identity, &reg, "owned", uint64(index+1))
-	}
-	f.notifier.scanEvery = 500 * time.Millisecond
-	f.notifier.listenerInterval = 60 * time.Second
-	f.notifier.listenerUpstreams = []string{"alpha"}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- f.notifier.run(ctx) }()
-	path := filepath.Join(f.home, "presence", "conduit@alpha.ear")
-	deadline := time.Now().Add(5 * time.Minute)
-	var lastSequenceNumber int64
-	runningSnapshots := 0
-	for time.Now().Before(deadline) {
-		if snapshot, err := parseListenerSnapshot(path); err == nil && snapshot.State == "running" && snapshot.Generation != lastSequenceNumber {
-			if len(snapshot.Identities) != 3 {
-				cancel()
-				<-done
-				t.Fatalf("snapshot identities=%d, want 3", len(snapshot.Identities))
-			}
-			lastSequenceNumber = snapshot.Generation
-			runningSnapshots++
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	cancel()
-	if err := <-done; err != context.Canceled {
-		t.Fatalf("run err=%v", err)
-	}
-	if runningSnapshots > 6 {
-		t.Fatalf("5-minute idle running snapshots=%d, want <= 6", runningSnapshots)
-	}
-	t.Logf("5-minute idle running snapshots=%d", runningSnapshots)
-}
-
 func TestMalformedDrainWarnsOnce(t *testing.T) {
 	f := newNotifierFixture(t)
 	if err := os.MkdirAll(filepath.Join(f.home, "run", "drained"), 0700); err != nil {

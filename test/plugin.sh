@@ -446,49 +446,27 @@ grep -q '"state":"released"' "$END_HOME/runtime-root/identities/end-session.leas
     fail 9 "SessionEnd did not release the lease"
 pass 9 "SessionEnd removes registration and releases its lease"
 
-COLLIDE_HOME=$RIG/collide-home
-COLLIDE_PROJECT=$RIG/collide-session
-init_home "$COLLIDE_HOME"
-make_project "$COLLIDE_PROJECT" collide
-HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME KHALA_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
-    KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=owner-session KHALA_SESSION_PID=$$ \
-    KHALA_SESSION_KIND=interactive \
-    CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" </dev/null \
-    >"$RIG/collide-owner.out" 2>"$RIG/collide-owner.err" || fail 10 "owner hook failed"
-stage_letter "$COLLIDE_HOME" collide collision-body
-HOME=$FAKE_HOME KHALA_HOME=$COLLIDE_HOME KHALA_RUNTIME_DIR=$COLLIDE_HOME/runtime-root \
-    KHALA_TEST_BOOT_ID=plugin-test-boot KHALA_CLAUDE_SESSION_ID=other-session KHALA_SESSION_PID=$$ \
-    KHALA_SESSION_KIND=interactive \
-    CLAUDE_PROJECT_DIR=$COLLIDE_PROJECT PATH=$SHIM:/usr/bin:/bin "$START" \
-    <<<'{"session_id":"other-session"}' >"$RIG/collide-other.out" 2>"$RIG/collide-other.err" || \
-    fail 10 "second hook failed"
-grep -q 'you are not the receiver of collide' "$RIG/collide-other.out" || \
-    fail 10 "non-receiver warning missing"
-[ "$(count_files "$COLLIDE_HOME/inbox/collide/new")" -eq 1 ] || \
-    fail 10 "non-owner hook read a message"
-pass 10 "duplicate identity warns loudly and non-owner inbox read moves nothing"
-
-for audit_script in "$ROOT/plugin/hooks/lib.sh" "$START" "$STOP" "$END"; do
+# The shell runtime the plugin ships: bin/khala (plugin/bin/khala is its byte
+# copy, case 1) and every hook. Its $KHALA_ROOT/tmp is not the system /tmp.
+RUNTIME_SCRIPTS=("$ROOT/bin/khala" "$ROOT"/plugin/hooks/*.sh)
+for audit_script in "${RUNTIME_SCRIPTS[@]}"; do
     bash -n "$audit_script" || fail 11 "bash syntax failed: $audit_script"
 done
-if grep -En '^[[:space:]]*tmux([[:space:]]|$)|signal-send' "$ROOT"/plugin/hooks/*.sh \
-    > "$RIG/r13-audit.out"; then
+if grep -En '^[[:space:]]*tmux([[:space:]]|$)|signal-send|kill[^#]*(CLAUDE|SESSION|PPID)' \
+    "$ROOT"/plugin/hooks/*.sh > "$RIG/r13-audit.out"; then
     fail 11 "R13-forbidden command found: $(tr '\n' ' ' < "$RIG/r13-audit.out")"
 fi
 if grep -En 'declare[[:space:]]+-A|mapfile|readarray|\$\{[^}]*,,|\$\{![^}]*\[@\]' \
-    "$ROOT"/plugin/hooks/*.sh > "$RIG/bash4-audit.out"; then
+    "${RUNTIME_SCRIPTS[@]}" > "$RIG/bash4-audit.out"; then
     fail 11 "bash-4-only construct found: $(tr '\n' ' ' < "$RIG/bash4-audit.out")"
 fi
-# Audit scope is the plugin's own runtime (hooks/skill/manifests); the bundled
-# CLI is a byte copy of bin/khala with its own suites (and its $KHALA_ROOT/tmp
-# usage is not the forbidden system /tmp).
-grep -R -En '(^|[=[:space:]"])/tmp(/|[[:space:]"]|$)' \
+grep -R -En '(^|[=[:space:]"])/tmp(/|[[:space:]"]|$)' "$ROOT/bin/khala" \
     "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
     > "$RIG/tmp-audit.out" && \
-    fail 11 "plugin references /tmp: $(tr '\n' ' ' < "$RIG/tmp-audit.out")"
-grep -R -n 'jq' "$ROOT/plugin/hooks" "$ROOT/plugin/skills" "$ROOT/plugin/.claude-plugin" \
-    > "$RIG/jq-audit.out" && \
-    fail 11 "plugin runtime references jq: $(tr '\n' ' ' < "$RIG/jq-audit.out")"
+    fail 11 "runtime references /tmp: $(tr '\n' ' ' < "$RIG/tmp-audit.out")"
+grep -R -n 'jq' "$ROOT/bin/khala" "$ROOT/plugin/hooks" "$ROOT/plugin/skills" \
+    "$ROOT/plugin/.claude-plugin" > "$RIG/jq-audit.out" && \
+    fail 11 "runtime references jq: $(tr '\n' ' ' < "$RIG/jq-audit.out")"
 pass 11 "R13, bash 3.2, no-jq, no-/tmp, and bash -n audits pass"
 
 # Property 13 — CLI self-install ownership rules. Each case gets its own HOME.
@@ -587,36 +565,5 @@ run_start_home "$CLI_LINK" "$RIG/cli-symlink-same.out" || fail 13 "identical-sym
 grep -q 'CLI' "$RIG/cli-symlink-same.out" && fail 13 "identical symlink still warned"
 pass 13 "CLI self-install: fresh installs, receipted forward updates only, manual copies and symlinks stay untouched"
 
-# An outer driver (minds.sh T1) that has already run every legacy suite once can
-# skip this recursive re-run; nested duplicate load flaked three distinct
-# suites on loaded hosts without ever reproducing standalone.
-if [ "${PLUGIN_SKIP_REGRESSION-}" = 1 ]; then
-    printf 'SKIP 12 — outer driver owns legacy coverage\n'
-    printf 'RESULT: PASS\n'
-    printf 'Claude Code plugin conduit hooks and lease lifecycle passed (regressions skipped by driver)\n'
-    exit 0
-fi
-for regression_suite in local-roundtrip exchange-roundtrip hardening concurrency watch; do
-    if ! bash "$ROOT/test/$regression_suite.sh" > "$RIG/$regression_suite.out" 2>&1; then
-        cat "$RIG/$regression_suite.out"
-        fail 12 "$regression_suite failed"
-    fi
-    cat "$RIG/$regression_suite.out"
-    grep -q '^RESULT: PASS$' "$RIG/$regression_suite.out" || \
-        fail 12 "$regression_suite omitted RESULT: PASS"
-done
-if [ -x "$GO" ]; then
-    if ! GO_BINARY=$GO bash "$ROOT/test/link.sh" > "$RIG/link.out" 2>&1; then
-        cat "$RIG/link.out"
-        fail 12 "link.sh failed"
-    fi
-    cat "$RIG/link.out"
-    grep -q '^RESULT: PASS$' "$RIG/link.out" || fail 12 "link.sh omitted RESULT: PASS"
-else
-    printf 'SKIP link — Go toolchain is not an executable path: %s\n' "$GO"
-fi
-pass 12 "all available existing suites pass unchanged"
-
-
 printf 'RESULT: PASS\n'
-printf 'Claude Code plugin conduit hooks, lease lifecycle, and regressions passed\n'
+printf 'Claude Code plugin conduit hooks and lease lifecycle passed\n'

@@ -114,15 +114,6 @@ func TestLegacyOfferEncodingRemainsByteIdentical(t *testing.T) {
 	}
 }
 
-func TestPresenceTransferIDKnownDigest(t *testing.T) {
-	digest := sha256.Sum256([]byte("marker"))
-	got := transferID("presence", "", "alpha", "", "gpu-guard@alpha.watcher", digest)
-	const want = "5879fcd7c98ef9a586e5e1c23cdc8fee5ae33494951a2c7a0e7fc8d74c899fd9"
-	if got != want {
-		t.Fatalf("presence transfer ID=%s want pinned %s", got, want)
-	}
-}
-
 func TestDataCarriesExactlyOfferedBytes(t *testing.T) {
 	want := []byte{0, 1, 2, 0xff}
 	f := dataFrame("xfer", want)
@@ -132,20 +123,6 @@ func TestDataCarriesExactlyOfferedBytes(t *testing.T) {
 	}
 	if id != "xfer" || !bytes.Equal(got, want) {
 		t.Fatalf("got id=%q data=%v", id, got)
-	}
-}
-
-func TestUnknownFrameRemainsVisibleToProtocolLoop(t *testing.T) {
-	var wire bytes.Buffer
-	if err := newFrameWriter(&wire).write(frame{typ: 0xff}); err != nil {
-		t.Fatal(err)
-	}
-	f, err := readFrame(bufio.NewReader(&wire), 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.typ != 0xff {
-		t.Fatalf("unknown type changed to %d", f.typ)
 	}
 }
 

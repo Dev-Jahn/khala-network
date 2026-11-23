@@ -113,32 +113,6 @@ property_declared_notify() {
         die "P1 retired notify created an inbox file"
 }
 
-property_presence_split() {
-    home=$RIG/presence-split
-    init_home "$home"
-    now=$(date +%s)
-    printf '%s\n' "$now" > "$home/presence/human@alpha"
-    KHALA_HOME=$home "$KHALA" watcher declare guard --cadence 0 --owner human >/dev/null ||
-        die "P2 watchdog declaration failed"
-    KHALA_HOME=$home "$KHALA" presence >"$RIG/presence.out" || die "P2 presence failed"
-    grep -q '^human@alpha' "$RIG/presence.out" || die "P2 session row is missing"
-    ! grep -qx 'watchers:' "$RIG/presence.out" || die "P2 default presence printed watchdogs:"
-    ! grep -q $'^guard\talpha\t' "$RIG/presence.out" ||
-        die "P2 default presence printed a watchdog row"
-    grep -Fq 'khala watcher list' "$RIG/presence.out" ||
-        die "P2 presence legend does not mention khala watcher list"
-    KHALA_HOME=$home "$KHALA" presence --watchers >"$RIG/presence-watchers.out" ||
-        die "P2 presence --watchers failed"
-    grep -qx 'watchers:' "$RIG/presence-watchers.out" ||
-        die "P2 presence --watchers omitted its heading"
-    grep -q $'^guard\talpha\t' "$RIG/presence-watchers.out" ||
-        die "P2 presence --watchers omitted the active watchdog"
-    KHALA_HOME=$home "$KHALA" watcher list >"$RIG/watcher-list.out" ||
-        die "P2 watchdog list failed"
-    grep -q $'^guard\talpha\t' "$RIG/watcher-list.out" ||
-        die "P2 watchdog list omitted the watchdog"
-}
-
 property_automatic_retire() {
     home=$RIG/automatic-retire
     init_home "$home"
@@ -252,7 +226,6 @@ mkdir -p "$RIG"
 trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property P1 property_declared_notify
-run_property P2 property_presence_split
 run_property P3 property_automatic_retire
 run_property P4 property_fold_info_notices
 

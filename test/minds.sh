@@ -326,14 +326,6 @@ property_m7() {
     fi
 }
 
-property_m8() {
-    if ! GO_BINARY=$GO bash "$ROOT/test/link-minds.sh" \
-        >"$RIG/m8.out" 2>"$RIG/m8.err"; then
-        die "link-minds.sh suite failed: $(tail -n 8 "$RIG/m8.err" | tr '\n' ' ')"
-    fi
-    grep -q '^RESULT: PASS$' "$RIG/m8.out" || die "link-minds.sh suite omitted RESULT: PASS"
-}
-
 property_m9() {
     home=$RIG/m9-home
     init_home "$home" alpha
@@ -351,10 +343,9 @@ property_m9() {
     [ "$(sed -n 's/^Generation: //p' "$current_file")" = "$current" ] || die "Generation header differs from filename"
     [ "$(sed -n 's/^Session: //p' "$current_file")" = joined ] || die "Session header differs"
     [ "$(sed -n 's/^Node: //p' "$current_file")" = alpha ] || die "Node header differs"
-    [ "$(KHALA_HOME=$home "$KHALA" version)" = 'khala 0.9.12' ] || die "core CLI version is not 0.9.12"
-    grep -q '"version": "0.9.12"' "$ROOT/plugin/.claude-plugin/plugin.json" ||
-        die "plugin version is not 0.9.12"
-    grep -q '"hooks"' "$ROOT/plugin/.claude-plugin/plugin.json" && die "plugin manifest contains forbidden hooks key"
+    plugin_version=$(sed -n 's/^ *"version": "\([^"]*\)".*/\1/p' "$ROOT/plugin/.claude-plugin/plugin.json")
+    [ "$(KHALA_HOME=$home "$KHALA" version)" = "khala $plugin_version" ] ||
+        die "core CLI and plugin manifest disagree on the release version"
     return 0
 }
 
@@ -591,45 +582,6 @@ property_p8() {
     [ ! -e "$(archive_path "$home" khala alpha "$second")" ] || die "disable did not stop future capture"
 }
 
-property_t1() {
-    if [ "${MINDS_SKIP_REGRESSION-}" = 1 ]; then
-        printf 'SKIP T1 execution — focused M/P run\n'
-        return 0
-    fi
-    for suite in local-roundtrip exchange-roundtrip hardening watch concurrency plugin streams; do
-        if [ "$suite" = streams ]; then
-            # T1 has already run every legacy suite that streams property 9
-            # composes. Avoid recursively running that same set again under
-            # plugin/relay liveness load; all stream-specific properties still run.
-            STREAMS_SKIP_LEGACY=1 bash "$ROOT/test/$suite.sh" \
-                >"$RIG/t1-$suite.out" 2>"$RIG/t1-$suite.err"
-            suite_status=$?
-        elif [ "$suite" = plugin ]; then
-            # Same recursion cut for plugin property 12: T1 itself just ran
-            # the five legacy suites it would re-run. Plugin-specific
-            # properties (1-11, 13) still run in full.
-            PLUGIN_SKIP_REGRESSION=1 bash "$ROOT/test/$suite.sh" \
-                >"$RIG/t1-$suite.out" 2>"$RIG/t1-$suite.err"
-            suite_status=$?
-        else
-            bash "$ROOT/test/$suite.sh" >"$RIG/t1-$suite.out" 2>"$RIG/t1-$suite.err"
-            suite_status=$?
-        fi
-        if [ "$suite_status" -ne 0 ]; then
-            die "$suite regression failed: $(tail -n 4 "$RIG/t1-$suite.err" | tr '\n' ' ')"
-        fi
-        grep -q '^RESULT: PASS$' "$RIG/t1-$suite.out" || die "$suite omitted RESULT: PASS"
-    done
-    if [ -x "$GO" ]; then
-        GO_BINARY=$GO bash "$ROOT/test/link.sh" \
-            >"$RIG/t1-link.out" 2>"$RIG/t1-link.err" ||
-            die "link.sh regression failed: $(tail -n 4 "$RIG/t1-link.err" | tr '\n' ' ')"
-        grep -q '^RESULT: PASS$' "$RIG/t1-link.out" || die "link.sh omitted RESULT: PASS"
-    else
-        printf 'SKIP T1 link — Go toolchain unavailable\n'
-    fi
-}
-
 run_property() {
     number=$1
     title=$2
@@ -652,7 +604,6 @@ run_property M4 'retire 후 상태 보드에서 즉시 소거; 재발화만으�
 run_property M5 'freshness 경과 시 stale 명시 표기와 필드별 Declared 나이' property_m5
 run_property M6 '같은 세대·다른 바이트 = quarantine, 덮어쓰기 0' property_m6
 run_property M7 '세션 상태는 watch 비각성·inbox read 비출력·커서 무관·보관 노드 비대상' property_m7
-run_property M8 'protocol 1.2 링크 전파·협상·순서역전·경주·나이 가드' property_m8
 run_property M9 '3층 조인 표가 실파일과 일치' property_m9
 run_property P1 'capture 각 단계 kill — live만/live+archive/archive만, 소실 없음' property_p1
 run_property P2 '같은 Id 지연 재도착 — archive 중복 0' property_p2
@@ -662,7 +613,6 @@ run_property P5 'archive 실패·ENOSPC — live 조용한 삭제 0, degraded �
 run_property P6 'cat 병합 — dedup·정렬 유지·커서 불변' property_p6
 run_property P7 '늦은 enable — 현재 live 창만 capture, completeness 미주장' property_p7
 run_property P8 'disable — 기존 archive 잔존' property_p8
-run_property T1 '기존 7+1 스위트(streams.sh 포함) 무변 통과' property_t1
 
 if [ -n "$FAILURES" ]; then
     printf 'RESULT: FAIL properties%s\n' "$FAILURES"

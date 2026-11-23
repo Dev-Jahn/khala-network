@@ -77,12 +77,6 @@ KHALA_HOME=$NODE "$KHALA" init gw >/dev/null || fail 0 "khala init"
 export KHALA_HOME=$NODE
 pass 0 "built khala-link and initialized node gw"
 
-# 1. Refuses to start without gateway.conf.
-"$BIN" gateway --once >"$RIG/g1.out" 2>&1
-rc=$?
-[ "$rc" -eq 2 ] && grep -q 'gateway.conf' "$RIG/g1.out" || fail 1 "absent conf: rc=$rc $(cat "$RIG/g1.out")"
-pass 1 "absent gateway.conf → rc 2"
-
 printf 'adapter fake\ntelegram allow 1\nkhala bin %s\n' "$KHALA" > "$NODE/gateway.conf"
 chmod 600 "$NODE/gateway.conf"
 

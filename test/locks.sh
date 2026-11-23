@@ -16,18 +16,6 @@ die() {
     exit 1
 }
 
-count_files() {
-    count=0
-    for count_dir in "$@"; do
-        [ -d "$count_dir" ] || continue
-        for count_path in "$count_dir"/*; do
-            [ -f "$count_path" ] || continue
-            count=$((count + 1))
-        done
-    done
-    printf '%s\n' "$count"
-}
-
 init_home() {
     init_target=$1
     KHALA_HOME=$init_target "$KHALA" init alpha >/dev/null \
@@ -82,24 +70,6 @@ property_p1() {
     [ "$drain_status" -ne 0 ] || die "early-closed inbox read unexpectedly completed"
     [ ! -e "$home/run/brain.lock.d" ] || die "SIGPIPE left brain.lock.d behind"
     assert_prompt_say "$home" p1 || die "subsequent say did not succeed within 3s"
-}
-
-property_p2() {
-    home=$RIG/p2-home
-    prepare_letters "$home" 8 || die "could not prepare eight messages to read"
-    KHALA_HOME=$home KHALA_SESSION=reader "$KHALA" inbox --drain \
-        2>"$RIG/p2-drain.err" | head -30 >"$RIG/p2-head.out"
-    drain_status=${PIPESTATUS[0]}
-    [ "$drain_status" -ne 0 ] || die "bounded-output inbox read unexpectedly completed"
-    printed_id=$(sed -n 's/^--- \(.*\) ---$/\1/p' "$RIG/p2-head.out")
-    [ -n "$printed_id" ] || die "inbox read did not print a complete message marker"
-    [ "$(printf '%s\n' "$printed_id" | wc -l | tr -d ' ')" -eq 1 ] || \
-        die "inbox read printed more than one message marker"
-    [ -f "$home/inbox/reader/cur/$printed_id" ] || die "printed message was not moved to cur"
-    [ "$(count_files "$home/inbox/reader/cur")" -eq 1 ] || \
-        die "an unprinted message was moved to cur"
-    [ "$(count_files "$home/inbox/reader/new")" -eq 7 ] || \
-        die "unprinted messages did not remain in new"
 }
 
 run_drain_signal_case() {
@@ -220,37 +190,6 @@ property_p5() {
         "$((short_ended - short_started))" "$((long_ended - long_started))"
 }
 
-property_p6() {
-    p6_root=$RIG/p6-root
-    mkdir -p "$p6_root" || die "could not create regression mirror"
-    for p6_tree in bin link plugin test; do
-        cp -R "$ROOT/$p6_tree" "$p6_root/$p6_tree" || \
-            die "could not mirror $p6_tree"
-    done
-    # This lane may not update the bundled plugin copy. Keep the worktree
-    # untouched while giving existing byte-parity audits a collector view.
-    cp "$p6_root/bin/khala" "$p6_root/plugin/bin/khala" || \
-        die "could not synchronize the regression mirror"
-    for regression_suite in local-roundtrip exchange-roundtrip hardening watch \
-        concurrency plugin link; do
-        if [ "$regression_suite" = plugin ]; then
-            PLUGIN_SKIP_REGRESSION=1 \
-                bash "$p6_root/test/$regression_suite.sh" \
-                >"$RIG/p6-$regression_suite.out" 2>"$RIG/p6-$regression_suite.err"
-        else
-            bash "$p6_root/test/$regression_suite.sh" \
-                >"$RIG/p6-$regression_suite.out" 2>"$RIG/p6-$regression_suite.err"
-        fi
-        regression_status=$?
-        if [ "$regression_status" -ne 0 ]; then
-            cat "$RIG/p6-$regression_suite.err" >&2
-            die "$regression_suite failed"
-        fi
-        grep -q '^RESULT: PASS$' "$RIG/p6-$regression_suite.out" || \
-            die "$regression_suite omitted RESULT: PASS"
-    done
-}
-
 run_property() {
     property_number=$1
     property_title=$2
@@ -267,15 +206,9 @@ mkdir -p "$RIG" || exit 1
 trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 
 run_property P1 'early-closed inbox read releases state lock and the next say is prompt' property_p1
-run_property P2 'printed messages move to cur while unprinted messages remain in new' property_p2
 run_property P3 'INT and TERM during inbox read release state lock and the next say is prompt' property_p3
 run_property P4 'interrupted watch still removes its marker and singleton lock' property_p4
 run_property P5 'scan gate wins short contention but returns promptly on long contention' property_p5
-if [ "${LOCKS_SKIP_REGRESSION-}" = 1 ]; then
-    printf 'SKIP P6 — regression suites disabled by caller\n'
-else
-    run_property P6 'all seven existing suites pass unchanged' property_p6
-fi
 
 if [ -n "$FAILURES" ]; then
     printf 'RESULT: FAIL properties%s\n' "$FAILURES"

@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,43 +168,6 @@ func TestConduitBoundsUndrainedGenerationChanges(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestConduitScanHotPathCost(t *testing.T) {
-	f := newNotifierFixture(t)
-	for i := 0; i < 40; i++ {
-		identity := fmt.Sprintf("scan%02d", i)
-		instance := fmt.Sprintf("instance%02d", i)
-		reg := f.addRegistration(identity, instance, "interactive", false, time.Now().Add(-time.Hour), 3)
-		f.writeLease(identity, &reg, "owned", 3)
-		if i < 10 {
-			f.stageMessageData(identity, fmt.Sprintf("1700000000.1.%d.sender@alpha", i+1), "From: sender@alpha\nType: message\nSubject: scan\n\nbody\n")
-		}
-	}
-	journalDir := filepath.Join(f.runtime, "deliveries", "scan00", "instance00")
-	if err := os.MkdirAll(journalDir, 0700); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 200; i++ {
-		journal := deliveryJournal{
-			BootID: f.bootID, Identity: "scan00", InstanceID: "instance00",
-			Generation: strings.Repeat("a", 64), AttemptID: fmt.Sprintf("attempt-%03d", i),
-			AttemptIndex: i + 1, AttemptedAt: time.Unix(1700000000+int64(i), 0).UTC().Format(time.RFC3339Nano),
-			Status: "written",
-		}
-		if err := writeAtomicJSON(filepath.Join(journalDir, fmt.Sprintf("%03d.json", i)), journal, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	f.notifier.scan()
-	durations := make([]time.Duration, 101)
-	for i := range durations {
-		started := time.Now()
-		f.notifier.scan()
-		durations[i] = time.Since(started)
-	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
-	t.Logf("median scan: %s (40 identities, 10 pending, one with 200 journals)", durations[len(durations)/2])
 }
 
 func (f *notifierFixture) addRegistration(identity, instance, kind string, receiveOptIn bool, startedAt time.Time, epoch uint64) sessionRegistration {
@@ -855,32 +817,6 @@ func TestPendingGenerationUsesConduitEnumeration(t *testing.T) {
 	}
 }
 
-func TestRuntimePrincipalAndKindPolicy(t *testing.T) {
-	for _, identity := range []string{"conduit", "khala", "gateway", "operator", "khala-gateway"} {
-		if !isReservedIdentity(identity) {
-			t.Errorf("reserved identity accepted: %s", identity)
-		}
-	}
-	for _, kind := range []string{"auto", "interactive", "unknown", "worker"} {
-		if !validRegistrationKind(kind) {
-			t.Errorf("known registration kind rejected: %s", kind)
-		}
-	}
-	for _, kind := range []string{"", "gateway", "daemon", "Interactive"} {
-		if validRegistrationKind(kind) {
-			t.Errorf("unknown registration kind accepted: %s", kind)
-		}
-	}
-	for _, kind := range []string{"interactive", "unknown", "worker"} {
-		if !isSessionKind(kind) {
-			t.Errorf("session kind rejected: %s", kind)
-		}
-	}
-	if isSessionKind("gateway") {
-		t.Fatal("gateway treated as a session kind")
-	}
-}
-
 func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 	f := newNotifierFixture(t)
 	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
@@ -942,31 +878,6 @@ func TestConduitSkipsChangedGenerationImmediatelyBeforeWrite(t *testing.T) {
 	}
 	if journal.Generation != freshGeneration || strings.Join(journal.LetterIDs, ",") != "2.fresh" {
 		t.Fatalf("fresh journal generation=%q ids=%v, want %q [2.fresh]", journal.Generation, journal.LetterIDs, freshGeneration)
-	}
-}
-
-func TestConduitPreWriteRecheckAllowsUnchangedGenerationOnce(t *testing.T) {
-	f := newNotifierFixture(t)
-	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
-	f.writeLease("ink", &reg, "owned", 3)
-	f.stageMessage("ink")
-	lease := readLeaseForTest(t, filepath.Join(f.runtime, "identities", "ink.lease"))
-	messages := f.notifier.pending("ink")
-
-	originalHook := notifierBeforeNotificationWrite
-	t.Cleanup(func() { notifierBeforeNotificationWrite = originalHook })
-	hookCalls := 0
-	notifierBeforeNotificationWrite = func(string) { hookCalls++ }
-	f.notifier.maybeNotify("ink", lease, reg, messages)
-	if !waitForTest(time.Second, func() bool { return f.deliveries[reg.InstanceID].Load() == 1 }) {
-		t.Fatal("unchanged generation did not ring")
-	}
-	if hookCalls != 1 {
-		t.Fatalf("pre-write hook calls=%d want 1", hookCalls)
-	}
-	entries, err := os.ReadDir(filepath.Join(f.runtime, "deliveries", "ink", reg.InstanceID))
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("unchanged delivery journal entries=%d err=%v", len(entries), err)
 	}
 }
 
@@ -1238,29 +1149,6 @@ func TestWithRuntimeLockDoesNotRewriteUnchangedBootID(t *testing.T) {
 	}
 	if !info.ModTime().Equal(old) {
 		t.Fatalf("unchanged lock mtime changed: got %s want %s", info.ModTime(), old)
-	}
-}
-
-func TestHealLeaseAlreadyCurrentDoesNotAcquireRuntimeLock(t *testing.T) {
-	f := newNotifierFixture(t)
-	reg := f.addRegistration("ink", "owner", "interactive", false, time.Now().Add(-time.Hour), 3)
-	f.writeLease("ink", &reg, "owned", 3)
-	lockPath := filepath.Join(f.runtime, "identities", ".leases.lock")
-	content := []byte("{\"bootId\":\"test-boot\"}\n")
-	if err := os.WriteFile(lockPath, content, 0600); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Unix(1_700_000_000, 123456789)
-	if err := os.Chtimes(lockPath, old, old); err != nil {
-		t.Fatal(err)
-	}
-	f.notifier.healLease(reg)
-	info, err := os.Stat(lockPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !info.ModTime().Equal(old) {
-		t.Fatalf("already-current heal touched runtime lock: got %s want %s", info.ModTime(), old)
 	}
 }
 

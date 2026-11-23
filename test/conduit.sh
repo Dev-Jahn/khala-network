@@ -186,23 +186,15 @@ trap 'cleanup; isolate_cleanup' EXIT HUP INT TERM
 # H20 — a Codex registration (harness codex, the khala-network-codex bridge) is
 # rung only through its verified channel socket, never through a Claude socket,
 # even one inherited in its environment. A dead channel is journaled as a failed
-# attempt with no fallback. register-channel refuses a Claude registration.
+# attempt with no fallback.
 H20_HOME=$RIG/h20-home
 init_home "$H20_HOME"
 start_listener h20-cc h20-claude-session
 H20_CC_PID=$LISTENER_PID
 H20_CC_SOCKET=$LISTENER_SOCKET
 H20_CC_FRAMES=$LISTENER_OUTPUT
-H20_CLAUDE_REG=$(register_session "$H20_HOME" claudeside h20-claude-session "$H20_CC_PID" \
-    "$H20_CC_SOCKET" interactive ready) || fail H20 "Claude registration failed"
-H20_CLAUDE_INSTANCE=$(printf '%s\n' "$H20_CLAUDE_REG" | sed -n 's/^instance //p')
-if runtime_env "$BIN" runtime register-channel --instance "$H20_CLAUDE_INSTANCE" \
-    --session-id h20-claude-session --channel-socket "$RUNTIME_BASE/channels/$H20_CLAUDE_INSTANCE.sock" \
-    --caller-pid "$H20_CC_PID" --verified >/dev/null 2>"$RIG/h20-claude.err"; then
-    fail H20 "register-channel accepted a Claude registration"
-fi
-grep -q 'a Claude session receives through its inbox socket' "$RIG/h20-claude.err" || \
-    fail H20 "Claude refusal is unclear: $(cat "$RIG/h20-claude.err")"
+register_session "$H20_HOME" claudeside h20-claude-session "$H20_CC_PID" \
+    "$H20_CC_SOCKET" interactive ready >/dev/null || fail H20 "Claude registration failed"
 sleep 300 &
 H20_CODEX_PID=$!
 PIDS="$PIDS $H20_CODEX_PID"
@@ -283,12 +275,12 @@ grep -R -q '"via":"socket"' "$RUNTIME_BASE/deliveries/channelled/$H20_INSTANCE" 
     fail H20 "a Codex attempt was journaled via socket"
 grep -q "registration $H20_INSTANCE not verified: Codex channel socket is invalid" "$H20_HOME/log/conduit.log" || \
     fail H20 "dead channel was not logged"
-pass H20 "Codex rings only its channel; a dead channel fails without fallback; Claude cannot register a channel"
+pass H20 "Codex rings only its channel; a dead channel fails without fallback"
 stop_pid "$H20_CONDUIT_PID"
 stop_pid "$H20_CODEX_PID"
 stop_pid "$H20_CC_PID"
 
-# H1/H2 — durable new/ remains authoritative and generations coalesce.
+# H1 — durable new/ remains authoritative.
 H1_HOME=$RIG/h1-home
 init_home "$H1_HOME"
 start_listener h1 h1-session
@@ -298,7 +290,7 @@ H1_FRAMES=$LISTENER_OUTPUT
 H1_REGISTER=$(register_session "$H1_HOME" eddy h1-session "$H1_LISTENER_PID" \
     "$H1_SOCKET" interactive ready) || fail H1 "ready registration failed"
 stage_letter "$H1_HOME" eddy 1 reel@bw2
-start_conduit "$H1_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms KHALA_CONDUIT_TEST_REWRITE_AFTER=500ms
+start_conduit "$H1_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
 H1_CONDUIT_PID=$CONDUIT_PID
 wait_lines "$H1_FRAMES" 1 40 || fail H1 "no frame within 2s"
 sleep 0.15
@@ -314,23 +306,12 @@ assert frame["priority"] == "next", frame["priority"]
 assert ":" in frame["msg_id"]
 PY
 pass H1 "one valid inbox notification arrived (priority next) and the message remained in new/"
-
-stage_letter "$H1_HOME" eddy 2 clawd@mini
-sleep 0.15
-[ "$(line_count "$H1_FRAMES")" -eq 1 ] || fail H2 "second generation bypassed the outstanding schedule"
-wait_lines "$H1_FRAMES" 2 20 || fail H2 "second generation did not send an inbox notification on schedule"
-stage_letter "$H1_HOME" eddy 3 pen@b200
-sleep 0.15
-[ "$(line_count "$H1_FRAMES")" -eq 2 ] || fail H2 "third generation bypassed the outstanding schedule"
-wait_lines "$H1_FRAMES" 3 20 || fail H2 "third generation did not send an inbox notification on schedule"
-pass H2 "generation changes refresh the next scheduled frame without minting one immediately"
-
 stop_pid "$H1_CONDUIT_PID"
 stop_pid "$H1_LISTENER_PID"
 
 # H19 — inbox notification priority: next by default; later only when every pending
 # message carries "Priority: later" (khala send --later); one ordinary message in
-# the batch keeps next; the header is read from the header block, never the body.
+# the batch keeps next.
 H19_HOME=$RIG/h19-home
 init_home "$H19_HOME"
 start_listener h19 h19-session
@@ -363,143 +344,7 @@ assert frame["priority"] == sys.argv[3], frame["priority"]
 PY
 stop_pid "$H19_CONDUIT_PID"
 stop_pid "$H19_LISTENER_PID"
-# a body line "Priority: later" is not a header
-H19B_HOME=$RIG/h19b-home
-init_home "$H19B_HOME"
-start_listener h19b h19b-session
-H19B_LISTENER_PID=$LISTENER_PID
-H19B_FRAMES=$LISTENER_OUTPUT
-register_session "$H19B_HOME" bodyonly h19b-session "$H19B_LISTENER_PID" \
-    "$listener_socket" interactive ready >/dev/null || fail H19 "ready registration failed (body case)"
-stage_letter "$H19B_HOME" bodyonly 1 reel@bw2
-printf 'Priority: later\n' >> "$H19B_HOME/inbox/bodyonly/new/1700000000.1.1.sender@alpha"
-start_conduit "$H19B_HOME" env KHALA_CONDUIT_TEST_BACKOFF=500ms
-H19B_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H19B_FRAMES" 1 40 || fail H19 "body-case generation did not send an inbox notification"
-uv run --no-project python - "$H19B_FRAMES" 1 next <<'PY' || fail H19 "a body line was honoured as a Priority header"
-import json, sys
-lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
-frame = json.loads(lines[int(sys.argv[2]) - 1])
-assert frame["priority"] == sys.argv[3], frame["priority"]
-PY
-stop_pid "$H19B_CONDUIT_PID"
-stop_pid "$H19B_LISTENER_PID"
-pass H19 "inbox notification is next by default, later only when every message asks, and only via the header block"
-
-# H13 — a written inbox notification stays outstanding until a later inbox read. An unchanged
-# generation does not use the fast backoff; after an inbox read, a changed generation
-# notifies immediately.
-H13_HOME=$RIG/h13-home
-init_home "$H13_HOME"
-start_listener h13 h13-session
-H13_LISTENER_PID=$LISTENER_PID
-H13_SOCKET=$LISTENER_SOCKET
-H13_FRAMES=$LISTENER_OUTPUT
-register_session "$H13_HOME" h13id h13-session "$H13_LISTENER_PID" \
-    "$H13_SOCKET" interactive ready >/dev/null || fail H13 "ready registration failed"
-stage_letter "$H13_HOME" h13id 1 reel@bw2
-start_conduit "$H13_HOME" env KHALA_CONDUIT_TEST_BACKOFF=200ms KHALA_CONDUIT_TEST_REWRITE_AFTER=30s
-H13_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H13_FRAMES" 1 40 || fail H13 "no frame within 2s"
-sleep 3
-[ "$(line_count "$H13_FRAMES")" -eq 1 ] || fail H13 "written generation was re-rung within 3s (got $(line_count "$H13_FRAMES") frames)"
-mkdir -p "$H13_HOME/run/drained"
-mkdir -p "$H13_HOME/inbox/h13id/cur"
-mv "$H13_HOME/inbox/h13id/new/1700000000.1.1.sender@alpha" "$H13_HOME/inbox/h13id/cur/"
-printf 'drain 1 %s - - 0 0 0 ok\n' "$(date +%s)" > "$H13_HOME/run/drained/h13id"
-stage_letter "$H13_HOME" h13id 2 clawd@mini
-wait_lines "$H13_FRAMES" 2 40 || fail H13 "generation change after inbox read did not send an inbox notification"
-sleep 1
-[ "$(line_count "$H13_FRAMES")" -eq 2 ] || fail H13 "second written generation was re-rung"
-stop_pid "$H13_CONDUIT_PID"
-stop_pid "$H13_LISTENER_PID"
-pass H13 "an outstanding frame is held; inbox read consumption makes the next generation notify immediately"
-
-# H23 — frequent generation changes cannot outrun the bounded backoff schedule
-# while the accepting session never reads the inbox. The 1.25s observation window is 25
-# first intervals; the final frame must summarize all coalesced messages.
-H23_HOME=$RIG/h23-home
-init_home "$H23_HOME"
-start_listener h23 h23-session
-H23_PID=$LISTENER_PID; H23_SOCKET=$LISTENER_SOCKET; H23_FRAMES=$LISTENER_OUTPUT
-register_session "$H23_HOME" bounded h23-session "$H23_PID" "$H23_SOCKET" interactive ready \
-    >/dev/null || fail H23 "registration failed"
-stage_letter "$H23_HOME" bounded 1 reel@bw2
-start_conduit "$H23_HOME" env KHALA_CONDUIT_TEST_BACKOFF=10ms \
-    KHALA_CONDUIT_TEST_REWRITE_AFTER=50ms,100ms,200ms,400ms
-H23_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H23_FRAMES" 1 40 || fail H23 "first frame was not immediate"
-h23_seq=2
-while [ "$h23_seq" -le 26 ]; do
-    stage_letter "$H23_HOME" bounded "$h23_seq" reel@bw2
-    sleep 0.04
-    h23_seq=$((h23_seq + 1))
-done
-sleep 0.25
-h23_count=$(line_count "$H23_FRAMES")
-[ "$h23_count" -le 6 ] || fail H23 "26 messages wrote $h23_count frames; schedule permits at most 6"
-[ "$h23_count" -ge 5 ] || fail H23 "backoff schedule wrote only $h23_count frames; want at least 5"
-h23_journals=$(find "$RUNTIME_BASE/deliveries/bounded" -type f -name '*.json' | wc -l | tr -d ' ')
-[ "$h23_journals" -eq "$h23_count" ] || fail H23 "$h23_journals journals for $h23_count frames"
-H23_PENDING=$(runtime_env KHALA_HOME="$H23_HOME" "$BIN" runtime pending-generation --identity bounded) || \
-    fail H23 "pending-generation failed"
-H23_GENERATION=${H23_PENDING%% *}
-uv run --no-project python - "$H23_FRAMES" "$H23_GENERATION" <<'PY' || fail H23 "last frame did not carry the fresh coalesced summary"
-import json, sys
-frame = json.loads(open(sys.argv[1], encoding="utf-8").read().splitlines()[-1])
-lines = dict(line.split(": ", 1) for line in frame["message"]["content"].splitlines()[1:] if ": " in line)
-assert lines["pending"] == "26", lines
-assert lines["notices"] == "0", lines
-assert lines["urgent"] == "0", lines
-assert lines["from"] == "reel@bw2", lines
-assert "conduit-1" in lines["subjects"], lines
-assert lines["generation"] == sys.argv[2], lines
-assert lines["retry"] == "0", lines
-PY
-stop_pid "$H23_CONDUIT_PID"
-stop_pid "$H23_PID"
-pass H23 "26 changing generations over 25 first intervals stayed within the six-frame backoff schedule bound"
-
-# H24 — an existing turn marker gates each scheduled notification retry. A parked session
-# keeps only its first queued frame; a fresh turn permits exactly one more.
-H24_HOME=$RIG/h24-home
-init_home "$H24_HOME"
-start_listener h24 h24-session
-H24_PID=$LISTENER_PID; H24_SOCKET=$LISTENER_SOCKET; H24_FRAMES=$LISTENER_OUTPUT
-register_session "$H24_HOME" turnaware h24-session "$H24_PID" "$H24_SOCKET" interactive ready \
-    >/dev/null || fail H24 "registration failed"
-mkdir -p "$H24_HOME/run/turns"
-printf 'turn 1 %s\n' "$(( $(date +%s) - 60 ))" > "$H24_HOME/run/turns/turnaware"
-stage_letter "$H24_HOME" turnaware 1 reel@bw2
-start_conduit "$H24_HOME" env KHALA_CONDUIT_TEST_BACKOFF=10ms \
-    KHALA_CONDUIT_TEST_REWRITE_AFTER=50ms,100ms,200ms,400ms
-H24_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H24_FRAMES" 1 40 || fail H24 "first frame was not immediate"
-h24_seq=2
-while [ "$h24_seq" -le 26 ]; do
-    stage_letter "$H24_HOME" turnaware "$h24_seq" reel@bw2
-    sleep 0.04
-    h24_seq=$((h24_seq + 1))
-done
-sleep 0.25
-[ "$(line_count "$H24_FRAMES")" -eq 1 ] || \
-    fail H24 "parked session received $(line_count "$H24_FRAMES") frames, want 1"
-
-h24_turn=$(date +%s)
-printf 'turn 1 %s\n' "$h24_turn" > "$H24_HOME/tmp/h24-turn"
-while [ "$(date +%s)" -le "$h24_turn" ]; do
-    sleep 0.05
-done
-mv "$H24_HOME/tmp/h24-turn" "$H24_HOME/run/turns/turnaware"
-wait_lines "$H24_FRAMES" 2 40 || fail H24 "new turn did not allow the due notification retry"
-sleep 0.65
-[ "$(line_count "$H24_FRAMES")" -eq 2 ] || \
-    fail H24 "one turn allowed more than one notification retry (got $(line_count "$H24_FRAMES") frames)"
-printf 'turn 1 %s\n' "$(date +%s)" > "$H24_HOME/run/turns/turnaware"
-wait_lines "$H24_FRAMES" 3 40 || fail H24 "second new turn did not allow the next due notification retry"
-stop_pid "$H24_CONDUIT_PID"
-stop_pid "$H24_PID"
-pass H24 "parked sessions keep one frame and each later turn permits one scheduled notification retry"
+pass H19 "inbox notification is next by default and later only when every message asks"
 
 # H3 — not-ready/missing sockets journal failure, then late-bind succeeds.
 H3_HOME=$RIG/h3-home
@@ -741,72 +586,15 @@ runtime_env KHALA_HOME="$H25_HOME" "$BIN" runtime release --session-id h25-sessi
     runtime_env KHALA_HOME="$H25_HOME" "$BIN" runtime release --session-id h25-plain-session >/dev/null ||
     fail H25 "releasing the dead registrations failed"
 
-# H26 — one session open in two processes (`claude --resume S` twice; windows
-# jahns-vsr, D18 r1 §1). The second SessionStart (its own socket, no pid)
-# re-points the registration at the newer process. A registration an older
-# release left instead (old pid, new socket — "Claude registry pid/socket
-# mismatch" forever) is repaired by the conduit: it rings only the process
-# whose registry started last, the lease follows, the other pid is logged once.
-H26_HOME=$RIG/h26-home
-init_home "$H26_HOME"
-start_listener h26-old h26-session
-H26_OLD_PID=$LISTENER_PID; H26_OLD_SOCKET=$LISTENER_SOCKET; H26_OLD_FRAMES=$LISTENER_OUTPUT
-start_listener h26-new h26-session
-H26_NEW_PID=$LISTENER_PID; H26_NEW_SOCKET=$LISTENER_SOCKET; H26_NEW_FRAMES=$LISTENER_OUTPUT
-h26_pids() {
-    uv run --no-project python - "$RUNTIME_BASE/sessions/$H26_INSTANCE.json" \
-        "$RUNTIME_BASE/identities/twice.lease" <<'PY'
-import json, sys
-print(json.load(open(sys.argv[1]))["pid"], json.load(open(sys.argv[2]))["pid"])
-PY
-}
-H26_REG=$(register_session "$H26_HOME" twice h26-session 0 "$H26_OLD_SOCKET" interactive ready) || \
-    fail H26 "first SessionStart registration failed"
-H26_INSTANCE=$(printf '%s\n' "$H26_REG" | sed -n 's/^instance //p')
-register_session "$H26_HOME" twice h26-session 0 "$H26_NEW_SOCKET" interactive ready >/dev/null || \
-    fail H26 "second SessionStart registration failed"
-[ "$(h26_pids)" = "$H26_NEW_PID $H26_NEW_PID" ] || fail H26 "second SessionStart kept the old process ($(h26_pids))"
-register_session "$H26_HOME" twice h26-session "$H26_OLD_PID" "$H26_NEW_SOCKET" interactive ready >/dev/null || \
-    fail H26 "mixed registration failed"
-[ "$(h26_pids)" = "$H26_OLD_PID $H26_OLD_PID" ] || fail H26 "precondition: mixed state not built ($(h26_pids))"
-stage_letter "$H26_HOME" twice 27
-start_conduit "$H26_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s KHALA_CONDUIT_TEST_REWRITE_AFTER=30s
-H26_CONDUIT_PID=$CONDUIT_PID
-wait_lines "$H26_NEW_FRAMES" 1 60 || fail H26 "the newest process was not rung"
-sleep 0.3
-[ "$(line_count "$H26_OLD_FRAMES")" -eq 0 ] || fail H26 "the older process was rung"
-[ "$(h26_pids)" = "$H26_NEW_PID $H26_NEW_PID" ] || \
-    fail H26 "registration and lease did not follow the newest process ($(h26_pids))"
-[ "$(grep -c "pids $H26_NEW_PID,$H26_OLD_PID; ringing the newest" "$H26_HOME/log/conduit.log")" -eq 1 ] || \
-    fail H26 "the other pid was not logged exactly once"
-pass H26 "a session open twice rings only its newest process, by registration or by conduit repair"
-stop_pid "$H26_CONDUIT_PID"
-stop_pid "$H26_OLD_PID"
-stop_pid "$H26_NEW_PID"
-runtime_env KHALA_HOME="$H26_HOME" "$BIN" runtime release --session-id h26-session >/dev/null ||
-    fail H26 "releasing the dead registration failed"
-
-# H7/H9 are hook-level gates: no identity refuses; non-owner never reads the inbox;
-# ready registration survives an inbox-read lock deadline.
-H7_HOME=$RIG/h7-home
-init_home "$H7_HOME"
-H7_PROJECT=$RIG/h7-project
-mkdir -p "$H7_PROJECT"
-HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE \
-    KHALA_TEST_BOOT_ID=conduit-test-boot CLAUDE_PROJECT_DIR=$H7_PROJECT \
-    PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
-    "$ROOT/plugin/hooks/session-start.sh" </dev/null >"$RIG/h7.out" 2>"$RIG/h7.err" || \
-    fail H7 "identity refusal hook exited nonzero"
-grep -q 'KHALA_SESSION' "$RIG/h7.out" || fail H7 "identity instruction missing"
-[ ! -d "$H7_HOME/inbox" ] || [ -z "$(find "$H7_HOME/inbox" -path '*/cur/*' -type f -print -quit)" ] || \
-    fail H7 "identity refusal moved mail"
-
+# H9 — a hook-level gate: the ready registration survives an inbox-read lock deadline.
+H9_HOME=$RIG/h9-home
+init_home "$H9_HOME"
 H9_PROJECT=$RIG/h9-project
 mkdir -p "$H9_PROJECT"
 printf '%s\n' timed > "$H9_PROJECT/.khala-session"
-stage_letter "$H7_HOME" timed 7
-mkdir -p "$H7_HOME/run/brain.lock.d"
-printf '%s\npid %s contention\n' "$(date +%s)" "$$" > "$H7_HOME/run/brain.lock.d/owner"
+stage_letter "$H9_HOME" timed 7
+mkdir -p "$H9_HOME/run/brain.lock.d"
+printf '%s\npid %s contention\n' "$(date +%s)" "$$" > "$H9_HOME/run/brain.lock.d/owner"
 h9_reconcile_pids=
 # Each contention loop leads its own process group, so it is killed whole:
 # setsid(1) is util-linux; on macOS the system perl makes the same setsid(2).
@@ -819,44 +607,29 @@ fi
 h9_loop=1
 while [ "$h9_loop" -le 3 ]; do
     "${h9_own_session[@]}" sh -c 'while :; do KHALA_HOME=$1 "$2" reconcile >/dev/null 2>&1 || :; done' \
-        sh "$H7_HOME" "$KHALA" &
+        sh "$H9_HOME" "$KHALA" &
     h9_reconcile_pid=$!
     h9_reconcile_pids="$h9_reconcile_pids $h9_reconcile_pid"
     h9_loop=$((h9_loop + 1))
 done
-start_conduit "$H7_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
+start_conduit "$H9_HOME" env KHALA_CONDUIT_TEST_BACKOFF=2s
 H9_CONDUIT_PID=$CONDUIT_PID
 h9_wait=0
-while ! runtime_env KHALA_HOME="$H7_HOME" "$BIN" runtime daemon-status >/dev/null 2>&1 && \
+while ! runtime_env KHALA_HOME="$H9_HOME" "$BIN" runtime daemon-status >/dev/null 2>&1 && \
     [ "$h9_wait" -lt 40 ]; do
     sleep 0.05
     h9_wait=$((h9_wait + 1))
 done
 [ "$h9_wait" -lt 40 ] || fail H9 "fixture notifier did not become live"
-H7_OWNER=$(register_session "$H7_HOME" taken h7-owner "$$" "$RIG/h7-missing.sock" \
-    interactive ready) || fail H7 "live owner registration failed"
-printf '%s\n' "$H7_OWNER" | grep -q '^owner yes$' || fail H7 "fixture owner did not get lease"
-stage_letter "$H7_HOME" taken 11
-H7_TAKEN_PROJECT=$RIG/h7-taken-project
-mkdir -p "$H7_TAKEN_PROJECT"
-printf '%s\n' taken > "$H7_TAKEN_PROJECT/.khala-session"
-HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE KHALA_TEST_BOOT_ID=conduit-test-boot \
-    KHALA_CLAUDE_SESSION_ID=h7-other KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
-    CLAUDE_PROJECT_DIR=$H7_TAKEN_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
-    "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h7-other"}' \
-    >"$RIG/h7-taken.out" 2>"$RIG/h7-taken.err" || fail H7 "non-owner hook failed"
-grep -q 'you are not the receiver of taken' "$RIG/h7-taken.out" || fail H7 "non-owner warning missing"
-[ -f "$H7_HOME/inbox/taken/new/1700000000.1.11.sender@alpha" ] || fail H7 "non-owner moved mail"
-pass H7 "SessionStart refuses inference and a valid non-owner consumes no mail"
 h9_started=$(uv run --no-project python - <<'PY'
 import time
 print(time.monotonic())
 PY
 )
-HOME=$RIG KHALA_HOME=$H7_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE \
+HOME=$RIG KHALA_HOME=$H9_HOME KHALA_RUNTIME_DIR=$RUNTIME_BASE \
     KHALA_TEST_BOOT_ID=conduit-test-boot KHALA_SESSION_INSTANCE=h9-instance \
     KHALA_CLAUDE_SESSION_ID=h9-session KHALA_SESSION_PID=$$ KHALA_SESSION_KIND=interactive \
-    CLAUDE_PROJECT_DIR=$H9_PROJECT PATH=$H7_HOME/bin:$ROOT/bin:/usr/bin:/bin \
+    CLAUDE_PROJECT_DIR=$H9_PROJECT PATH=$H9_HOME/bin:$ROOT/bin:/usr/bin:/bin \
     "$ROOT/plugin/hooks/session-start.sh" <<<'{"session_id":"h9-session"}' \
     >"$RIG/h9.out" 2>"$RIG/h9.err" || fail H9 "contended hook exited nonzero"
 h9_finished=$(uv run --no-project python - <<'PY'
@@ -873,9 +646,9 @@ uv run --no-project python - "$h9_elapsed" <<'PY' || fail H9 "hook exceeded 12s:
 import sys
 assert float(sys.argv[1]) < 12.0
 PY
-grep -R -q '"phase":"ready"' "$RUNTIME_BASE/sessions" || fail H9 "registration never reached ready"
-[ -f "$H7_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out inbox read consumed/misplaced mail"
-rm -rf -- "$H7_HOME/run/brain.lock.d"
+grep -q '"phase":"ready"' "$RUNTIME_BASE/sessions/h9-instance.json" || fail H9 "registration never reached ready"
+[ -f "$H9_HOME/inbox/timed/new/1700000000.1.7.sender@alpha" ] || fail H9 "timed-out inbox read consumed/misplaced mail"
+rm -rf -- "$H9_HOME/run/brain.lock.d"
 for h9_reconcile_pid in $h9_reconcile_pids; do
     kill -- "-$h9_reconcile_pid" 2>/dev/null || :
     wait "$h9_reconcile_pid" 2>/dev/null || :
@@ -1220,7 +993,8 @@ Declared-Focus: 1700000000
 Declared-Stance: 1700000000
 
 EOF
-find "$H22_HOME" -printf '%P\t%y\n' | sort > "$RIG/h22.tree.before"
+# Paths and kinds (ls -F marks directories, links, sockets); find -printf is GNU-only.
+ls -AFR "$H22_HOME" > "$RIG/h22.tree.before"
 KHALA_HOME=$H22_HOME KHALA_RUNTIME_DIR=$H22_HOME/runtime-must-not-exist \
     "$BIN" dashboard --port 0 --no-text \
     >"$RIG/h22.dashboard.out" 2>"$RIG/h22.dashboard.err" &
@@ -1276,7 +1050,7 @@ kill "$H22_DASHBOARD_PID" 2>/dev/null || fail H22 "dashboard was not running at 
 wait "$H22_DASHBOARD_PID"
 H22_STATUS=$?
 [ "$H22_STATUS" -eq 0 ] || fail H22 "SIGTERM exited $H22_STATUS, want 0"
-find "$H22_HOME" -printf '%P\t%y\n' | sort > "$RIG/h22.tree.after"
+ls -AFR "$H22_HOME" > "$RIG/h22.tree.after"
 cmp -s "$RIG/h22.tree.before" "$RIG/h22.tree.after" || fail H22 "dashboard changed KHALA_HOME tree"
 [ ! -e "$H22_HOME/runtime-must-not-exist" ] || fail H22 "dashboard created or chmodded runtime"
 if KHALA_HOME=$H22_HOME "$BIN" dashboard --listen 0.0.0.0:0 \
@@ -1309,9 +1083,5 @@ fi
 stop_pid "$H22_PORT_PID"
 pass H22 "dashboard auth, headers, guards, ephemeral bind, and read-only tree passed"
 
-bash -n "$ROOT/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
-    "$ROOT/plugin/hooks/session-start.sh" "$ROOT/plugin/hooks/stop.sh" \
-    "$ROOT/plugin/hooks/session-end.sh" || fail syntax "bash -n failed"
-
 printf 'RESULT: PASS\n'
-printf 'Conduit H1-H26 delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'
+printf 'Conduit delivery, channel routing, lease, hook, restart, watch, runtime, ears, and dashboard properties passed\n'

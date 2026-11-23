@@ -388,16 +388,45 @@ prompt_line=$(printf '%s\t%s' "$prompt_id" 'sender@alpha')
 grep -Fqx "$prompt_line" "$TEST_DIR/prompt-watch.out" || fail 13 "prompt output omitted Id or From"
 pass 13 "without a fresh link a landed letter wakes the watch in ${prompt_latency}s at the default interval"
 
-# 14. All existing suites remain green without modification.
-for regression_suite in local-roundtrip exchange-roundtrip hardening; do
-    if ! bash "$ROOT/test/$regression_suite.sh" \
-        >"$TEST_DIR/$regression_suite.out" 2>"$TEST_DIR/$regression_suite.err"; then
-        fail 14 "$regression_suite regression failed: $(tr '\n' ' ' < "$TEST_DIR/$regression_suite.err")"
-    fi
-    grep -q '^RESULT: PASS$' "$TEST_DIR/$regression_suite.out" || \
-        fail 14 "$regression_suite did not report PASS"
-done
-pass 14 "all three existing suites pass unchanged"
+# 14. --until: a true condition wakes with `wake: condition` and none of the
+# check's own output; a false one is retried once per --interval (not on the 1 s
+# inbox loop) while a letter still wakes the watch as a delivery.
+if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session until-true --max-wait 10 \
+    --until 'echo noise; echo noise >&2; true' \
+    >"$TEST_DIR/until-true.out" 2>"$TEST_DIR/until-true.err"; then
+    fail 14 "true condition did not exit 0: $(tr '\n' ' ' < "$TEST_DIR/until-true.err")"
+fi
+[ "$(cat "$TEST_DIR/until-true.out")" = 'wake: condition' ] || \
+    fail 14 "true condition output is not exactly wake: condition"
+[ ! -s "$TEST_DIR/until-true.err" ] || fail 14 "check output leaked to stderr"
+[ ! -e "$HOME_LOCAL/run/watch.until-true.lock.d" ] || fail 14 "condition wake left the watch lock"
+KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session until-false --interval 3 --max-wait 20 \
+    --until "echo run >> '$TEST_DIR/until-runs'; false" \
+    >"$TEST_DIR/until-false.out" 2>"$TEST_DIR/until-false.err" &
+ACTIVE_PID=$!
+sleep 5
+until_runs=$(wc -l < "$TEST_DIR/until-runs" | tr -d ' ')
+[ "$until_runs" -eq 2 ] || fail 14 "check ran $until_runs times in 5 s at --interval 3"
+if ! until_id=$(KHALA_HOME="$HOME_LOCAL" KHALA_SESSION=sender \
+    "$KHALA" send until-false@alpha -m "mail beats the wait" 2>"$TEST_DIR/until-send.err"); then
+    fail 14 "until send failed: $(tr '\n' ' ' < "$TEST_DIR/until-send.err")"
+fi
+if ! KHALA_HOME="$HOME_LOCAL" "$KHALA" reconcile \
+    >"$TEST_DIR/until-reconcile.out" 2>"$TEST_DIR/until-reconcile.err"; then
+    fail 14 "until reconcile failed: $(tr '\n' ' ' < "$TEST_DIR/until-reconcile.err")"
+fi
+if ! wait "$ACTIVE_PID"; then
+    fail 14 "false-condition watch did not exit 0 on mail"
+fi
+ACTIVE_PID=
+[ "$(sed -n '1p' "$TEST_DIR/until-false.out")" = 'wake: delivery' ] || \
+    fail 14 "letter under a false condition did not report wake: delivery"
+grep -Fq "$until_id" "$TEST_DIR/until-false.out" || fail 14 "delivery wake omitted the letter Id"
+if KHALA_HOME="$HOME_LOCAL" "$KHALA" watch --session until-empty --until '' \
+    >"$TEST_DIR/until-empty.out" 2>"$TEST_DIR/until-empty.err"; then
+    fail 14 "empty --until unexpectedly succeeded"
+fi
+pass 14 "--until wakes on the condition, checks per interval, and yields to mail"
 
 printf 'RESULT: PASS\n'
-printf 'watch honesty, singleton lifecycle, exchange, routing isolation, and regressions passed\n'
+printf 'watch honesty, singleton lifecycle, exchange, routing isolation, and wake latency passed\n'

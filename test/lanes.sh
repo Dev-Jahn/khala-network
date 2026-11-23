@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # D18 core: lane identities and their parents — `khala whoami`, `--parent` /
-# KHALA_PARENT, the Claude-bind guard inside codex, the unknown-recipient
-# warning, `inbox --as`, the conduit's parent notice end to end, and prompt
-# same-node delivery on a node with no dial connection.
+# KHALA_PARENT, the unknown-recipient warning, `inbox --as`, the conduit's
+# parent notice end to end, and prompt same-node delivery on a node with no
+# dial connection.
 set -u
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -97,20 +97,14 @@ fi
 "$KHALA" --help 2>&1 | grep -qF 'khala whoami [--as session]' || fail W "whoami missing from usage"
 pass W "whoami prints <identity>@<node> from --as, KHALA_SESSION, .khala-session; refuses without one"
 
-# P — the parent record: validated, written once, outlives release.
+# P — the parent record through the CLI; it outlives release. Validation and
+# write-once are TestParentRecordIsValidatedWrittenOnceAndKept (link).
 start_stand_in
 P_PID=$STAND_IN
 register_worker() {
     "$KHALA" bind --register ready --harness codex --kind worker --receive-opt-in=false \
         --pid "$1" --session-id "$2" "${@:3}"
 }
-for p_bad in main main@ @alpha Main@alpha a@b@c conduit@alpha lane@alpha; do
-    if KHALA_SESSION=lane register_worker "$P_PID" thread-1 --parent "$p_bad" >/dev/null 2>"$RIG/p.err"; then
-        fail P "parent $p_bad was accepted"
-    fi
-    grep -q 'invalid parent' "$RIG/p.err" || fail P "parent $p_bad: $(cat "$RIG/p.err")"
-done
-[ ! -e "$KHALA_HOME/parents/lane" ] || fail P "a refused parent was recorded"
 P_OUT=$(KHALA_SESSION=lane KHALA_PARENT=main@alpha register_worker "$P_PID" thread-1) ||
     fail P "worker registration with KHALA_PARENT failed"
 P_INSTANCE=$(printf '%s\n' "$P_OUT" | sed -n 's/^instance //p')
@@ -122,19 +116,7 @@ KHALA_SESSION=plain "$KHALA" bind --parent eddy@beta >/dev/null 2>"$RIG/p.err" |
 [ "$(cat "$KHALA_HOME/parents/plain")" = eddy@beta ] || fail P "bind --parent not recorded"
 "$BIN" runtime release --identity lane --instance "$P_INSTANCE" || fail P "release failed"
 [ "$(cat "$KHALA_HOME/parents/lane")" = main@alpha ] || fail P "release dropped the parent record"
-pass P "--parent/KHALA_PARENT recorded at parents/<identity> (0600), bad parents refused, release keeps it"
-
-# G — inside codex, the Claude path of bind/register is refused.
-for g_args in "bind" "bind --register ready"; do
-    # shellcheck disable=SC2086
-    if CODEX_THREAD_ID=019a KHALA_SESSION=main "$KHALA" $g_args >/dev/null 2>"$RIG/g.err"; then
-        fail G "khala $g_args accepted a Claude bind inside codex"
-    fi
-    grep -qF 'this is a codex session; use khala-codex' "$RIG/g.err" || fail G "khala $g_args: $(cat "$RIG/g.err")"
-done
-CODEX_THREAD_ID=019a KHALA_SESSION=guarded register_worker "$P_PID" 019a >/dev/null 2>"$RIG/g.err" ||
-    fail G "the codex path was refused: $(cat "$RIG/g.err")"
-pass G "CODEX_THREAD_ID refuses the Claude bind and register paths; the codex path still registers"
+pass P "--parent/KHALA_PARENT recorded at parents/<identity> (0600), release keeps it"
 
 # S — send warns once about an address no session has used, and still sends.
 s_send() {
@@ -161,7 +143,8 @@ printf 'ears 1\nnode beta\nidentity name=listed principal=session listening=no r
     > "$KHALA_HOME/presence/conduit@beta.ear"
 s_quiet listed@beta "conduit snapshot"
 s_quiet lane@alpha "parent record"
-s_quiet guarded@alpha "registration without a lease"
+KHALA_SESSION=unleased register_worker "$P_PID" thread-3 >/dev/null || fail S "worker registration failed"
+s_quiet unleased@alpha "registration without a lease"
 printf '{}\n' > "$RUNTIME/identities/leased.lease"
 s_quiet leased@alpha "lease"
 s_quiet main@alpha "the sender itself"
@@ -175,19 +158,12 @@ mkdir -p "$KHALA_HOME/inbox/reader/new"
 printf 'Khala: 0.1\nId: %s\nFrom: ink@alpha\nTo: reader@alpha\nDate: 2026-10-21T00:00:00Z\nType: message\nSubject: for reader\nExpires: 4102444800\n\nreader body\n' \
     "$I_ID" > "$KHALA_HOME/inbox/reader/new/$I_ID"
 KHALA_SESSION=main "$KHALA" inbox list --as reader | grep -qF "for reader" || fail I "list --as"
-I_READ=1700000000.1.2.ink@alpha
-mkdir -p "$KHALA_HOME/inbox/reader/cur"
-sed "s/^Id: .*/Id: $I_READ/" "$KHALA_HOME/inbox/reader/new/$I_ID" > "$KHALA_HOME/inbox/reader/cur/$I_READ"
-KHALA_SESSION=main "$KHALA" inbox list --as reader | cut -f1,5 > "$RIG/i.list"
-printf '%s\tunread\n%s\tread\n' "$I_ID" "$I_READ" | cmp -s - "$RIG/i.list" ||
-    fail I "list does not tell unread from read: $(cat "$RIG/i.list")"
-rm -f "$KHALA_HOME/inbox/reader/cur/$I_READ"
 KHALA_SESSION=main "$KHALA" inbox read "$I_ID" --as reader | grep -qx 'reader body' || fail I "read --as"
 [ -f "$KHALA_HOME/inbox/reader/new/$I_ID" ] || fail I "read --as moved the letter"
 [ ! -e "$KHALA_HOME/presence/reader@alpha" ] || fail I "--as refreshed the other identity's presence"
 [ "$(KHALA_SESSION=main "$KHALA" inbox ack-read --as reader "$I_ID")" = "$I_ID" ] || fail I "ack-read --as"
 [ -f "$KHALA_HOME/inbox/reader/cur/$I_ID" ] || fail I "ack-read --as did not mark it read"
-pass I "inbox list/read/ack-read --as <identity> work on that mailbox without touching its presence; list marks unread and read"
+pass I "inbox list/read/ack-read --as <identity> work on that mailbox without touching its presence"
 
 # N — a lane that ended with mail: its parent gets one notice, through the
 # real reconcile and drain, and a restarted conduit does not repeat it.

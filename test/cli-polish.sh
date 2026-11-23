@@ -263,6 +263,51 @@ property_7() {
     grep -Fq "$p7_stream" "$RIG/p7-stream.out" || die "stream rows changed"
 }
 
+property_8() {
+    p8_home=$RIG/p8-home
+    init_home "$p8_home"
+    p8_interval() {
+        KHALA_HOME=$p8_home KHALA_SESSION=reader "$KHALA" inbox interval "$@" 2>"$RIG/p8.err"
+    }
+    [ "$(p8_interval)" = off ] || die "unset interval did not print off"
+    p8_interval 0300 >/dev/null || die "setting the interval failed"
+    [ "$(cat "$p8_home/notify-interval/reader")" = 300 ] ||
+        die "interval file is not the one canonical line the conduit reads"
+    [ "$(p8_interval)" = 300 ] || die "set interval did not print its seconds"
+    [ "$(KHALA_HOME=$p8_home "$KHALA" inbox interval --as other)" = off ] ||
+        die "--as did not select another identity's interval"
+    for p8_bad in 59 86401 soon -5 '300 400'; do
+        if p8_interval $p8_bad >/dev/null; then
+            die "interval '$p8_bad' was accepted"
+        fi
+    done
+    [ "$(p8_interval)" = 300 ] || die "a refused value changed the interval"
+    printf '5\n' > "$p8_home/notify-interval/reader"
+    if p8_interval >/dev/null; then
+        die "a malformed interval file printed as if it were valid"
+    fi
+    p8_interval off >/dev/null || die "clearing the interval failed"
+    [ ! -e "$p8_home/notify-interval/reader" ] || die "off left the interval file"
+    [ "$(p8_interval)" = off ] || die "cleared interval did not print off"
+
+    p8_urgent=$(KHALA_HOME=$p8_home KHALA_SESSION=sender "$KHALA" \
+        send reader@alpha --urgent -m M) || die "urgent send failed"
+    p8_urgent_file=$(letter_path "$p8_home" "$p8_urgent") || die "urgent message missing"
+    grep -qx 'Priority: urgent' "$p8_urgent_file" || die "--urgent omitted Priority: urgent"
+    p8_keyed=$(KHALA_HOME=$p8_home KHALA_SESSION=sender "$KHALA" \
+        send reader@alpha --urgent --request-id k1 -m M) || die "keyed urgent send failed"
+    grep -qx 'Priority: urgent' "$(letter_path "$p8_home" "$p8_keyed")" ||
+        die "--urgent with --request-id omitted Priority: urgent"
+    if KHALA_HOME=$p8_home KHALA_SESSION=sender "$KHALA" \
+        send reader@alpha --request-id k1 -m M >/dev/null 2>"$RIG/p8.err"; then
+        die "a retry key was reused across urgent and ordinary sends"
+    fi
+    if KHALA_HOME=$p8_home KHALA_SESSION=sender "$KHALA" \
+        send reader@alpha --urgent --later -m M >/dev/null 2>"$RIG/p8.err"; then
+        die "--urgent and --later were accepted together"
+    fi
+}
+
 run_property() {
     property_number=$1
     property_title=$2
@@ -284,6 +329,7 @@ run_property 4 'SIGPIPE cannot redeliver already selected messages'
 run_property 5 'inbox list and read expose messages without moving them'
 run_property 6 'message and stream inbox read delimiters are distinct'
 run_property 7 'watch reason is the first line for delivery and stream wakes'
+run_property 8 'inbox interval sets, prints and clears a validated value; send --urgent marks the letter'
 
 if [ -n "$FAILURES" ]; then
     printf 'RESULT: FAIL properties%s\n' "$FAILURES"

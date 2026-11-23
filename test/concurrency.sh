@@ -258,16 +258,5 @@ if grep -q 'reclaimed stale lock' "$TEST_DIR/fresh-lock.err"; then
 fi
 pass 7 "stale state locks are reclaimed and fresh locks are awaited"
 
-# 8. Every pre-existing suite remains green.
-for regression_suite in local-roundtrip exchange-roundtrip hardening watch; do
-    if ! bash "$ROOT/test/$regression_suite.sh" \
-        >"$TEST_DIR/$regression_suite.out" 2>"$TEST_DIR/$regression_suite.err"; then
-        fail 8 "$regression_suite regression failed: $(tr '\n' ' ' < "$TEST_DIR/$regression_suite.err")"
-    fi
-    grep -q '^RESULT: PASS$' "$TEST_DIR/$regression_suite.out" || \
-        fail 8 "$regression_suite did not report PASS"
-done
-pass 8 "all four existing suites pass"
-
 printf 'RESULT: PASS\n'
-printf 'self-spool, concurrency, crash recovery, locks, deterministic infra, and regressions passed\n'
+printf 'self-spool, concurrency, crash recovery, locks, and deterministic infra passed\n'

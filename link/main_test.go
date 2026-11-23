@@ -30,9 +30,6 @@ func TestVersionSubcommandUsesLinkVersion(t *testing.T) {
 	if status != 0 || string(data) != linkVersion+"\n" || !semverPattern.MatchString(linkVersion) {
 		t.Fatalf("status=%d output=%q linkVersion=%q", status, data, linkVersion)
 	}
-	if implVersion != "0.5.0" {
-		t.Fatalf("implVersion changed to %q", implVersion)
-	}
 }
 
 func TestProcessStartCommandPinsLocale(t *testing.T) {

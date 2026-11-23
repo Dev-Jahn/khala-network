@@ -356,79 +356,6 @@ property_7() {
     [ "$other_status" -eq 3 ] || die "nonjoined watch exited $other_status instead of timeout"
 }
 
-run_link_streams_suite() {
-    link_streams_status=$RIG/link-streams.status
-    if [ -f "$link_streams_status" ]; then
-        grep -qx PASS "$link_streams_status"
-        return
-    fi
-    if GO_BINARY=$GO bash "$ROOT/test/link-streams.sh" \
-        >"$RIG/link-streams.out" 2>"$RIG/link-streams.err"; then
-        printf 'PASS\n' > "$link_streams_status"
-        return 0
-    fi
-    printf 'FAIL\n' > "$link_streams_status"
-    return 1
-}
-
-property_8() {
-    run_link_streams_suite || die "link-streams.sh suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
-    for property in 8a 8b 8c L1 L2 H1 H2; do
-        grep -q "^ok $property —" "$RIG/link-streams.out" || die "link-streams.sh suite omitted $property"
-    done
-}
-
-property_10() {
-    run_link_streams_suite || die "link-streams.sh suite failed: $(tail -n 4 "$RIG/link-streams.err" | tr '\n' ' ')"
-    grep -q '^ok 10 —' "$RIG/link-streams.out" || die "link-streams.sh suite omitted property 10"
-}
-
-property_9() {
-    if [ "${STREAMS_SKIP_LEGACY-}" = 1 ]; then
-        printf 'SKIP property 9 execution — RED-only run\n'
-        return 0
-    fi
-    for suite in local-roundtrip exchange-roundtrip hardening watch concurrency plugin; do
-        if ! bash "$ROOT/test/$suite.sh" >"$RIG/p9-$suite.out" 2>"$RIG/p9-$suite.err"; then
-            die "$suite regression failed: $(tail -n 3 "$RIG/p9-$suite.err" | tr '\n' ' ')"
-        fi
-        grep -q '^RESULT: PASS$' "$RIG/p9-$suite.out" || die "$suite omitted RESULT: PASS"
-    done
-    if [ -x "$GO" ]; then
-        GO_BINARY=$GO bash "$ROOT/test/link.sh" \
-            >"$RIG/p9-link.out" 2>"$RIG/p9-link.err" ||
-            die "link.sh regression failed: $(tail -n 3 "$RIG/p9-link.err" | tr '\n' ' ')"
-        grep -q '^RESULT: PASS$' "$RIG/p9-link.out" || die "link.sh omitted RESULT: PASS"
-    else
-        printf 'SKIP property 9 link — Go toolchain unavailable\n'
-    fi
-}
-
-property_11() {
-    for runtime in "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" "$ROOT/plugin/hooks/lib.sh" \
-        "$ROOT/plugin/hooks/session-start.sh" "$ROOT/plugin/hooks/stop.sh"; do
-        bash -n "$runtime" || die "bash syntax failed: $runtime"
-    done
-    if grep -En 'declare[[:space:]]+-A|mapfile|readarray|\$\{[^}]*,,|\$\{![^}]*\[@\]' \
-        "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" "$ROOT"/plugin/hooks/*.sh >"$RIG/p11-bash4.out"; then
-        die "bash-4-only runtime construct found"
-    fi
-    if grep -R -nE '(^|[[:space:]=])/tmp(/|[[:space:]]|$)' \
-        "$ROOT/bin/khala" "$ROOT/plugin/hooks" "$ROOT/plugin/skills" \
-        "$ROOT/plugin/.claude-plugin" >"$RIG/p11-tmp.out"; then
-        die "runtime references the system temporary directory"
-    fi
-    if grep -R -n 'jq' "$ROOT/bin/khala" "$ROOT/plugin/hooks" "$ROOT/plugin/skills" \
-        "$ROOT/plugin/.claude-plugin" >"$RIG/p11-jq.out"; then
-        die "runtime references jq"
-    fi
-    if grep -En '^[[:space:]]*tmux([[:space:]]|$)|signal-send|kill[^#]*(CLAUDE|SESSION|PPID)' \
-        "$ROOT"/plugin/hooks/*.sh >"$RIG/p11-r13.out"; then
-        die "R13-forbidden hook action found"
-    fi
-    cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || die "bundled CLI differs"
-}
-
 property_12() {
     home=$RIG/p12-home
     init_home "$home" alpha
@@ -586,18 +513,6 @@ run_property 4 'SessionStart default-stream auto-join respects leave and rejoin'
 run_property 5 'mail and streams share caps with mail priority and exact cursor advancement' property_5
 run_property 6 'retention prunes independently, cannot revive, and reports cursor loss' property_6
 run_property 7 'watch wakes only for joined loud streams' property_7
-if [ -x "$GO" ]; then
-    run_property 8 'relay streams propagate, negotiate minor 0, avoid echo, and quarantine future epochs' property_8
-else
-    printf 'SKIP 8 — Go toolchain unavailable\n'
-fi
-run_property 9 'all seven legacy suites remain green' property_9
-if [ -x "$GO" ]; then
-    run_property 10 'relay and rsync race converges to one file and one inbox read' property_10
-else
-    printf 'SKIP 10 — Go toolchain unavailable\n'
-fi
-run_property 11 'R13, bash 3.2, no-jq, no-system-temp audits remain green' property_11
 run_property 12 'streams and stream cat agree with physical files' property_12
 run_property 13 'presence ages, retires, projects, and revives correctly' property_13
 run_property 14 'future-epoch entries are quarantined loudly' property_14

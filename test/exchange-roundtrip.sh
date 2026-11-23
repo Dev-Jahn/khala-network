@@ -195,14 +195,5 @@ fi
 grep -q '사용 가능한 mailbox 후보가 없습니다' "$TEST_DIR/alpha-sync-failed.err" || fail 7 "total failure was not reported"
 pass 7 "upstream failure is non-zero but local delivery continues"
 
-# 8. The unchanged single-machine suite remains green.
-if ! bash "$ROOT/test/local-roundtrip.sh" \
-    >"$TEST_DIR/local-roundtrip.out" 2>"$TEST_DIR/local-roundtrip.err"; then
-    fail 8 "local regression failed: $(tr '\n' ' ' < "$TEST_DIR/local-roundtrip.err")"
-fi
-grep -q '^ok 9 —' "$TEST_DIR/local-roundtrip.out" || fail 8 "local suite did not reach step 9"
-grep -q '^RESULT: PASS$' "$TEST_DIR/local-roundtrip.out" || fail 8 "local suite did not pass"
-pass 8 "local roundtrip regression remains 9/9"
-
 printf 'RESULT: PASS\n'
-printf 'mailbox exchange, ack settlement, dedup, presence, isolation, and regression passed\n'
+printf 'mailbox exchange, ack settlement, dedup, presence, and isolation passed\n'

@@ -144,20 +144,6 @@ fi
     fail 5 "old valid message was moved to dead"
 pass 5 "age alone never quarantines valid mail"
 
-if ! "$ROOT/test/local-roundtrip.sh" \
-    >"$TEST_DIR/local-roundtrip.out" 2>"$TEST_DIR/local-roundtrip.err"; then
-    fail 6 "local regression failed: $(tr '\n' ' ' < "$TEST_DIR/local-roundtrip.err")"
-fi
-if ! "$ROOT/test/exchange-roundtrip.sh" \
-    >"$TEST_DIR/exchange-roundtrip.out" 2>"$TEST_DIR/exchange-roundtrip.err"; then
-    fail 6 "exchange regression failed: $(tr '\n' ' ' < "$TEST_DIR/exchange-roundtrip.err")"
-fi
-grep -q '^RESULT: PASS$' "$TEST_DIR/local-roundtrip.out" || \
-    fail 6 "local regression did not report PASS"
-grep -q '^RESULT: PASS$' "$TEST_DIR/exchange-roundtrip.out" || \
-    fail 6 "exchange regression did not report PASS"
-pass 6 "local and exchange roundtrip regressions pass unchanged"
-
 . "$ROOT/plugin/hooks/lib.sh"
 KHALA_SESSION=khala-gateway
 if khala_resolve_session 0 1 >"$TEST_DIR/reserved-hook.out"; then
@@ -168,4 +154,4 @@ grep -Fqx 'khala: 예약된 이름입니다: khala-gateway' "$TEST_DIR/reserved-
 pass 7 "hook diagnoses a reserved identity early"
 
 printf 'RESULT: PASS\n'
-printf 'pruning, isolation, spool hygiene, and regressions passed\n'
+printf 'pruning, isolation, spool hygiene, and reserved identities passed\n'

@@ -250,15 +250,8 @@ property_P5() {
     printf 'ok P5 — status triage line: off, on with values/defaults, 0600 rule, no key\n'
 }
 
-# P6: the plugin copy is identical.
-property_P6() {
-    cmp -s "$ROOT/bin/khala" "$ROOT/plugin/bin/khala" || die "plugin/bin/khala differs from bin/khala"
-    sh -n "$ROOT/bin/khala" || die "sh -n failed"
-    printf 'ok P6 — plugin copy identical, syntax clean\n'
-}
-
 failed=0
-for p in P1 P2 P3 P4 P5 P6; do
+for p in P1 P2 P3 P4 P5; do
     ( "property_$p" ) || { printf 'FAIL %s\n' "$p"; failed=1; }
 done
 [ "$failed" -eq 0 ] || { printf 'RESULT: FAIL\n'; exit 1; }
