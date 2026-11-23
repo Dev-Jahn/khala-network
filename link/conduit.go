@@ -65,6 +65,9 @@ type notifierState struct {
 	nextAttempt              time.Time
 	lastInboxReadToken       string
 	failures                 int
+	// announced holds the message ids named by the last written notification. An
+	// urgent message outside it has not been announced to the target process yet.
+	announced map[string]bool
 }
 
 type pendingMessage struct {
@@ -75,7 +78,9 @@ type pendingMessage struct {
 	from    string
 	subject string
 	alert   bool
-	urgent  bool
+	// urgent is set for a notice whose Urgency is not "info" and for a letter
+	// whose headers carry "Priority: urgent" (khala send --urgent).
+	urgent bool
 	// later is set when the message headers carry "Priority: later" — the sender
 	// asked for the inbox notification to wait until the session is idle.
 	later bool
@@ -123,6 +128,9 @@ type notifier struct {
 	parentWaiting   map[string]time.Time
 	parentNoticed   map[string]map[string]bool
 	parentNoticeErr map[string]string
+	// notifyIntervalWarned records identities whose malformed notify-interval
+	// file has been logged; created on first use.
+	notifyIntervalWarned map[string]bool
 }
 
 func runNotifier(args []string) int {
@@ -281,6 +289,63 @@ func notificationRetryAfter(outstandingNotifications int) time.Duration {
 		parsed = append(parsed, duration)
 	}
 	return parsed[rewriteDelayIndex(outstandingNotifications, len(parsed))]
+}
+
+// The receiver-set notification interval (khala inbox interval) is a whole number
+// of seconds within these bounds.
+const (
+	minNotifyIntervalSeconds = 60
+	maxNotifyIntervalSeconds = 86400
+)
+
+// notifyInterval is the minimum spacing identity asked for between inbox
+// notifications of ordinary mail: <home>/notify-interval/<identity> holds the
+// seconds on one line. No file means off (0). A file that is not exactly one
+// in-range decimal integer is logged once per identity and also means off.
+func (c *notifier) notifyInterval(identity string) time.Duration {
+	data, err := readRegularBytes(filepath.Join(c.home, "notify-interval", identity), 17)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		return c.malformedNotifyInterval(identity)
+	}
+	value, terminated := strings.CutSuffix(string(data), "\n")
+	seconds, err := strconv.Atoi(value)
+	if !terminated || err != nil || strconv.Itoa(seconds) != value ||
+		seconds < minNotifyIntervalSeconds || seconds > maxNotifyIntervalSeconds {
+		return c.malformedNotifyInterval(identity)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (c *notifier) malformedNotifyInterval(identity string) time.Duration {
+	if c.notifyIntervalWarned == nil {
+		c.notifyIntervalWarned = make(map[string]bool)
+	}
+	if !c.notifyIntervalWarned[identity] && c.logger != nil {
+		c.logger.Printf("malformed notify interval ignored (treated as off): %s", identity)
+		c.notifyIntervalWarned[identity] = true
+	}
+	return 0
+}
+
+// withinNotifyInterval reports whether the receiver's notification interval holds
+// back a notification the existing schedule would write now. It only ever
+// withholds: inside the interval since the last notification written to the
+// identity nothing is written, unless an urgent message is pending that no
+// written notification has named yet. Such a message passes once; after it has
+// been announced, repeats follow the outstanding-notification schedule alone.
+func withinNotifyInterval(interval time.Duration, state *notifierState, messages []pendingMessage, now time.Time) bool {
+	if interval <= 0 || state.lastWritten.IsZero() || now.Sub(state.lastWritten) >= interval {
+		return false
+	}
+	for _, messageItem := range messages {
+		if messageItem.urgent && !state.announced[messageItem.id] {
+			return false
+		}
+	}
+	return true
 }
 
 func rewriteDelayIndex(outstandingNotifications, scheduleLength int) int {
@@ -989,8 +1054,13 @@ func (c *notifier) readPending(identity string, includeMtime bool) []pendingMess
 				if strings.HasPrefix(line, "Subject: ") {
 					messageItem.subject = sanitizePreview(strings.TrimPrefix(line, "Subject: "), 256)
 				}
-				if strings.HasPrefix(line, "Priority: ") && strings.TrimSpace(strings.TrimPrefix(line, "Priority: ")) == "later" {
-					messageItem.later = true
+				if strings.HasPrefix(line, "Priority: ") {
+					switch strings.TrimSpace(strings.TrimPrefix(line, "Priority: ")) {
+					case "later":
+						messageItem.later = true
+					case "urgent":
+						messageItem.urgent = true
+					}
 				}
 				if strings.HasPrefix(line, "Type: ") {
 					typeValue = strings.TrimSpace(strings.TrimPrefix(line, "Type: "))
@@ -1003,6 +1073,7 @@ func (c *notifier) readPending(identity string, includeMtime bool) []pendingMess
 		}
 		messageItem.kind = typeValue
 		if typeValue == "notice" {
+			// A notice's urgency comes from its Urgency header alone.
 			messageItem.alert = true
 			messageItem.urgent = urgencyValue != "info"
 		}
@@ -1103,6 +1174,7 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 		state.outstandingNotifications = 0
 		state.outstandingWritten = time.Time{}
 		state.failures = 0
+		state.announced = nil
 		if state.lastAttempt.IsZero() || now.Sub(state.lastAttempt) >= c.backoff[0] {
 			state.nextAttempt = now
 		} else {
@@ -1133,6 +1205,10 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 		}
 	}
 	if now.Before(state.nextAttempt) {
+		c.statesMu.Unlock()
+		return
+	}
+	if withinNotifyInterval(c.notifyInterval(identity), state, messages, now) {
 		c.statesMu.Unlock()
 		return
 	}
@@ -1230,6 +1306,7 @@ func (c *notifier) maybeNotify(identity string, lease identityLease, reg session
 		state.outstandingWritten = now
 		state.notificationsSent++
 		state.outstandingNotifications++
+		state.announced = messageIDSet(journal.LetterIDs)
 		state.nextAttempt = now.Add(notificationRetryAfter(state.outstandingNotifications))
 	} else {
 		delayIndex := attemptIndex - 1
@@ -1304,6 +1381,7 @@ func (c *notifier) restoreState(identity, instance, pendingDigest string) *notif
 			state.failures++
 		} else if item.journal.Status == "written" {
 			state.failures = 0
+			state.announced = messageIDSet(item.journal.LetterIDs)
 			if state.lastWritten.IsZero() || item.at.After(state.lastWritten) {
 				state.lastWritten = item.at
 			}
@@ -1355,6 +1433,14 @@ func (c *notifier) restoreState(identity, instance, pendingDigest string) *notif
 		c.logger.Printf("write listener sidecar %s failed: %v", identity, err)
 	}
 	return state
+}
+
+func messageIDSet(ids []string) map[string]bool {
+	set := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set
 }
 
 func (c *notifier) updateNativeStatus(reg sessionRegistration, failures int) {
@@ -1507,14 +1593,15 @@ func (c *notifier) verifyChannelSocket(reg sessionRegistration) error {
 // 2026-08-17, superseding the 0.5.0 default). A inbox notification drops to "later" only
 // when every notifiable message carries "Priority: later" (khala send
 // --later); info alerts are outside that set, while one ordinary message keeps
-// the batch prompt. "now" is never minted here.
+// the batch prompt, and so does an urgent one whatever else it carries. "now"
+// is never minted here.
 func notificationPriority(messages []pendingMessage) string {
 	notifiable := notifiableMessages(messages)
 	if len(notifiable) == 0 {
 		return "next"
 	}
 	for _, messageItem := range notifiable {
-		if !messageItem.later {
+		if !messageItem.later || messageItem.urgent {
 			return "next"
 		}
 	}

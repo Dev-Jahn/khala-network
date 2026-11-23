@@ -78,6 +78,39 @@ khala_launch_link_autofetch() {
         "$khala_autofetch_pid" "$khala_autofetch_log"
 }
 
+# Codex runs none of the adapter's hooks once their trust has lapsed (a Codex
+# update can do that) and tells nobody, so codex lanes stop receiving mail.
+# The adapter can ask Codex: `khala-codex hooks` exits 3 when a hook is not
+# trusted and 4 when it could not tell. Without an adapter on this node, or
+# with one too old to know `hooks` (any other status), there is nothing to say.
+khala_codex_hook_trust() {
+    khala_trust_bin=$(command -v khala-codex 2>/dev/null) || khala_trust_bin=
+    if [ -z "$khala_trust_bin" ] && [ -n "${HOME-}" ] && [ -x "$HOME/.local/bin/khala-codex" ]; then
+        khala_trust_bin=$HOME/.local/bin/khala-codex
+    fi
+    [ -n "$khala_trust_bin" ] || return 0
+    khala_trust_out=$KHALA_ROOT/tmp/session-trust.$$
+    khala_trust_err=$KHALA_ROOT/tmp/session-trust.$$.err
+    # The adapter gives up by itself after 5s; this deadline only backs it up.
+    khala_run_with_deadline 6 "$khala_trust_out" "$khala_trust_err" "$khala_trust_bin" hooks
+    case $? in
+        3)
+            khala_trust_events=$(awk -F '\t' '$2 != "trusted" { printf "%s%s", sep, $1; sep = ", " }' \
+                "$khala_trust_out")
+            printf 'khala: Codex hook trust 만료 — khala-network-codex의 %s hook을 Codex가 실행하지 않습니다. 다시 trust할 때까지 이 노드의 codex lane은 편지를 받지 못합니다 (khala-codex trust-hooks로 다시 trust, 또는 codex TUI의 /hooks에서 수동으로)\n' \
+                "$khala_trust_events"
+            ;;
+        4)
+            printf 'khala: Codex hook trust 확인 실패 — %s\n' \
+                "$(sed 's/^khala-codex: hook trust could not be checked: //' "$khala_trust_err" | tr '\n' ' ')"
+            ;;
+        124)
+            printf '%s\n' 'khala: Codex hook trust 확인 실패 — khala-codex hooks가 6s 안에 끝나지 않았습니다'
+            ;;
+    esac
+    rm -f "$khala_trust_out" "$khala_trust_err"
+}
+
 khala_start_input=$(cat 2>/dev/null) || khala_start_input=
 khala_ensure_cli "$HOOK_DIR/.."
 
@@ -86,6 +119,7 @@ if ! khala_discover; then
     exit 0
 fi
 khala_launch_link_autofetch
+khala_codex_hook_trust
 if ! khala_resolve_session 0 1; then
     exit 0
 fi
