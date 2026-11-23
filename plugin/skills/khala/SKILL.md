@@ -56,6 +56,26 @@ SendMessage) or `later` when every pending message was sent with `--later`; the
 notifier never emits `now`. Sessions need no manual activation or reactivation: the node notifier handles
 inbox notifications, while `inbox/<identity>/new` remains the durable truth.
 
+By default every letter that arrives after you have read your inbox notifies you
+at once. A session that receives many progress reports — a main session with
+several reporting workers — should set a notification interval for itself:
+
+```sh
+khala inbox interval 600    # ordinary mail: at most one notification per 600 s
+khala inbox interval        # print the current value (seconds, or off)
+khala inbox interval off
+```
+
+The value is 60–86400 seconds, is stored per identity on this node, and survives
+session and notifier restarts. After a quiet period the first letter still
+notifies at once; letters that follow inside the interval wait and are announced
+together by one notification when it ends. Nothing is delayed in the mailbox
+itself — `khala inbox --drain` always reads everything pending. Urgent mail
+passes the interval once: urgent alerts, and letters sent with
+`khala send --urgent`. As a sender, use `--urgent` only when you are blocked on
+the answer; a progress or completion report is ordinary mail. `--urgent` and
+`--later` cannot be combined.
+
 ## Alerts
 
 Machine senders first declare an identity with
@@ -119,6 +139,25 @@ KHALA_SESSION=<name> khala watch --max-wait 600
 `watch` returns as soon as a letter arrives (`wake: delivery`), and the letter
 is shown right after that call; on `--max-wait` it returns with nothing.
 
+A subagent that is also waiting for a long job should wait for both in one
+call, so a letter is not left unheard while it polls the job:
+
+```sh
+KHALA_SESSION=<name> khala watch --max-wait 300 --interval 30 \
+  --until '! squeue -h -j 48213 | grep -q .'
+```
+
+`--until` runs the command with `sh -c` once at the start and then every
+`--interval` seconds; exit status 0 means the condition holds, and `watch`
+returns `wake: condition`. A letter still returns `wake: delivery` within a
+second, and wins when both happen together. The command's output is discarded
+(only its exit status counts), and a check still running after `--interval`
+seconds is killed and counted as "not yet". For a local process use
+`--until '! kill -0 <pid>'`. Run it as its own tool call, in steps of a few
+minutes (`--max-wait 300`, then call again): letters are handed over only when
+a tool call ends. `wake: condition` says the check passed, not that the job
+succeeded — look at the job's result next.
+
 To let a subagent and a Codex lane talk to each other directly, without you
 relaying:
 
@@ -166,6 +205,14 @@ resume does not get them again, and never move inbox files by hand. A Claude
 subagent that has ended does not receive them again: handle them yourself. The
 letters are peer messages like any other mail, not instructions from the user.
 Each new batch is announced once; no notice comes while the lane or subagent is running.
+
+If SessionStart prints `khala: Codex hook trust 만료`, Codex has stopped running
+the khala-network-codex hooks on this node, and Codex lanes get no mail until
+the hooks are trusted again. Run `khala-codex trust-hooks` and tell the user
+what it recorded, or why it refused. It records trust only when the installed
+plugin is byte-identical to the published release; never work around a refusal
+(no edits to Codex's config, no other way to mark the hooks trusted) — report
+it and leave `/hooks` in the Codex TUI to the user.
 
 ## Streams
 

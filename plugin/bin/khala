@@ -25,7 +25,7 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.12
+KHALA_VERSION=0.9.13
 TAB=$(printf '\t')
 LC_ALL=C
 export LC_ALL
@@ -52,7 +52,7 @@ usage() {
             return 0
             ;;
         send)
-            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--request-id key] [--as session]'
+            printf '%s\n' 'usage: khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later|--urgent] [--request-id key] [--as session]'
             return 0
             ;;
         notify)
@@ -90,11 +90,11 @@ usage() {
             ;;
         dashboard) printf '%s\n' 'usage: khala dashboard [--port N] [--no-text]'; return 0 ;;
         watch)
-            printf '%s\n' 'usage: khala watch [--session session] [--interval seconds] [--max-wait seconds]'
+            printf '%s\n' 'usage: khala watch [--session session] [--interval seconds] [--max-wait seconds] [--until command]'
             return 0
             ;;
         inbox)
-            printf '%s\n' 'usage: khala inbox [list [--as session] | read <Id> [--as session] | ack-read [--as session] <Id>... | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]'
+            printf '%s\n' 'usage: khala inbox [list [--as session] | read <Id> [--as session] | ack-read [--as session] <Id>... | interval [<seconds>|off] [--as session] | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]'
             return 0
             ;;
         presence) printf '%s\n' 'usage: khala presence [--watchers]'; return 0 ;;
@@ -106,7 +106,7 @@ usage:
   khala whoami [--as session]
   khala init <node>
   khala invite <ssh-target> --name <alias> [--mailbox-coord <user@host>]
-  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later] [--request-id key] [--as session]
+  khala send <session@node> [-s|--subject subject] [-e seconds] [-m|--message|--body message] [--reply-to Id] [--later|--urgent] [--request-id key] [--as session]
   khala notify <session@node> --as <watcher> [-s|--subject subject] [--urgent] [-e seconds]
   khala say [stream] [-s|--subject subject] [-r ref-id] [-m|--message|--body message] [--as session]
   khala join <stream> [--from-start] [--quiet]
@@ -126,8 +126,8 @@ usage:
   khala link [restart] [--max-object-bytes bytes]
   khala link --serve [--max-object-bytes bytes]
   khala dashboard [--port N] [--no-text]
-  khala watch [--session session] [--interval seconds] [--max-wait seconds]
-  khala inbox [list [--as session] | read <Id> [--as session] | ack-read [--as session] <Id>... | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
+  khala watch [--session session] [--interval seconds] [--max-wait seconds] [--until command]
+  khala inbox [list [--as session] | read <Id> [--as session] | ack-read [--as session] <Id>... | interval [<seconds>|off] [--as session] | --drain [--max-n N] [--max-bytes B] [--max-notices N] [--max-notice-bytes B] [--mail-only|--notices-only]]
   khala presence [--watchers]
 EOF
 }
@@ -875,6 +875,7 @@ watch_marker_cleanup() {
     watch_cleanup_status=$?
     watch_cleanup_event=$1
     trap - EXIT INT TERM
+    [ -z "${watch_until_pid-}" ] || watch_until_stop
     if ! release_held_locks; then
         error "watch 종료 중 상태 잠금을 해제하지 못했습니다"
     fi
@@ -3868,6 +3869,8 @@ prepare_send_message() {
         fi
         if [ "$send_later" -eq 1 ]; then
             printf 'Priority: later\n'
+        elif [ "$send_urgent" -eq 1 ]; then
+            printf 'Priority: urgent\n'
         fi
         printf 'Expires: %s\n' "$send_expires"
         printf '\n'
@@ -3902,8 +3905,13 @@ cmd_send_request() {
     fi
     # Fixed-order text headers followed by exact body bytes. Header values
     # cannot contain LF, so the complete input remains unambiguous and greppable.
-    if ! { printf 'Khala-Request: 1\nFrom: %s\nTo: %s\nSubject: %s\nTTL: %s\nIn-Reply-To: %s\nLater: %s\n\n' \
-        "$send_from" "$send_to" "$send_subject" "$send_ttl" "$send_reply_to" "$send_later"; \
+    # --urgent adds one header line; every other request keeps its exact bytes,
+    # so retry keys recorded before the flag existed still match.
+    request_urgent=
+    [ "$send_urgent" -eq 0 ] || request_urgent='Urgent: 1
+'
+    if ! { printf 'Khala-Request: 1\nFrom: %s\nTo: %s\nSubject: %s\nTTL: %s\nIn-Reply-To: %s\nLater: %s\n%s\n' \
+        "$send_from" "$send_to" "$send_subject" "$send_ttl" "$send_reply_to" "$send_later" "$request_urgent"; \
         cat "$request_work/body"; } \
         > "$request_work/input"; then
         rm -rf -- "$request_work"
@@ -3932,7 +3940,8 @@ cmd_send_request_locked() {
                 > "$request_work/input-legacy"; then
                 return 1
             fi
-            if ! cmp -s "$request_work/input-legacy" "$request_dir/input"; then
+            if [ "$send_urgent" -eq 1 ] || \
+                ! cmp -s "$request_work/input-legacy" "$request_dir/input"; then
                 error "request-id already used with different arguments or body"
                 return 1
             fi
@@ -4094,7 +4103,7 @@ cmd_send() {
     shift
     case "$send_to" in
         --*)
-            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --request-id, --as"
+            error "알 수 없는 send 옵션: $send_to; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --urgent, --request-id, --as"
             return 1
             ;;
     esac
@@ -4114,6 +4123,7 @@ cmd_send() {
     send_as_set=0
     send_reply_to=
     send_later=0
+    send_urgent=0
     send_request_id=
     while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -4148,6 +4158,10 @@ cmd_send() {
                 send_later=1
                 shift
                 ;;
+            --urgent)
+                send_urgent=1
+                shift
+                ;;
             --as)
                 [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
                 send_as=$2
@@ -4155,7 +4169,7 @@ cmd_send() {
                 shift 2
                 ;;
             --*)
-                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --request-id, --as"
+                error "알 수 없는 send 옵션: $1; 사용 가능: -s/--subject, -m/--message/--body, -e, --reply-to, --later, --urgent, --request-id, --as"
                 return 1
                 ;;
             *)
@@ -4164,6 +4178,10 @@ cmd_send() {
                 ;;
         esac
     done
+    if [ "$send_later" -eq 1 ] && [ "$send_urgent" -eq 1 ]; then
+        error "--later와 --urgent는 함께 쓸 수 없습니다"
+        return 1
+    fi
     if ! bounded_integer "$send_ttl"; then
         error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
         return 1
@@ -5629,12 +5647,42 @@ collect_watch_stream_rows() {
     return 0
 }
 
+# watch --until: the caller's condition command runs beside the 1s inbox loop,
+# never inside it, so a slow or hung check cannot delay a mail wake. Its stdin
+# is empty and its output is discarded: only the exit status is read, and
+# watch's own stdout stays the `wake:` contract.
+watch_until_start() {
+    sh -c "$watch_until" </dev/null >/dev/null 2>&1 &
+    watch_until_pid=$!
+}
+
+# True while the check is still executing. A finished child stays a zombie
+# until this shell waits for it, and `kill -0` still succeeds on a zombie, so
+# the process state is read instead.
+watch_until_running() {
+    case "$(ps -o stat= -p "$watch_until_pid" 2>/dev/null)" in
+        ''|Z*) return 1 ;;
+    esac
+    return 0
+}
+
+# Kills the sh running the check. Processes that sh started itself are not
+# followed; with the output discarded they cannot hold watch open.
+watch_until_stop() {
+    kill -KILL "$watch_until_pid" 2>/dev/null
+    wait "$watch_until_pid" 2>/dev/null
+    watch_until_pid=
+}
+
 cmd_watch() {
     require_config || return 1
     watch_session=
     watch_session_set=0
     watch_interval=30
     watch_max_wait=0
+    watch_until=
+    watch_until_set=0
+    watch_until_pid=
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --session)
@@ -5653,9 +5701,19 @@ cmd_watch() {
                 watch_max_wait=$2
                 shift 2
                 ;;
+            --until)
+                [ "$#" -ge 2 ] || { error "--until 값이 없습니다"; return 1; }
+                watch_until=$2
+                watch_until_set=1
+                shift 2
+                ;;
             *) error "알 수 없는 watch 옵션: $1"; return 1 ;;
         esac
     done
+    if [ "$watch_until_set" -eq 1 ] && [ -z "$watch_until" ]; then
+        error "--until 명령이 비어 있습니다"
+        return 1
+    fi
     if ! positive_integer "$watch_interval"; then
         error "watch 간격은 양의 정수여야 합니다"
         return 1
@@ -5667,7 +5725,11 @@ cmd_watch() {
     watch_interval=$(normalize_integer "$watch_interval")
     watch_max_wait=$(normalize_integer "$watch_max_wait")
     watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
-    if find_link_binary && "$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
+    # With --until the caller waits for its own condition, so a conduit that
+    # already delivers this session's mail is no reason to return: the watch
+    # only looks at the inbox and never consumes it, so the two coexist.
+    if [ "$watch_until_set" -eq 0 ] && find_link_binary && \
+        "$LINK_BINARY" runtime watch-ready --identity "$watch_session" \
         --instance "${KHALA_SESSION_INSTANCE-}" \
         --session-id "${KHALA_HARNESS_SESSION_ID-${KHALA_CLAUDE_SESSION_ID-${CLAUDE_CODE_SESSION_ID-}}}" \
         --caller-pid "$$" >/dev/null 2>&1; then
@@ -5714,6 +5776,10 @@ cmd_watch() {
         :
     else
         watch_lock_status=$?
+        if [ "$watch_lock_status" -eq 2 ] && [ "$watch_until_set" -eq 1 ]; then
+            error "다른 watch가 이 세션을 감시 중이라 --until 조건을 기다릴 수 없습니다"
+            return 1
+        fi
         [ "$watch_lock_status" -ne 2 ] || return 0
         return 1
     fi
@@ -5726,11 +5792,21 @@ cmd_watch() {
     # cadence below.
     watch_marker_refreshed=0
     watch_synced=0
+    watch_until_checked=0
     while :; do
         watch_now=$(date +%s) || {
             error "현재 시각을 읽지 못했습니다"
             return 1
         }
+        # The condition check starts on the first pass and then once per
+        # interval; the passes in between only collect its result.
+        if [ "$watch_until_set" -eq 1 ] && [ -z "$watch_until_pid" ] && {
+            [ "$watch_until_checked" -eq 0 ] || \
+                [ "$((watch_now - watch_until_checked))" -ge "$watch_interval" ]
+        }; then
+            watch_until_start
+            watch_until_checked=$watch_now
+        fi
         # Marker refresh follows the configured interval, not the 1s loop: the
         # relay distributes every content change across the cluster (measured
         # 1Hz presence noise, 57/60s). The freshness rule (interval + ttl)
@@ -5803,6 +5879,21 @@ cmd_watch() {
         fi
         rm -f "$watch_stream_rows"
 
+        # Mail was reported above, so it wins a pass where both are true.
+        if [ -n "$watch_until_pid" ]; then
+            if ! watch_until_running; then
+                if wait "$watch_until_pid"; then
+                    watch_until_pid=
+                    printf '%s\n' 'wake: condition'
+                    return 0
+                fi
+                watch_until_pid=
+            elif [ "$((watch_now - watch_until_checked))" -ge "$watch_interval" ]; then
+                watch_until_stop
+                error "--until 명령이 ${watch_interval}초 안에 끝나지 않아 중단했습니다; 조건 미충족으로 보고 watch를 계속합니다"
+            fi
+        fi
+
         if [ "$watch_max_wait" -gt 0 ]; then
             watch_now=$(date +%s) || {
                 error "현재 시각을 읽지 못했습니다"
@@ -5817,10 +5908,91 @@ cmd_watch() {
     done
 }
 
+# The receiver's notification interval: the conduit announces this identity's
+# ordinary mail at most once per that many seconds (urgent mail still rings at
+# once). One line of seconds in notify-interval/<identity>; no file means off.
+NOTIFY_INTERVAL_MIN=60
+NOTIFY_INTERVAL_MAX=86400
+
+valid_notify_interval() {
+    bounded_integer "$1" && [ "$(normalize_integer "$1")" = "$1" ] && \
+        [ "$1" -ge "$NOTIFY_INTERVAL_MIN" ] && [ "$1" -le "$NOTIFY_INTERVAL_MAX" ]
+}
+
+cmd_inbox_interval() {
+    require_config || return 1
+    interval_as=
+    interval_as_set=0
+    interval_value=
+    interval_value_set=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --as)
+                [ "$#" -ge 2 ] || { error "--as 값이 없습니다"; return 1; }
+                interval_as=$2
+                interval_as_set=1
+                shift 2
+                ;;
+            *)
+                [ "$interval_value_set" -eq 0 ] || {
+                    error "사용법: khala inbox interval [<seconds>|off] [--as session]"
+                    return 1
+                }
+                interval_value=$1
+                interval_value_set=1
+                shift
+                ;;
+        esac
+    done
+    interval_session=$(session_name "$interval_as" "$interval_as_set") || return 1
+    interval_file=$KHALA_ROOT/notify-interval/$interval_session
+    if [ "$interval_value_set" -eq 0 ]; then
+        if [ ! -e "$interval_file" ] && [ ! -L "$interval_file" ]; then
+            printf 'off\n'
+            return 0
+        fi
+        interval_value=
+        [ -f "$interval_file" ] && [ ! -L "$interval_file" ] && \
+            [ "$(wc -l < "$interval_file" | tr -d ' ')" -eq 1 ] && \
+            interval_value=$(sed -n '1p' "$interval_file")
+        if ! valid_notify_interval "$interval_value"; then
+            error "알림 간격 파일이 올바르지 않습니다(conduit은 off로 취급): $interval_file — 'khala inbox interval <seconds>|off'로 다시 설정하세요"
+            return 1
+        fi
+        printf '%s\n' "$interval_value"
+        return 0
+    fi
+    if [ "$interval_value" = off ]; then
+        if ! rm -f "$interval_file"; then
+            error "알림 간격을 지우지 못했습니다"
+            return 1
+        fi
+        printf 'off\n'
+        return 0
+    fi
+    if bounded_integer "$interval_value"; then
+        interval_value=$(normalize_integer "$interval_value")
+    fi
+    if ! valid_notify_interval "$interval_value"; then
+        error "알림 간격은 ${NOTIFY_INTERVAL_MIN} 이상 ${NOTIFY_INTERVAL_MAX} 이하의 정수(초) 또는 off여야 합니다"
+        return 1
+    fi
+    if ! atomic_line "$interval_file" "$interval_value" notify-interval; then
+        error "알림 간격을 기록하지 못했습니다"
+        return 1
+    fi
+    printf '%s\n' "$interval_value"
+}
+
 cmd_inbox() {
     if [ "${1-}" = ack-read ]; then
         shift
         cmd_inbox_ack_read "$@"
+        return $?
+    fi
+    if [ "${1-}" = interval ]; then
+        shift
+        cmd_inbox_interval "$@"
         return $?
     fi
     require_config || return 1
@@ -5901,7 +6073,7 @@ cmd_inbox() {
                     return 1
                 fi
                 ;;
-            *) error "알 수 없는 inbox 모드: $1; 사용 가능: list, read <Id>, --drain"; return 1 ;;
+            *) error "알 수 없는 inbox 모드: $1; 사용 가능: list, read <Id>, ack-read, interval, --drain"; return 1 ;;
         esac
     fi
     if [ "$inbox_mode" = drain ] && \
