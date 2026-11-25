@@ -181,3 +181,56 @@ func assertCandidateClasses(t *testing.T, candidates <-chan candidate, want map[
 		}
 	}
 }
+
+// The event path skips the gate reconcile only while the core CLI's own
+// retention_due would also say "not due"; any disagreement in the other
+// direction would let an aged presence file be offered.
+func TestRetentionSweepDueMirrorsCoreCLI(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	cases := []struct {
+		name   string
+		config string
+		stamp  int64 // age in seconds; negative = in the future
+		absent bool
+		want   bool
+	}{
+		{name: "default interval, fresh stamp", config: "self a\n", stamp: 299, want: false},
+		{name: "default interval, stamp at the interval", config: "self a\n", stamp: 300, want: true},
+		{name: "missing stamp", config: "self a\n", absent: true, want: true},
+		{name: "stamp from the future", config: "self a\n", stamp: -5, want: true},
+		{name: "interval zero sweeps every pass", config: "retention-interval 0\n", stamp: 0, want: true},
+		{name: "configured interval, fresh", config: "retention-interval 0060\n", stamp: 59, want: false},
+		{name: "configured interval, due", config: "retention-interval 60\n", stamp: 60, want: true},
+		{name: "empty value means the default", config: "retention-interval \n", stamp: 100, want: false},
+		{name: "non-numeric interval", config: "retention-interval 5m\n", stamp: 1, want: true},
+		{name: "repeated key", config: "retention-interval 60\nretention-interval 60\n", stamp: 1, want: true},
+		{name: "more than 18 digits", config: "retention-interval 1000000000000000000\n", stamp: 1, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "config"), []byte(tc.config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.absent {
+				if err := os.Mkdir(filepath.Join(home, "run"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				stamp := filepath.Join(home, "run", "retention.stamp")
+				if err := os.WriteFile(stamp, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				at := now.Add(-time.Duration(tc.stamp) * time.Second)
+				if err := os.Chtimes(stamp, at, at); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := retentionSweepDue(home, now); got != tc.want {
+				t.Fatalf("due=%v, want %v", got, tc.want)
+			}
+		})
+	}
+	if !retentionSweepDue(filepath.Join(t.TempDir(), "no-home"), now) {
+		t.Fatal("an unreadable config must count as due")
+	}
+}

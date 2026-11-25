@@ -261,6 +261,20 @@ property_7() {
     [ "$(sed -n '1p' "$RIG/p7-stream.out")" = 'wake: stream' ] ||
         die "stream wake reason is not first"
     grep -Fq "$p7_stream" "$RIG/p7-stream.out" || die "stream rows changed"
+    # An entry that arrives while the watch waits wakes it even when the shard
+    # directory's mtime does not move forward: rsync -a in the exchange sets it
+    # to the sender's value.
+    KHALA_HOME=$p7_home KHALA_SESSION=stream-reader "$KHALA" inbox --drain >/dev/null ||
+        die "stream reader drain failed"
+    KHALA_HOME=$p7_home "$KHALA" watch --session stream-reader --interval 30 --max-wait 8 \
+        > "$RIG/p7-late.out" 2>/dev/null &
+    p7_watch=$!
+    sleep 3
+    p7_late=$(KHALA_HOME=$p7_home KHALA_SESSION=speaker "$KHALA" say -m late) ||
+        die "late stream say failed"
+    touch -t 200001010000 "$p7_home/streams/khala/alpha" || die "shard mtime rewind failed"
+    wait "$p7_watch" || die "watch missed an entry that arrived under an old directory mtime"
+    grep -Fq "$p7_late" "$RIG/p7-late.out" || die "late stream row missing"
 }
 
 property_8() {

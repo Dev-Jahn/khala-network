@@ -499,4 +499,37 @@ grep -q 'retention-interval' "$RIG/interval-6.err" || die "bad interval error do
 for f in 1 2 3 4 5; do [ ! -s "$RIG/interval-$f.err" ] || die "interval pass $f was not silent: $(tr '\n' ' ' < "$RIG/interval-$f.err")"; done
 printf 'ok P4e — age-out sweeps wait for retention-interval; a future marker and interval 0 sweep at once\n'
 
+# P4f — the sweep reads the mtimes of many archived messages with one stat per
+# batch, not one per file. Among 250 messages whose Ids are all past retention
+# (more than one batch, under a path with a space), exactly those that also
+# entered the archive long ago are pruned.
+home="$RIG/bulk archive"
+init_home "$home"
+now=$(date +%s)
+old=$((now - 40 * 86400))
+mkdir -p "$home/outbox/acked"
+bulk_aged=()
+bulk_n=0
+while [ "$bulk_n" -lt 250 ]; do
+    bulk_file=$home/outbox/acked/$old.4.$bulk_n.sender@alpha
+    printf 'Khala: 0.1\nId: %s\n\nbody\n' "${bulk_file##*/}" > "$bulk_file"
+    [ "$((bulk_n % 2))" -eq 0 ] || bulk_aged[${#bulk_aged[@]}]=$bulk_file
+    bulk_n=$((bulk_n + 1))
+done
+touch -d "@$old" "${bulk_aged[@]}" 2>/dev/null ||
+    touch -t "$(date -r "$old" +%Y%m%d%H%M.%S)" "${bulk_aged[@]}" || die "bulk aging failed"
+KHALA_HOME=$home "$KHALA" reconcile >/dev/null 2>"$RIG/bulk.err" ||
+    die "bulk archive reconcile failed: $(tr '\n' ' ' < "$RIG/bulk.err")"
+bulk_n=0
+while [ "$bulk_n" -lt 250 ]; do
+    bulk_file=$home/outbox/acked/$old.4.$bulk_n.sender@alpha
+    if [ "$((bulk_n % 2))" -eq 0 ]; then
+        [ -f "$bulk_file" ] || die "archived message $bulk_n, acked today, was pruned for its old Id"
+    else
+        [ ! -e "$bulk_file" ] || die "archived message $bulk_n, acked 40 days ago, survived"
+    fi
+    bulk_n=$((bulk_n + 1))
+done
+printf 'ok P4f — a bulk archive sweep prunes by each file'"'"'s own mtime\n'
+
 printf 'RESULT: PASS\n'
