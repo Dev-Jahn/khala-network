@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +125,7 @@ func (t *treeWatcher) run(ctx context.Context) error {
 			t.scanAll()
 		case <-presenceC:
 			presenceC = nil
-			if t.ageScanReady() {
+			if t.ageHintReady() {
 				t.scanPresence()
 			}
 		case err, ok := <-w.Errors:
@@ -297,8 +298,22 @@ func (t *treeWatcher) scanAgeGoverned() {
 	t.scanStatuses()
 }
 
-func (t *treeWatcher) ageScanReady() bool {
-	if t.coreCLI.ownsReconcile() {
+// ageScanReady opens the age gate with a reconcile pass. The periodic scan
+// uses it: on a dial node that pass is also the node's only timed reconcile.
+func (t *treeWatcher) ageScanReady() bool { return t.openAgeGate(true) }
+
+// ageHintReady is the gate for a presence event. The reconcile is the
+// presence age gate, and a pass that is not a retention pass cannot change
+// which presence files are eligible, so once the gate is open an event starts
+// a pass only when the core CLI's retention sweep is due. Presence changes
+// every few seconds on a busy cluster; a new stream or session status
+// directory is rare and keeps the full gate.
+func (t *treeWatcher) ageHintReady() bool {
+	return t.openAgeGate(!t.ageReady || retentionSweepDue(t.home, time.Now()))
+}
+
+func (t *treeWatcher) openAgeGate(reconcile bool) bool {
+	if reconcile && t.coreCLI.ownsReconcile() {
 		if err := t.coreCLI.reconcile(true); err != nil {
 			t.ageReady = false
 			t.logger.Printf("age-governed scan skipped; core CLI reconcile failed: %v", err)
@@ -657,4 +672,35 @@ func (t *treeWatcher) handleHint(path string) {
 			t.enqueue(candidate{class: "spool", node: node, basename: filepath.Base(path), path: path, deleteAfterStored: t.role == "serve"})
 		}
 	}
+}
+
+// retentionSweepDue mirrors retention_due in the core CLI without stamping:
+// the age-out sweeps of a reconcile pass run when config `retention-interval`
+// (seconds, 300 when absent) is 0 or unreadable, when run/retention.stamp is
+// missing or from the future, or when the stamp is at least that old.
+func retentionSweepDue(home string, now time.Time) bool {
+	data, err := os.ReadFile(filepath.Join(home, "config"))
+	if err != nil {
+		return true
+	}
+	var values []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if value, ok := strings.CutPrefix(line, "retention-interval "); ok {
+			values = append(values, value)
+		}
+	}
+	interval := int64(300)
+	if value := strings.Join(values, "\n"); value != "" {
+		digits := strings.TrimLeft(value, "0")
+		if strings.Trim(value, "0123456789") != "" || len(digits) > 18 || digits == "" {
+			return true
+		}
+		interval, _ = strconv.ParseInt(digits, 10, 64)
+	}
+	info, err := os.Stat(filepath.Join(home, "run", "retention.stamp"))
+	if err != nil || !info.Mode().IsRegular() {
+		return true
+	}
+	last := info.ModTime().Unix()
+	return last > now.Unix() || now.Unix()-last >= interval
 }

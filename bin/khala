@@ -25,8 +25,9 @@ LOCK_HELD_PATHS=()
 TTL_LINK=12
 # Display-only semantic freshness; storage lifetime remains config retain.
 MIND_FRESH_SECONDS=3600
-KHALA_VERSION=0.9.13
-TAB=$(printf '\t')
+KHALA_VERSION=0.9.14
+TAB=$'\t'
+NEWLINE=$'\n'
 LC_ALL=C
 export LC_ALL
 PRESERVE_CONFIG_LOADED=0
@@ -36,6 +37,10 @@ PRESERVE_STREAMS=
 ARCHIVER_DEGRADED=0
 ARCHIVER_READY=0
 SYNC_DIR_STYLE=
+CLOCK_STYLE=
+CLOCK_BASE=
+NOW=
+STAT_STYLE=
 
 error() {
     printf 'khala: %s\n' "$*" >&2
@@ -220,7 +225,12 @@ positive_integer() {
 # pure shell on purpose: one fork per value, times a few values per file, times
 # hundreds of files, is what held the state lock for whole seconds. LC_ALL=C is
 # pinned above, so the bracket ranges in these case patterns are ASCII.
-normalize_integer() {
+#
+# Value helpers come in two forms for the same reason: `name` prints its value
+# for `$(name ...)`, which forks a subshell, and `set_...`/`read_...` leave it
+# in a global instead (normalized, NOW, HEADER_VALUE, FILE_MTIME) for the
+# passes that run all day.
+set_normalized() {
     normalized=$1
     while case "$normalized" in 0?*) true ;; *) false ;; esac; do
         normalized=${normalized#0}
@@ -228,7 +238,39 @@ normalize_integer() {
     if [ -z "$normalized" ]; then
         normalized=0
     fi
+}
+
+normalize_integer() {
+    set_normalized "$1"
     printf '%s\n' "$normalized"
+}
+
+# Epoch seconds in $NOW. bash 4.2+ formats the clock itself. Older bash (the
+# /bin/bash 3.2 that macOS services run under) has no such builtin, so the
+# first call asks date(1) once and every later call adds the shell's SECONDS
+# counter to that answer: bash advances SECONDS by time(2) differences, so the
+# sum follows the wall clock, steps included, at no cost. The counter is zeroed
+# just before date runs; if it has ticked by the time date returns, the answer
+# may belong to either second and is taken again.
+now_epoch() {
+    case "$CLOCK_STYLE" in
+        builtin) printf -v NOW '%(%s)T' -1 ;;
+        seconds) NOW=$((CLOCK_BASE + SECONDS)) ;;
+        *)
+            if [ "${BASH_VERSINFO[0]}" -gt 4 ] || \
+                { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 2 ]; }; then
+                CLOCK_STYLE=builtin
+            else
+                while :; do
+                    SECONDS=0
+                    CLOCK_BASE=$(date +%s) && positive_or_zero_integer "$CLOCK_BASE" || return 1
+                    [ "$SECONDS" -ne 0 ] || break
+                done
+                CLOCK_STYLE=seconds
+            fi
+            now_epoch
+            ;;
+    esac
 }
 
 # A digits-only check is not enough for shell arithmetic: a 40-digit value
@@ -236,12 +278,36 @@ normalize_integer() {
 # Bound every epoch, heartbeat interval, and lifetime the 0.8.0 code adds to 18 digits.
 bounded_integer() {
     positive_or_zero_integer "$1" || return 1
-    bounded_value=$(normalize_integer "$1")
-    [ "${#bounded_value}" -le 18 ]
+    set_normalized "$1"
+    [ "${#normalized}" -le 18 ]
 }
 
-retain_days() {
-    retained=$(sed -n 's/^retain //p' "$CONFIG")
+# What `$(sed -n "s/^$1 //p" "$CONFIG")` would hold, left in $CONFIG_VALUE:
+# the rest of every config line that starts with "$1 ", joined by newlines.
+read_config() {
+    CONFIG_VALUE=
+    config_read_any=0
+    while IFS= read -r config_read_line || [ -n "$config_read_line" ]; do
+        case "$config_read_line" in
+            "$1 "*)
+                if [ "$config_read_any" -eq 1 ]; then
+                    CONFIG_VALUE=$CONFIG_VALUE$NEWLINE${config_read_line#"$1 "}
+                else
+                    CONFIG_VALUE=${config_read_line#"$1 "}
+                    config_read_any=1
+                fi
+                ;;
+        esac
+    done < "$CONFIG"
+    while [ "${CONFIG_VALUE%"$NEWLINE"}" != "$CONFIG_VALUE" ]; do
+        CONFIG_VALUE=${CONFIG_VALUE%"$NEWLINE"}
+    done
+}
+
+# Retention in days, in $RETAIN_DAYS.
+read_retain_days() {
+    read_config retain
+    retained=$CONFIG_VALUE
     if [ -z "$retained" ]; then
         retained=30
     fi
@@ -249,7 +315,13 @@ retain_days() {
         error "config의 retain이 0 이상의 정수가 아닙니다"
         return 1
     fi
-    normalize_integer "$retained"
+    set_normalized "$retained"
+    RETAIN_DAYS=$normalized
+}
+
+retain_days() {
+    read_retain_days || return 1
+    printf '%s\n' "$RETAIN_DAYS"
 }
 
 # Age-out sweeps (expired alerts, aged cur/acked/dead, delivered log, and the
@@ -262,8 +334,10 @@ retain_days() {
 # outbox/new, archive capture, validation/quarantine and the session status generation
 # GC stay on every pass; only the age-out sweeps wait for `retention-interval`
 # seconds (300 by default; 0 = every pass) measured from run/retention.stamp.
-retention_interval_seconds() {
-    retention_interval=$(sed -n 's/^retention-interval //p' "$CONFIG")
+# The interval is left in $RETENTION_INTERVAL.
+read_retention_interval() {
+    read_config retention-interval
+    retention_interval=$CONFIG_VALUE
     if [ -z "$retention_interval" ]; then
         retention_interval=300
     fi
@@ -271,7 +345,8 @@ retention_interval_seconds() {
         error "config의 retention-interval이 0 이상 18자리 이하의 정수가 아닙니다"
         return 1
     fi
-    normalize_integer "$retention_interval"
+    set_normalized "$retention_interval"
+    RETENTION_INTERVAL=$normalized
 }
 
 # True when the age-out sweeps are due; stamps the pass so the next one waits.
@@ -281,40 +356,62 @@ retention_due() {
     retention_due_interval=$1
     retention_stamp=$KHALA_ROOT/run/retention.stamp
     if [ "$retention_due_interval" -gt 0 ] && [ -f "$retention_stamp" ]; then
-        retention_now=$(date +%s) || return 0
-        retention_last=$(file_mtime "$retention_stamp") || retention_last=
-        if bounded_integer "${retention_last-}" && \
+        now_epoch || return 0
+        retention_now=$NOW
+        read_file_mtime "$retention_stamp" || FILE_MTIME=
+        retention_last=$FILE_MTIME
+        if bounded_integer "$retention_last" && \
             [ "$retention_last" -le "$retention_now" ] && \
             [ "$((retention_now - retention_last))" -lt "$retention_due_interval" ]; then
             return 1
         fi
     fi
-    touch "$retention_stamp" 2>/dev/null || :
+    # Writing the stamp sets its mtime, as touch did, without a process; only
+    # the mtime is ever read.
+    { printf '\n' > "$retention_stamp"; } 2>/dev/null || :
     return 0
 }
 
+# Epoch mtime of $1 in $FILE_MTIME. GNU stat takes -c, BSD/macOS stat takes -f
+# and rejects -c. The flavor that answers is remembered for the process, and the
+# first lookup tries the one this OS normally ships, so a lookup is one process.
+read_file_mtime() {
+    case "$STAT_STYLE" in
+        gnu) FILE_MTIME=$(stat -c %Y "$1") || FILE_MTIME= ;;
+        bsd) FILE_MTIME=$(stat -f %m "$1") || FILE_MTIME= ;;
+        *)
+            case "${OSTYPE-}" in
+                darwin*|*bsd*) set -- "$1" bsd gnu ;;
+                *) set -- "$1" gnu bsd ;;
+            esac
+            for STAT_STYLE in "$2" "$3"; do
+                read_file_mtime "$1" && return 0
+            done
+            STAT_STYLE=
+            return 1
+            ;;
+    esac
+    positive_or_zero_integer "$FILE_MTIME"
+} 2>/dev/null
+
 file_mtime() {
-    mtime_path=$1
-    mtime_value=$(stat -c %Y "$mtime_path" 2>/dev/null) || mtime_value=
-    if positive_or_zero_integer "$mtime_value"; then
-        printf '%s\n' "$mtime_value"
-        return 0
-    fi
-    mtime_value=$(stat -f %m "$mtime_path" 2>/dev/null) || mtime_value=
-    if positive_or_zero_integer "$mtime_value"; then
-        printf '%s\n' "$mtime_value"
-        return 0
-    fi
-    return 1
+    read_file_mtime "$1" || return 1
+    printf '%s\n' "$FILE_MTIME"
 }
 
-self_node() {
-    node=$(sed -n 's/^self //p' "$CONFIG")
-    if ! valid_name "$node"; then
+# This node's name, in $SELF_NODE.
+read_self_node() {
+    read_config self
+    if ! valid_name "$CONFIG_VALUE"; then
         error "config의 self 항목이 없거나 잘못되었습니다"
         return 1
     fi
-    printf '%s\n' "$node"
+    SELF_NODE=$CONFIG_VALUE
+}
+
+self_node() {
+    read_self_node || return 1
+    printf '%s\n' "$SELF_NODE"
 }
 
 session_name() {
@@ -361,6 +458,30 @@ header_value() {
             "$key: "*) printf '%s\n' "${header_line#"$key: "}" ;;
         esac
     done < "$file"
+}
+
+# header_value's answer as `$(header_value key file)` would hold it, left in
+# $HEADER_VALUE: the matching values joined by newlines, trailing empty ones
+# dropped.
+read_header() {
+    HEADER_VALUE=
+    header_read_any=0
+    while IFS= read -r header_read_line || [ -n "$header_read_line" ]; do
+        [ -n "$header_read_line" ] || break
+        case "$header_read_line" in
+            "$1: "*)
+                if [ "$header_read_any" -eq 1 ]; then
+                    HEADER_VALUE=$HEADER_VALUE$NEWLINE${header_read_line#"$1: "}
+                else
+                    HEADER_VALUE=${header_read_line#"$1: "}
+                    header_read_any=1
+                fi
+                ;;
+        esac
+    done < "$2"
+    while [ "${HEADER_VALUE%"$NEWLINE"}" != "$HEADER_VALUE" ]; do
+        HEADER_VALUE=${HEADER_VALUE%"$NEWLINE"}
+    done
 }
 
 # Jev triage (review/jev-triage-r1.md, DESIGN §9.6): the notifier writes one
@@ -481,16 +602,18 @@ triage_status_line() {
 }
 
 # Number of lines anywhere in the file (header and body) starting with the
-# literal prefix — the fork-free twin of `grep -c "^prefix"`.
-line_prefix_count() {
-    prefix=$1
-    file=$2
+# literal prefix — the fork-free twin of `grep -c "^prefix"` — in $prefix_count.
+count_line_prefix() {
     prefix_count=0
     while IFS= read -r prefix_line || [ -n "$prefix_line" ]; do
         case "$prefix_line" in
-            "$prefix"*) prefix_count=$((prefix_count + 1)) ;;
+            "$1"*) prefix_count=$((prefix_count + 1)) ;;
         esac
-    done < "$file"
+    done < "$2"
+}
+
+line_prefix_count() {
+    count_line_prefix "$1" "$2"
     printf '%s\n' "$prefix_count"
 }
 
@@ -519,8 +642,11 @@ atomic_line() {
     line_destination=$1
     line_value=$2
     line_kind=$3
-    line_parent=$(dirname "$line_destination") || return 1
-    if ! mkdir -p "$line_parent"; then
+    case "$line_destination" in
+        */*) line_parent=${line_destination%/*} ;;
+        *) line_parent=. ;;
+    esac
+    if [ ! -d "${line_parent:-/}" ] && ! mkdir -p "${line_parent:-/}"; then
         return 1
     fi
     line_tmp=$(mktemp "$TMP_DIR/$line_kind.XXXXXX") || return 1
@@ -584,10 +710,14 @@ read_watchdog_marker() {
         *) return 1 ;;
     esac
     bounded_integer "$watcher_read_6" || return 1
-    watcher_read_declared_normalized=$(normalize_integer "$watcher_read_declared")
-    watcher_read_cadence=$(normalize_integer "$watcher_read_2")
-    watcher_read_last_notify=$(normalize_integer "$watcher_read_4")
-    watcher_read_state_since=$(normalize_integer "$watcher_read_6")
+    set_normalized "$watcher_read_declared"
+    watcher_read_declared_normalized=$normalized
+    set_normalized "$watcher_read_2"
+    watcher_read_cadence=$normalized
+    set_normalized "$watcher_read_4"
+    watcher_read_last_notify=$normalized
+    set_normalized "$watcher_read_6"
+    watcher_read_state_since=$normalized
     WATCHER_L1=$watcher_read_1
     WATCHER_L2=$watcher_read_2
     WATCHER_L3=$watcher_read_3
@@ -672,17 +802,19 @@ acquire_lock() {
             lock_attempt_limit=3
         fi
     fi
-    if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
+    if [ ! -d "$KHALA_ROOT/run" ] && \
+        { ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; }; then
         error "$KHALA_ROOT/run: lock 디렉터리를 준비하지 못했습니다"
         return 1
     fi
     lock_attempt=0
     while [ "$lock_attempt" -lt "$lock_attempt_limit" ]; do
         if mkdir "$lock_path" 2>/dev/null; then
-            lock_now=$(date +%s) || {
+            now_epoch || {
                 rmdir "$lock_path" 2>/dev/null || :
                 return 1
             }
+            lock_now=$NOW
             lock_owner_tmp=$lock_path/owner.tmp.$$
             if ! printf '%s\npid %s %s\n' "$lock_now" "$$" "$lock_what" \
                 > "$lock_owner_tmp" || ! mv "$lock_owner_tmp" "$lock_path/owner"; then
@@ -695,7 +827,8 @@ acquire_lock() {
             LOCK_HELD_PATHS[$lock_held_index]=$lock_path
             return 0
         fi
-        lock_now=$(date +%s) || return 1
+        now_epoch || return 1
+        lock_now=$NOW
         lock_owner_epoch=$(sed -n '1p' "$lock_path/owner" 2>/dev/null)
         lock_owner_line=$(sed -n '2p' "$lock_path/owner" 2>/dev/null)
         set -- $lock_owner_line
@@ -729,7 +862,11 @@ release_lock() {
         error "$release_path: 소유하지 않은 lock을 해제하려 했습니다"
         return 1
     fi
-    release_owner_line=$(sed -n '2p' "$release_path/owner" 2>/dev/null)
+    release_owner_line=
+    {
+        IFS= read -r release_owner_line && release_owner_line= &&
+            { IFS= read -r release_owner_line || [ -n "$release_owner_line" ]; }
+    } < "$release_path/owner" 2>/dev/null || release_owner_line=
     set -- $release_owner_line
     release_owner_pid=${2-}
     if [ "$release_owner_pid" != "$$" ]; then
@@ -781,9 +918,10 @@ trap 'lock_signal_cleanup PIPE' PIPE
 
 heartbeat() {
     heartbeat_session=$1
-    heartbeat_node=$(self_node) || return 1
+    read_self_node || return 1
+    heartbeat_node=$SELF_NODE
     heartbeat_tmp=$(mktemp "$TMP_DIR/heartbeat.XXXXXX") || return 1
-    if ! date +%s > "$heartbeat_tmp"; then
+    if ! now_epoch || ! printf '%s\n' "$NOW" > "$heartbeat_tmp"; then
         rm -f "$heartbeat_tmp"
         return 1
     fi
@@ -796,10 +934,11 @@ heartbeat() {
 
 refresh_watching_marker() {
     watching_tmp=$(mktemp "$TMP_DIR/watching.XXXXXX") || return 1
-    watching_epoch=$(date +%s) || {
+    now_epoch || {
         rm -f "$watching_tmp"
         return 1
     }
+    watching_epoch=$NOW
     if ! printf '%s\n%s\n' "$watching_epoch" "$watch_interval" > "$watching_tmp"; then
         rm -f "$watching_tmp"
         return 1
@@ -812,7 +951,8 @@ refresh_watching_marker() {
 }
 
 refresh_watch_lock() {
-    watch_lock_now=$(date +%s) || return 1
+    now_epoch || return 1
+    watch_lock_now=$NOW
     watch_lock_tmp=$watch_lock/owner.tmp.$$
     if ! printf '%s\npid %s watch\n%s\n' "$watch_lock_now" "$$" \
         "$watch_interval" > "$watch_lock_tmp"; then
@@ -827,7 +967,8 @@ refresh_watch_lock() {
 }
 
 acquire_watch_lock() {
-    if ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; then
+    if [ ! -d "$KHALA_ROOT/run" ] && \
+        { ! mkdir -p "$KHALA_ROOT/run" || ! chmod 700 "$KHALA_ROOT/run"; }; then
         error "$KHALA_ROOT/run: watch lock 디렉터리를 준비하지 못했습니다"
         return 1
     fi
@@ -853,7 +994,8 @@ acquire_watch_lock() {
             error "$watch_lock: 잘못된 watch lock owner"
             return 1
         fi
-        watch_lock_now=$(date +%s) || return 1
+        now_epoch || return 1
+        watch_lock_now=$NOW
         watch_stale_after=$((2 * (watch_owner_interval + watch_ttl)))
         if [ "$((watch_lock_now - watch_owner_epoch))" -gt "$watch_stale_after" ]; then
             if ! rm -rf -- "$watch_lock"; then
@@ -882,7 +1024,8 @@ watch_marker_cleanup() {
     if ! rm -f "$watch_marker"; then
         error "$watch_marker: watching marker를 지우지 못했습니다"
     fi
-    if ! rm -f "$watch_lock/owner" || ! rmdir "$watch_lock"; then
+    if ! rm -f "$watch_lock/owner" "$watch_lock/link-seen" "$watch_lock/pause" || \
+        ! rmdir "$watch_lock"; then
         error "$watch_lock: watch lock을 지우지 못했습니다"
     fi
     case "$watch_cleanup_event" in
@@ -905,8 +1048,10 @@ watching_status() {
             ! positive_integer "$watching_marker_interval"; then
             error "$watching_file: 잘못된 watching marker"
         else
-            watching_marker_epoch=$(normalize_integer "$watching_marker_epoch")
-            watching_marker_interval=$(normalize_integer "$watching_marker_interval")
+            set_normalized "$watching_marker_epoch"
+            watching_marker_epoch=$normalized
+            set_normalized "$watching_marker_interval"
+            watching_marker_interval=$normalized
             if [ "$((watching_now - watching_marker_epoch))" -le \
                 "$((watching_marker_interval + watching_ttl))" ]; then
                 watching_value=yes
@@ -1172,7 +1317,8 @@ load_listener_snapshots() {
 
 new_message_id() {
     id_from=$1
-    id_now=$(date +%s) || return 1
+    now_epoch || return 1
+    id_now=$NOW
     printf '%s.%s.%s.%s\n' "$id_now" "$$" "$RANDOM" "$id_from"
 }
 
@@ -1291,7 +1437,9 @@ validate_session_status_file() {
     return 0
 }
 
-current_session_status_generation() {
+# The path of the highest valid generation of a session's status, in
+# $CURRENT_SESSION_STATUS (empty when the session has none).
+find_current_session_status() {
     current_mind_node=$1
     current_mind_session=$2
     current_mind_dir=$KHALA_ROOT/minds/$current_mind_node/$current_mind_session
@@ -1308,8 +1456,10 @@ current_session_status_generation() {
             error "$current_candidate: 잘못된 세션 상태 generation"
             return 1
         fi
-        current_epoch=$(normalize_integer "${current_generation%%.*}")
-        current_counter=$(normalize_integer "${current_generation#*.}")
+        set_normalized "${current_generation%%.*}"
+        current_epoch=$normalized
+        set_normalized "${current_generation#*.}"
+        current_counter=$normalized
         if [ "$current_mind_found" -eq 0 ] || [ "$current_epoch" -gt "$current_mind_epoch" ] || \
             { [ "$current_epoch" -eq "$current_mind_epoch" ] && \
                 [ "$current_counter" -gt "$current_mind_counter" ]; }; then
@@ -1319,7 +1469,12 @@ current_session_status_generation() {
             current_mind_path=$current_candidate
         fi
     done
-    printf '%s\n' "$current_mind_path"
+    CURRENT_SESSION_STATUS=$current_mind_path
+}
+
+current_session_status_generation() {
+    find_current_session_status "$1" "$2" || return 1
+    printf '%s\n' "$CURRENT_SESSION_STATUS"
 }
 
 reset_session_status_update() {
@@ -1348,14 +1503,17 @@ write_session_status_generation() {
         return 1
     fi
     write_mind_current=$(current_session_status_generation "$write_mind_node" "$write_mind_session") || return 1
-    write_mind_now=$(date +%s) || {
+    now_epoch || {
         error "현재 시각을 읽지 못했습니다"
         return 1
     }
+    write_mind_now=$NOW
     if [ -n "$write_mind_current" ]; then
         write_mind_previous=$(basename "$write_mind_current")
-        write_mind_previous_epoch=$(normalize_integer "${write_mind_previous%%.*}")
-        write_mind_previous_counter=$(normalize_integer "${write_mind_previous#*.}")
+        set_normalized "${write_mind_previous%%.*}"
+        write_mind_previous_epoch=$normalized
+        set_normalized "${write_mind_previous#*.}"
+        write_mind_previous_counter=$normalized
     else
         write_mind_previous_epoch=0
         write_mind_previous_counter=0
@@ -1386,20 +1544,34 @@ write_session_status_generation() {
     # AMBIGUOUS: Which epoch represents a field never declared before the
     # first family-specific generation? Epoch 0 means "not yet declared".
     if [ -n "$write_mind_current" ]; then
-        write_state=$(header_value State "$write_mind_current")
-        write_model=$(header_value Model "$write_mind_current")
-        write_effort=$(header_value Effort "$write_mind_current")
-        write_role=$(header_value Role "$write_mind_current")
-        write_charge=$(header_value Charge "$write_mind_current")
-        write_focus=$(header_value Focus "$write_mind_current")
-        write_stance=$(header_value Stance "$write_mind_current")
-        write_declared_state=$(header_value Declared-State "$write_mind_current")
-        write_declared_model=$(header_value Declared-Model "$write_mind_current")
-        write_declared_effort=$(header_value Declared-Effort "$write_mind_current")
-        write_declared_role=$(header_value Declared-Role "$write_mind_current")
-        write_declared_charge=$(header_value Declared-Charge "$write_mind_current")
-        write_declared_focus=$(header_value Declared-Focus "$write_mind_current")
-        write_declared_stance=$(header_value Declared-Stance "$write_mind_current")
+        read_header State "$write_mind_current"
+        write_state=$HEADER_VALUE
+        read_header Model "$write_mind_current"
+        write_model=$HEADER_VALUE
+        read_header Effort "$write_mind_current"
+        write_effort=$HEADER_VALUE
+        read_header Role "$write_mind_current"
+        write_role=$HEADER_VALUE
+        read_header Charge "$write_mind_current"
+        write_charge=$HEADER_VALUE
+        read_header Focus "$write_mind_current"
+        write_focus=$HEADER_VALUE
+        read_header Stance "$write_mind_current"
+        write_stance=$HEADER_VALUE
+        read_header Declared-State "$write_mind_current"
+        write_declared_state=$HEADER_VALUE
+        read_header Declared-Model "$write_mind_current"
+        write_declared_model=$HEADER_VALUE
+        read_header Declared-Effort "$write_mind_current"
+        write_declared_effort=$HEADER_VALUE
+        read_header Declared-Role "$write_mind_current"
+        write_declared_role=$HEADER_VALUE
+        read_header Declared-Charge "$write_mind_current"
+        write_declared_charge=$HEADER_VALUE
+        read_header Declared-Focus "$write_mind_current"
+        write_declared_focus=$HEADER_VALUE
+        read_header Declared-Stance "$write_mind_current"
+        write_declared_stance=$HEADER_VALUE
     fi
     if [ "$MIND_SET_STATE" -eq 1 ]; then
         write_state=$MIND_STATE
@@ -1492,7 +1664,8 @@ quarantine_session_status_file() {
 
 install_pulled_session_status() {
     install_minds_root=$1
-    install_minds_now=$(date +%s) || return 1
+    now_epoch || return 1
+    install_minds_now=$NOW
     install_minds_days=$(retain_days) || return 1
     install_minds_seconds=$((install_minds_days * 86400))
     install_minds_failed=0
@@ -1511,7 +1684,8 @@ install_pulled_session_status() {
             install_minds_failed=1
             continue
         fi
-        install_mind_epoch=$(normalize_integer "${install_mind_generation%%.*}")
+        set_normalized "${install_mind_generation%%.*}"
+        install_mind_epoch=$normalized
         if [ "$install_mind_epoch" -gt "$((install_minds_now + 86400))" ]; then
             quarantine_session_status_file "$install_mind_file" "$install_mind_node" \
                 "$install_mind_session" "$install_mind_generation" \
@@ -1668,7 +1842,8 @@ archive_path_for() {
     archive_stream=$1
     archive_node=$2
     archive_id=$3
-    archive_epoch=$(normalize_integer "${archive_id%%.*}")
+    set_normalized "${archive_id%%.*}"
+    archive_epoch=$normalized
     detect_epoch_date_style || return 1
     case "$EPOCH_DATE_STYLE" in
         bsd) archive_month=$(date -u -r "$archive_epoch" '+%Y/%m') || return 1 ;;
@@ -1772,7 +1947,8 @@ capture_preserved_streams() {
     [ "$ARCHIVER_ENABLED" -eq 1 ] || return 0
     prepare_archiver || return 1
     capture_failed=0
-    capture_now=$(date +%s) || return 1
+    now_epoch || return 1
+    capture_now=$NOW
     for capture_file in "$KHALA_ROOT"/streams/*/*/*; do
         [ -f "$capture_file" ] || continue
         capture_node_dir=${capture_file%/*}
@@ -1787,7 +1963,8 @@ capture_preserved_streams() {
                 "$capture_id" "잘못된 preserve 대상 stream 항목" || capture_failed=1
             continue
         fi
-        capture_epoch=$(normalize_integer "${capture_id%%.*}")
+        set_normalized "${capture_id%%.*}"
+        capture_epoch=$normalized
         if [ "$capture_epoch" -gt "$((capture_now + 86400))" ]; then
             quarantine_stream_file "$capture_file" "$capture_stream" "$capture_node" \
                 "$capture_id" "하루를 넘는 미래 epoch" || capture_failed=1
@@ -1805,12 +1982,18 @@ validate_stream_file() {
     stream_file=$1
     stream_expected=$2
     stream_node_expected=$3
-    stream_id=$(header_value Id "$stream_file")
-    stream_from=$(header_value From "$stream_file")
-    stream_name=$(header_value Stream "$stream_file")
-    stream_date=$(header_value Date "$stream_file")
-    stream_type=$(header_value Type "$stream_file")
-    stream_refs=$(header_value Refs "$stream_file")
+    read_header Id "$stream_file"
+    stream_id=$HEADER_VALUE
+    read_header From "$stream_file"
+    stream_from=$HEADER_VALUE
+    read_header Stream "$stream_file"
+    stream_name=$HEADER_VALUE
+    read_header Date "$stream_file"
+    stream_date=$HEADER_VALUE
+    read_header Type "$stream_file"
+    stream_type=$HEADER_VALUE
+    read_header Refs "$stream_file"
+    stream_refs=$HEADER_VALUE
     if ! valid_message_id "$stream_id" || [ "${stream_file##*/}" != "$stream_id" ]; then
         return 1
     fi
@@ -1825,10 +2008,10 @@ validate_stream_file() {
         [ "$stream_type" != entry ]; then
         return 1
     fi
-    if [ "$(header_value Khala "$stream_file")" != 0.1 ] || \
-        [ "$(line_prefix_count 'Expires:' "$stream_file")" -ne 0 ]; then
-        return 1
-    fi
+    read_header Khala "$stream_file"
+    [ "$HEADER_VALUE" = 0.1 ] || return 1
+    count_line_prefix 'Expires:' "$stream_file"
+    [ "$prefix_count" -eq 0 ] || return 1
     if [ -n "$stream_refs" ] && ! valid_message_id "$stream_refs"; then
         return 1
     fi
@@ -1875,7 +2058,7 @@ collect_stream_entries() {
     }
     for collect_file in "$KHALA_ROOT/streams/$collect_stream"/*/*; do
         [ -f "$collect_file" ] || continue
-        collect_id=$(basename "$collect_file")
+        collect_id=${collect_file##*/}
         collect_epoch=${collect_id%%.*}
         if ! positive_or_zero_integer "$collect_epoch"; then
             continue
@@ -2008,10 +2191,11 @@ build_unread_stream_entries() {
         unread_cursor_epoch=${unread_cursor%%.*}
     fi
     unread_retain_days=$(retain_days) || return 1
-    unread_now=$(date +%s) || {
+    now_epoch || {
         error "현재 시각을 읽지 못했습니다"
         return 1
     }
+    unread_now=$NOW
     unread_retain_seconds=$((unread_retain_days * 86400))
     unread_all=$(mktemp "$TMP_DIR/stream-unread-all.XXXXXX") || return 1
     if ! collect_stream_entries "$unread_stream" "$unread_all"; then
@@ -2024,7 +2208,8 @@ build_unread_stream_entries() {
     }
     while IFS="$TAB" read -r unread_epoch unread_id unread_path; do
         [ -n "${unread_epoch-}" ] || continue
-        unread_epoch_normalized=$(normalize_integer "$unread_epoch")
+        set_normalized "$unread_epoch"
+        unread_epoch_normalized=$normalized
         if [ "$((unread_epoch_normalized + unread_retain_seconds))" -lt "$unread_now" ]; then
             continue
         fi
@@ -2186,7 +2371,8 @@ record_delivered() {
     if delivered_before "$delivered_id"; then
         return 0
     fi
-    delivered_now=$(date +%s) || return 1
+    now_epoch || return 1
+    delivered_now=$NOW
     delivered_tmp=$(mktemp "$TMP_DIR/delivered.XXXXXX") || return 1
     if ! cp "$KHALA_ROOT/log/delivered" "$delivered_tmp"; then
         rm -f "$delivered_tmp"
@@ -2324,7 +2510,8 @@ prune_listener_quarantine() {
         for prune_ear_file in "$KHALA_ROOT"/quarantine/ears/"$prune_ear_node".*; do
             [ -f "$prune_ear_file" ] || continue
             prune_ear_count=$((prune_ear_count + 1))
-            prune_ear_mtime=$(file_mtime "$prune_ear_file") || prune_ear_mtime=0
+            read_file_mtime "$prune_ear_file" || FILE_MTIME=0
+            prune_ear_mtime=$FILE_MTIME
             if [ -z "$prune_ear_oldest" ] || [ "$prune_ear_mtime" -lt "$prune_ear_oldest_mtime" ] || \
                 { [ "$prune_ear_mtime" -eq "$prune_ear_oldest_mtime" ] && \
                     [ "$prune_ear_file" \< "$prune_ear_oldest" ]; }; then
@@ -2357,7 +2544,8 @@ quarantine_pulled_listener_snapshot() {
 
 install_pulled_listener_snapshots() {
     install_ear_root=$1
-    install_ear_now=$(date +%s) || return 1
+    now_epoch || return 1
+    install_ear_now=$NOW
     for install_ear_file in "$install_ear_root"/conduit@*.ear; do
         [ -f "$install_ear_file" ] || continue
         install_ear_basename=${install_ear_file##*/}
@@ -2418,7 +2606,8 @@ pull_listener_snapshots_from_endpoint() {
 
 install_pulled_streams() {
     install_root=$1
-    install_now=$(date +%s) || return 1
+    now_epoch || return 1
+    install_now=$NOW
     for install_file in "$install_root"/*/*/*; do
         [ -f "$install_file" ] || continue
         install_node=$(basename "$(dirname "$install_file")")
@@ -2430,7 +2619,8 @@ install_pulled_streams() {
                 "$install_id" "잘못된 pull stream 항목" || return 1
             continue
         fi
-        install_epoch=$(normalize_integer "${install_id%%.*}")
+        set_normalized "${install_id%%.*}"
+        install_epoch=$normalized
         if [ "$install_epoch" -gt "$((install_now + 86400))" ]; then
             quarantine_stream_file "$install_file" "$install_stream" "$install_node" \
                 "$install_id" "하루를 넘는 미래 epoch" || return 1
@@ -2502,7 +2692,8 @@ remove_pushed_infrastructure() {
     pushed_dir=$1
     for pushed_file in "$pushed_dir"/*; do
         [ -f "$pushed_file" ] || continue
-        pushed_type=$(header_value Type "$pushed_file")
+        read_header Type "$pushed_file"
+        pushed_type=$HEADER_VALUE
         # An alert keeps its source copy until Expires: the upstream accepting
         # bytes is not delivery (R4). The destination deduplicates repeats by
         # Id, and prune_expired_alerts removes the copy once it expires.
@@ -2683,8 +2874,9 @@ validate_spool_file() {
                 ;;
         esac
     done < "$spool_file"
-    spool_id=$(header_value Id "$spool_file")
-    if [ -z "$spool_id" ] || [ "$(basename "$spool_file")" != "$spool_id" ]; then
+    read_header Id "$spool_file"
+    spool_id=$HEADER_VALUE
+    if [ -z "$spool_id" ] || [ "${spool_file##*/}" != "$spool_id" ]; then
         sync_error "$spool_file: filename과 Id가 다릅니다"
         return 1
     fi
@@ -2711,17 +2903,22 @@ move_old_invalid_spool_file() {
 }
 
 copy_outbox_to_spool() {
-    copy_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    copy_now=$NOW
     for outbox_file in "$KHALA_ROOT"/outbox/new/*; do
         [ -f "$outbox_file" ] || continue
-        outbox_id=$(header_value Id "$outbox_file")
-        outbox_type=$(header_value Type "$outbox_file")
-        outbox_to=$(header_value To "$outbox_file")
-        outbox_expires=$(header_value Expires "$outbox_file")
-        if [ -z "$outbox_id" ] || [ "$(basename "$outbox_file")" != "$outbox_id" ]; then
+        read_header Id "$outbox_file"
+        outbox_id=$HEADER_VALUE
+        read_header Type "$outbox_file"
+        outbox_type=$HEADER_VALUE
+        read_header To "$outbox_file"
+        outbox_to=$HEADER_VALUE
+        read_header Expires "$outbox_file"
+        outbox_expires=$HEADER_VALUE
+        if [ -z "$outbox_id" ] || [ "${outbox_file##*/}" != "$outbox_id" ]; then
             sync_error "$outbox_file: filename과 Id가 다릅니다"
             continue
         fi
@@ -2754,10 +2951,14 @@ copy_outbox_to_spool() {
 
 deliver_regular_message() {
     incoming_file=$1
-    incoming_id=$(header_value Id "$incoming_file")
-    incoming_from=$(header_value From "$incoming_file")
-    incoming_to=$(header_value To "$incoming_file")
-    incoming_expires=$(header_value Expires "$incoming_file")
+    read_header Id "$incoming_file"
+    incoming_id=$HEADER_VALUE
+    read_header From "$incoming_file"
+    incoming_from=$HEADER_VALUE
+    read_header To "$incoming_file"
+    incoming_to=$HEADER_VALUE
+    read_header Expires "$incoming_file"
+    incoming_expires=$HEADER_VALUE
     if ! valid_address "$incoming_from" || ! valid_address "$incoming_to"; then
         sync_error "$incoming_file: 잘못된 주소 헤더"
         return
@@ -2766,10 +2967,11 @@ deliver_regular_message() {
         sync_error "$incoming_file: 잘못된 Expires 헤더"
         return
     fi
-    incoming_now=$(date +%s) || {
+    now_epoch || {
         sync_error "$incoming_file: 현재 시각을 읽지 못했습니다"
         return
     }
+    incoming_now=$NOW
     if [ "$incoming_expires" -le "$incoming_now" ]; then
         if ! rm -f "$incoming_file"; then
             sync_error "$incoming_file: 만료된 spool 사본을 지우지 못했습니다"
@@ -2814,9 +3016,12 @@ coalesce_unread_info_alerts() {
     for fold_notice_file in "$fold_notice_dir"/*; do
         [ -f "$fold_notice_file" ] || continue
         [ -L "$fold_notice_file" ] && continue
-        [ "$(header_value Type "$fold_notice_file")" = notice ] || continue
-        [ "$(header_value Urgency "$fold_notice_file")" = info ] || continue
-        [ "$(header_value From "$fold_notice_file")" = "$fold_notice_from" ] || continue
+        read_header Type "$fold_notice_file"
+        [ "$HEADER_VALUE" = notice ] || continue
+        read_header Urgency "$fold_notice_file"
+        [ "$HEADER_VALUE" = info ] || continue
+        read_header From "$fold_notice_file"
+        [ "$HEADER_VALUE" = "$fold_notice_from" ] || continue
         if ! rm -f "$fold_notice_file"; then
             sync_error "$fold_notice_file: 이전 읽지 않은 info 경보를 병합하지 못했습니다"
             return 1
@@ -2827,30 +3032,38 @@ coalesce_unread_info_alerts() {
 
 deliver_fire_and_forget() {
     incoming_file=$1
-    incoming_id=$(header_value Id "$incoming_file")
-    incoming_to=$(header_value To "$incoming_file")
-    incoming_type=$(header_value Type "$incoming_file")
+    read_header Id "$incoming_file"
+    incoming_id=$HEADER_VALUE
+    read_header To "$incoming_file"
+    incoming_to=$HEADER_VALUE
+    read_header Type "$incoming_file"
+    incoming_type=$HEADER_VALUE
     incoming_fold_info=0
     if ! valid_address "$incoming_to"; then
         sync_error "$incoming_file: 잘못된 To 헤더"
         return
     fi
     if [ "$incoming_type" = notice ]; then
-        incoming_urgency=$(header_value Urgency "$incoming_file")
+        read_header Urgency "$incoming_file"
+        incoming_urgency=$HEADER_VALUE
         if [ "$incoming_urgency" = info ]; then
-            incoming_from=$(header_value From "$incoming_file")
+            read_header From "$incoming_file"
+            incoming_from=$HEADER_VALUE
             incoming_fold_info=1
         fi
-        incoming_expires=$(header_value Expires "$incoming_file")
+        read_header Expires "$incoming_file"
+        incoming_expires=$HEADER_VALUE
         if ! bounded_integer "$incoming_expires"; then
             sync_error "$incoming_file: 잘못된 경보 Expires 헤더"
             return
         fi
-        incoming_expires=$(normalize_integer "$incoming_expires")
-        incoming_now=$(date +%s) || {
+        set_normalized "$incoming_expires"
+        incoming_expires=$normalized
+        now_epoch || {
             sync_error "$incoming_file: 현재 시각을 읽지 못했습니다"
             return
         }
+        incoming_now=$NOW
         if [ "$incoming_expires" -le "$incoming_now" ]; then
             if ! rm -f "$incoming_file"; then
                 sync_error "$incoming_file: 만료된 경보를 지우지 못했습니다"
@@ -2895,7 +3108,8 @@ deliver_messages() {
             [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$incoming_file"
             continue
         fi
-        incoming_type=$(header_value Type "$incoming_file")
+        read_header Type "$incoming_file"
+        incoming_type=$HEADER_VALUE
         if [ "$incoming_type" = message ] || [ "$incoming_type" = operator ]; then
             deliver_regular_message "$incoming_file"
         fi
@@ -2904,17 +3118,22 @@ deliver_messages() {
 
 expire_outbox() {
     expire_self=$1
-    expire_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    expire_now=$NOW
     for expired_file in "$KHALA_ROOT"/outbox/new/*; do
         [ -f "$expired_file" ] || continue
-        expired_id=$(header_value Id "$expired_file")
-        expired_from=$(header_value From "$expired_file")
-        expired_to=$(header_value To "$expired_file")
-        expired_at=$(header_value Expires "$expired_file")
-        if [ -z "$expired_id" ] || [ "$(basename "$expired_file")" != "$expired_id" ]; then
+        read_header Id "$expired_file"
+        expired_id=$HEADER_VALUE
+        read_header From "$expired_file"
+        expired_from=$HEADER_VALUE
+        read_header To "$expired_file"
+        expired_to=$HEADER_VALUE
+        read_header Expires "$expired_file"
+        expired_at=$HEADER_VALUE
+        if [ -z "$expired_id" ] || [ "${expired_file##*/}" != "$expired_id" ]; then
             sync_error "$expired_file: filename과 Id가 다릅니다"
             continue
         fi
@@ -2954,7 +3173,8 @@ deliver_infrastructure() {
             [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$incoming_file"
             continue
         fi
-        incoming_type=$(header_value Type "$incoming_file")
+        read_header Type "$incoming_file"
+        incoming_type=$HEADER_VALUE
         case "$incoming_type" in
             bounce|notice) deliver_fire_and_forget "$incoming_file" ;;
         esac
@@ -2969,9 +3189,11 @@ settle_acks() {
             [ "$SPOOL_INVALID_IMMEDIATE" -eq 1 ] || move_old_invalid_spool_file "$ack_file"
             continue
         fi
-        ack_type=$(header_value Type "$ack_file")
+        read_header Type "$ack_file"
+        ack_type=$HEADER_VALUE
         [ "$ack_type" = ack ] || continue
-        ack_ref=$(header_value Refs "$ack_file")
+        read_header Refs "$ack_file"
+        ack_ref=$HEADER_VALUE
         if [ -z "$ack_ref" ]; then
             sync_error "$ack_file: Refs 헤더가 없습니다"
             continue
@@ -2992,7 +3214,8 @@ settle_acks() {
             reference_file=$KHALA_ROOT/outbox/dead/$ack_ref
         fi
         if [ -n "$reference_file" ]; then
-            original_to=$(header_value To "$reference_file")
+            read_header To "$reference_file"
+            original_to=$HEADER_VALUE
             if valid_address "$original_to"; then
                 original_node=${original_to#*@}
                 if ! rm -f "$KHALA_ROOT/spool/for/$original_node/$ack_ref"; then
@@ -3008,10 +3231,11 @@ settle_acks() {
 }
 
 prune_delivered_log() {
-    prune_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    prune_now=$NOW
     prune_before=$((prune_now - 5184000))
     prune_tmp=$(mktemp "$TMP_DIR/prune.XXXXXX") || {
         sync_error "dedup 로그 임시 파일을 만들지 못했습니다"
@@ -3053,19 +3277,23 @@ retention_path_inside_root() {
 }
 
 prune_expired_alerts() {
-    prune_notice_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    prune_notice_now=$NOW
     for prune_notice_file in "$KHALA_ROOT"/spool/for/*/* \
         "$KHALA_ROOT"/inbox/*/new/* "$KHALA_ROOT"/inbox/*/cur/*; do
         [ -f "$prune_notice_file" ] || continue
         [ -L "$prune_notice_file" ] && continue
         retention_path_inside_root "$prune_notice_file" || continue
-        [ "$(header_value Type "$prune_notice_file")" = notice ] || continue
-        prune_notice_expires=$(header_value Expires "$prune_notice_file")
+        read_header Type "$prune_notice_file"
+        [ "$HEADER_VALUE" = notice ] || continue
+        read_header Expires "$prune_notice_file"
+        prune_notice_expires=$HEADER_VALUE
         bounded_integer "$prune_notice_expires" || continue
-        prune_notice_expires=$(normalize_integer "$prune_notice_expires")
+        set_normalized "$prune_notice_expires"
+        prune_notice_expires=$normalized
         if [ "$prune_notice_expires" -le "$prune_notice_now" ]; then
             if ! rm -f "$prune_notice_file"; then
                 sync_error "$prune_notice_file: 만료된 경보를 지우지 못했습니다"
@@ -3074,53 +3302,130 @@ prune_expired_alerts() {
     done
 }
 
+# prune_aged_archive <file> <Id epoch> <mtime, or empty when unknown>
+# Age = time the file entered this state (inbox read/ack/expiry touch its
+# mtime), never the Id epoch: a message that waited 31 days in new/ must
+# not vanish the moment it is read. A file whose mtime predates its
+# own Id (clock skew, restored backup) falls back to the Id epoch.
+prune_aged_archive() {
+    prune_aged_epoch=$3
+    if ! bounded_integer "$prune_aged_epoch" || [ "$prune_aged_epoch" -lt "$2" ]; then
+        prune_aged_epoch=$2
+    fi
+    if [ "$prune_aged_epoch" -le "$prune_archive_now" ] && \
+        [ "$((prune_archive_now - prune_aged_epoch))" -gt "$prune_archive_seconds" ]; then
+        if ! rm -f "$1"; then
+            sync_error "$1: retention 지난 메시지를 지우지 못했습니다"
+        fi
+    fi
+}
+
+# prune_aged_archive for the listed file $1, with an mtime looked up on its own.
+prune_listed_archive() {
+    read_file_mtime "${prune_archive_files[$1]}" || FILE_MTIME=
+    prune_aged_archive "${prune_archive_files[$1]}" "${prune_archive_epochs[$1]}" "$FILE_MTIME"
+}
+
 prune_message_archives() {
-    prune_archive_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
-    prune_archive_days=$(retain_days) || {
+    prune_archive_now=$NOW
+    read_retain_days || {
         sync_error "메시지 retention 설정을 읽지 못했습니다"
         return
     }
+    prune_archive_days=$RETAIN_DAYS
     prune_archive_seconds=$((prune_archive_days * 86400))
+    # The age counts from the later of mtime and Id epoch, so a file whose Id is
+    # still inside retention stays whatever its mtime is. Only the others are
+    # listed for an mtime lookup, and the sweep costs processes for those alone
+    # instead of for every archived message.
+    prune_archive_files=()
+    prune_archive_epochs=()
     for prune_archive_file in "$KHALA_ROOT"/inbox/*/cur/* \
         "$KHALA_ROOT"/outbox/acked/* "$KHALA_ROOT"/outbox/dead/*; do
         [ -f "$prune_archive_file" ] || continue
         [ -L "$prune_archive_file" ] && continue
         retention_path_inside_root "$prune_archive_file" || continue
-        prune_archive_id=$(header_value Id "$prune_archive_file")
+        read_header Id "$prune_archive_file"
+        prune_archive_id=$HEADER_VALUE
         valid_message_id "$prune_archive_id" || continue
-        # Age = time the file entered this state (inbox read/ack/expiry touch its
-        # mtime), never the Id epoch: a message that waited 31 days in new/ must
-        # not vanish the moment it is read. A file whose mtime predates its
-        # own Id (clock skew, restored backup) falls back to the Id epoch.
-        prune_archive_epoch=$(file_mtime "$prune_archive_file") || prune_archive_epoch=
         bounded_integer "${prune_archive_id%%.*}" || continue
-        prune_archive_id_epoch=$(normalize_integer "${prune_archive_id%%.*}")
-        if ! bounded_integer "${prune_archive_epoch-}" || \
-            [ "$prune_archive_epoch" -lt "$prune_archive_id_epoch" ]; then
-            prune_archive_epoch=$prune_archive_id_epoch
-        fi
-        if [ "$prune_archive_epoch" -le "$prune_archive_now" ] && \
-            [ "$((prune_archive_now - prune_archive_epoch))" -gt "$prune_archive_seconds" ]; then
-            if ! rm -f "$prune_archive_file"; then
-                sync_error "$prune_archive_file: retention 지난 메시지를 지우지 못했습니다"
-            fi
-        fi
+        prune_archive_id_epoch=$normalized
+        [ "$prune_archive_id_epoch" -le "$prune_archive_now" ] && \
+            [ "$((prune_archive_now - prune_archive_id_epoch))" -gt "$prune_archive_seconds" ] || \
+            continue
+        case "$prune_archive_file" in
+            *"$NEWLINE"*)
+                # Its stat answer would not be one line; never listed.
+                read_file_mtime "$prune_archive_file" || FILE_MTIME=
+                prune_aged_archive "$prune_archive_file" "$prune_archive_id_epoch" "$FILE_MTIME"
+                continue
+                ;;
+        esac
+        prune_archive_files[${#prune_archive_files[@]}]=$prune_archive_file
+        prune_archive_epochs[${#prune_archive_epochs[@]}]=$prune_archive_id_epoch
+    done
+    prune_archive_count=${#prune_archive_files[@]}
+    [ "$prune_archive_count" -gt 0 ] || return 0
+    [ -n "$STAT_STYLE" ] || read_file_mtime "$CONFIG" || :
+    # One stat process answers for up to 200 listed files, a "mtime path" line
+    # each. A line is used only when it is exactly the path of a listed file;
+    # a file with no such line (it vanished, or stat refused it) is looked up
+    # on its own, as every file used to be.
+    prune_archive_index=0
+    while [ "$prune_archive_index" -lt "$prune_archive_count" ]; do
+        prune_archive_end=$((prune_archive_index + 200))
+        [ "$prune_archive_end" -le "$prune_archive_count" ] || prune_archive_end=$prune_archive_count
+        case "$STAT_STYLE" in
+            gnu)
+                prune_archive_stat=$(stat -c '%Y %n' -- \
+                    "${prune_archive_files[@]:prune_archive_index:200}" 2>/dev/null)
+                ;;
+            bsd)
+                prune_archive_stat=$(stat -f '%m %N' -- \
+                    "${prune_archive_files[@]:prune_archive_index:200}" 2>/dev/null)
+                ;;
+            *) prune_archive_stat= ;;
+        esac
+        while IFS= read -r prune_archive_line; do
+            prune_archive_seek=$prune_archive_index
+            while [ "$prune_archive_seek" -lt "$prune_archive_end" ] && \
+                [ "${prune_archive_files[$prune_archive_seek]}" != "${prune_archive_line#* }" ]; do
+                prune_archive_seek=$((prune_archive_seek + 1))
+            done
+            [ "$prune_archive_seek" -lt "$prune_archive_end" ] || continue
+            while [ "$prune_archive_index" -lt "$prune_archive_seek" ]; do
+                prune_listed_archive "$prune_archive_index"
+                prune_archive_index=$((prune_archive_index + 1))
+            done
+            prune_aged_archive "${prune_archive_files[$prune_archive_index]}" \
+                "${prune_archive_epochs[$prune_archive_index]}" "${prune_archive_line%% *}"
+            prune_archive_index=$((prune_archive_index + 1))
+        done <<EOF
+$prune_archive_stat
+EOF
+        while [ "$prune_archive_index" -lt "$prune_archive_end" ]; do
+            prune_listed_archive "$prune_archive_index"
+            prune_archive_index=$((prune_archive_index + 1))
+        done
     done
 }
 
 watchdog_heartbeat_timeout() {
     deadman_node=$1
-    deadman_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    deadman_now=$NOW
     for deadman_marker in "$KHALA_ROOT"/presence/*@"$deadman_node".watcher; do
         [ -f "$deadman_marker" ] || continue
         [ -L "$deadman_marker" ] && continue
-        deadman_address=$(basename "$deadman_marker" .watcher)
+        deadman_address=${deadman_marker##*/}
+        deadman_address=${deadman_address%.watcher}
         if ! valid_address "$deadman_address"; then
             sync_error "$deadman_marker: 잘못된 워치독 마커 파일명"
             continue
@@ -3196,15 +3501,17 @@ watchdog_heartbeat_timeout() {
 
 deregister_timed_out_watchdogs() {
     retire_dead_node=$1
-    retire_dead_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
+    retire_dead_now=$NOW
     retire_dead_after=$((7 * 86400))
     for retire_dead_marker in "$KHALA_ROOT"/presence/*@"$retire_dead_node".watcher; do
         [ -f "$retire_dead_marker" ] || continue
         [ -L "$retire_dead_marker" ] && continue
-        retire_dead_address=$(basename "$retire_dead_marker" .watcher)
+        retire_dead_address=${retire_dead_marker##*/}
+        retire_dead_address=${retire_dead_address%.watcher}
         if ! valid_address "$retire_dead_address"; then
             sync_error "$retire_dead_marker: 잘못된 워치독 마커 파일명"
             continue
@@ -3290,14 +3597,16 @@ deregister_timed_out_watchdogs() {
 # ($1 = 1 when that sweep is due).
 prune_stream_entries() {
     prune_stream_retention=$1
-    prune_stream_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
-    prune_stream_days=$(retain_days) || {
+    prune_stream_now=$NOW
+    read_retain_days || {
         sync_error "stream retention 설정을 읽지 못했습니다"
         return
     }
+    prune_stream_days=$RETAIN_DAYS
     prune_stream_seconds=$((prune_stream_days * 86400))
     for prune_stream_file in "$KHALA_ROOT"/streams/*/*/*; do
         [ -f "$prune_stream_file" ] || continue
@@ -3313,7 +3622,8 @@ prune_stream_entries() {
                 sync_error "$prune_stream_file: 잘못된 stream 항목 격리에 실패했습니다"
             continue
         fi
-        prune_stream_epoch=$(normalize_integer "${prune_stream_id%%.*}")
+        set_normalized "${prune_stream_id%%.*}"
+        prune_stream_epoch=$normalized
         if [ "$prune_stream_epoch" -gt "$((prune_stream_now + 86400))" ]; then
             quarantine_stream_file "$prune_stream_file" "$prune_stream_name" \
                 "$prune_stream_node" "$prune_stream_id" "하루를 넘는 미래 epoch" || \
@@ -3353,14 +3663,16 @@ prune_stream_entries() {
 # waits for the retention interval ($1 = 1 when that sweep is due).
 prune_session_status_generations() {
     prune_mind_retention=$1
-    prune_mind_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
-    prune_mind_days=$(retain_days) || {
+    prune_mind_now=$NOW
+    read_retain_days || {
         sync_error "세션 상태 retention 설정을 읽지 못했습니다"
         return
     }
+    prune_mind_days=$RETAIN_DAYS
     prune_mind_seconds=$((prune_mind_days * 86400))
     for prune_mind_session_dir in "$KHALA_ROOT"/minds/*/*; do
         [ -d "$prune_mind_session_dir" ] || continue
@@ -3378,7 +3690,8 @@ prune_session_status_generations() {
                     sync_error "$prune_mind_file: 세션 상태 quarantine에 실패했습니다"
                 continue
             fi
-            prune_mind_epoch=$(normalize_integer "${prune_mind_generation%%.*}")
+            set_normalized "${prune_mind_generation%%.*}"
+            prune_mind_epoch=$normalized
             if [ "$prune_mind_epoch" -gt "$((prune_mind_now + 86400))" ]; then
                 quarantine_session_status_file "$prune_mind_file" "$prune_mind_node" \
                     "$prune_mind_session" "$prune_mind_generation" \
@@ -3386,13 +3699,13 @@ prune_session_status_generations() {
                     sync_error "$prune_mind_file: 미래 세션 상태 quarantine에 실패했습니다"
             fi
         done
-        if ! prune_mind_current=$(current_session_status_generation "$prune_mind_node" \
-            "$prune_mind_session"); then
+        if ! find_current_session_status "$prune_mind_node" "$prune_mind_session"; then
             sync_error "$prune_mind_session_dir: 현재 세션 상태 generation을 정하지 못했습니다"
             continue
         fi
+        prune_mind_current=$CURRENT_SESSION_STATUS
         [ -n "$prune_mind_current" ] || {
-            rmdir "$prune_mind_session_dir" 2>/dev/null || :
+            remove_empty_dir "$prune_mind_session_dir"
             continue
         }
         for prune_mind_file in "$prune_mind_session_dir"/*; do
@@ -3405,24 +3718,29 @@ prune_session_status_generations() {
         done
         [ "$prune_mind_retention" -eq 1 ] || continue
         prune_mind_generation=${prune_mind_current##*/}
-        prune_mind_epoch=$(normalize_integer "${prune_mind_generation%%.*}")
+        set_normalized "${prune_mind_generation%%.*}"
+        prune_mind_epoch=$normalized
         if [ "$((prune_mind_epoch + prune_mind_seconds))" -lt "$prune_mind_now" ]; then
             if ! rm -f "$prune_mind_current"; then
                 sync_error "$prune_mind_current: retention 지난 최대 세션 상태 generation을 지우지 못했습니다"
             fi
         fi
-        rmdir "$prune_mind_session_dir" 2>/dev/null || :
+        remove_empty_dir "$prune_mind_session_dir"
     done
     for prune_mind_node_dir in "$KHALA_ROOT"/minds/*; do
         [ -d "$prune_mind_node_dir" ] || continue
-        rmdir "$prune_mind_node_dir" 2>/dev/null || :
+        remove_empty_dir "$prune_mind_node_dir"
     done
 }
 
-presence_record_epoch() {
+# The epoch a session heartbeat or retirement record carries, in $normalized.
+read_presence_epoch() {
     presence_record_file=$1
+    # A file that cannot be read leaves all three empty and is refused below,
+    # never judged by the record read before it.
+    presence_record_first= presence_record_second= presence_record_extra=
     IFS=' ' read -r presence_record_first presence_record_second presence_record_extra \
-        < "$presence_record_file"
+        < "$presence_record_file" || :
     if [ "$presence_record_first" = retired ]; then
         presence_record_value=$presence_record_second
         [ -z "${presence_record_extra-}" ] || return 1
@@ -3431,19 +3749,21 @@ presence_record_epoch() {
         [ -z "${presence_record_second-}" ] && [ -z "${presence_record_extra-}" ] || return 1
     fi
     positive_or_zero_integer "$presence_record_value" || return 1
-    normalize_integer "$presence_record_value"
+    set_normalized "$presence_record_value"
 }
 
 prune_presence() {
     prune_presence_node=$1
-    prune_presence_now=$(date +%s) || {
+    now_epoch || {
         sync_error "현재 시각을 읽지 못했습니다"
         return
     }
-    prune_presence_days=$(retain_days) || {
+    prune_presence_now=$NOW
+    read_retain_days || {
         sync_error "presence retention 설정을 읽지 못했습니다"
         return
     }
+    prune_presence_days=$RETAIN_DAYS
     prune_presence_seconds=$((prune_presence_days * 86400))
     for prune_presence_file in "$KHALA_ROOT"/presence/*; do
         [ -f "$prune_presence_file" ] || continue
@@ -3451,7 +3771,8 @@ prune_presence() {
             *.watching) continue ;;
             *.ear)
                 [ -L "$prune_presence_file" ] && continue
-                prune_presence_mtime=$(file_mtime "$prune_presence_file") || continue
+                read_file_mtime "$prune_presence_file" || continue
+                prune_presence_mtime=$FILE_MTIME
                 if [ "$((prune_presence_mtime + prune_presence_seconds))" -lt \
                     "$prune_presence_now" ]; then
                     if ! rm -f "$prune_presence_file"; then
@@ -3492,10 +3813,11 @@ prune_presence() {
                 continue
                 ;;
         esac
-        if ! prune_presence_epoch=$(presence_record_epoch "$prune_presence_file"); then
+        if ! read_presence_epoch "$prune_presence_file"; then
             sync_error "$prune_presence_file: 잘못된 heartbeat"
             continue
         fi
+        prune_presence_epoch=$normalized
         if [ "$((prune_presence_epoch + prune_presence_seconds))" -lt "$prune_presence_now" ]; then
             if ! rm -f "$prune_presence_file"; then
                 sync_error "$prune_presence_file: retention 지난 heartbeat를 지우지 못했습니다"
@@ -3504,12 +3826,23 @@ prune_presence() {
     done
 }
 
+# `rmdir "$1" 2>/dev/null || :` that starts rmdir only when the directory looks
+# empty, so the passes that find it in use cost no process.
+remove_empty_dir() {
+    for remove_empty_entry in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+        if [ -e "$remove_empty_entry" ] || [ -L "$remove_empty_entry" ]; then
+            return 0
+        fi
+    done
+    rmdir "$1" 2>/dev/null || :
+}
+
 prune_session_stream_state() {
     state_self=$1
     for state_family in join cursor; do
         for state_session_dir in "$KHALA_ROOT/$state_family"/*; do
             [ -d "$state_session_dir" ] || continue
-            state_session=$(basename "$state_session_dir")
+            state_session=${state_session_dir##*/}
             state_presence=$KHALA_ROOT/presence/$state_session@$state_self
             state_collect=0
             if [ ! -f "$state_presence" ]; then
@@ -3528,7 +3861,7 @@ prune_session_stream_state() {
                     sync_error "$state_file: 죽은 세션의 stream 상태를 지우지 못했습니다"
                 fi
             done
-            rmdir "$state_session_dir" 2>/dev/null || :
+            remove_empty_dir "$state_session_dir"
         done
     done
 }
@@ -3539,14 +3872,15 @@ reconcile_cycle() {
         sync_error "상태 잠금을 얻지 못했습니다"
         return 1
     fi
-    if ! reconcile_self=$(self_node); then
+    if ! read_self_node; then
         sync_error "self node를 읽지 못했습니다"
     else
+        reconcile_self=$SELF_NODE
         copy_outbox_to_spool
         # A broken retention-interval must not silently stop the sweeps: report it
         # and sweep on this pass as if the interval were 0.
-        if reconcile_interval=$(retention_interval_seconds); then
-            if retention_due "$reconcile_interval"; then
+        if read_retention_interval; then
+            if retention_due "$RETENTION_INTERVAL"; then
                 reconcile_retention=1
             else
                 reconcile_retention=0
@@ -3557,7 +3891,7 @@ reconcile_cycle() {
         fi
         [ "$reconcile_retention" -eq 0 ] || prune_expired_alerts
         reconcile_spool=$KHALA_ROOT/spool/for/$reconcile_self
-        if ! mkdir -p "$reconcile_spool"; then
+        if [ ! -d "$reconcile_spool" ] && ! mkdir -p "$reconcile_spool"; then
             sync_error "로컬 spool 디렉터리를 만들지 못했습니다"
         else
             watchdog_heartbeat_timeout "$reconcile_self"
@@ -3957,7 +4291,8 @@ cmd_send_request_locked() {
         rm -f "$request_work/body"
         mv "$request_work" "$request_dir" || return 1
     fi
-    send_id=$(header_value Id "$request_dir/message")
+    read_header Id "$request_dir/message"
+    send_id=$HEADER_VALUE
     valid_message_id "$send_id" || { error "invalid saved request Id"; return 1; }
     if [ -f "$request_dir/published" ]; then
         printf '%s\n' "$send_id"
@@ -3970,7 +4305,8 @@ cmd_send_request_locked() {
         fi
     done
     if [ "$request_found" -eq 0 ]; then
-        request_expires=$(header_value Expires "$request_dir/message")
+        read_header Expires "$request_dir/message"
+        request_expires=$HEADER_VALUE
         if [ "$request_expires" -le "$(date +%s)" ]; then
             error "saved request expired before publication; use a new request-id to send again"
             return 1
@@ -3981,7 +4317,8 @@ cmd_send_request_locked() {
     # authoritative repair path if interrupted after this point.
     atomic_line "$request_dir/published" "$send_id" send-request-published || return 1
     if [ -f "$KHALA_ROOT/outbox/new/$send_id" ]; then
-        request_to=$(header_value To "$request_dir/message")
+        read_header To "$request_dir/message"
+        request_to=$HEADER_VALUE
         mkdir -p "$KHALA_ROOT/spool/for/${request_to#*@}" || return 1
         atomic_copy "$request_dir/message" "$KHALA_ROOT/spool/for/${request_to#*@}/$send_id" || :
     fi
@@ -4186,7 +4523,8 @@ cmd_send() {
         error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
         return 1
     fi
-    send_ttl=$(normalize_integer "$send_ttl")
+    set_normalized "$send_ttl"
+    send_ttl=$normalized
     # The delivered-Id dedup log is kept 60 days; a message that could still be
     # retransmitted after its dedup entry expired would be installed twice.
     if [ "$send_ttl" -gt 5097600 ]; then
@@ -4297,7 +4635,8 @@ cmd_notify() {
         error "만료 초는 0 이상 18자리 이하의 정수여야 합니다"
         return 1
     fi
-    notify_ttl=$(normalize_integer "$notify_ttl")
+    set_normalized "$notify_ttl"
+    notify_ttl=$normalized
     case "$notify_subject" in
         *'
 '*|*'
@@ -4493,7 +4832,8 @@ cmd_join() {
         shift
     done
     join_session=$(session_name "" 0) || return 1
-    join_now=$(date +%s) || return 1
+    now_epoch || return 1
+    join_now=$NOW
     join_lock=$KHALA_ROOT/run/brain.lock.d
     if ! acquire_lock "$join_lock" 300 join; then
         error "join용 상태 잠금을 얻지 못했습니다"
@@ -4546,7 +4886,8 @@ cmd_leave() {
         return 1
     fi
     leave_session=$(session_name "" 0) || return 1
-    leave_now=$(date +%s) || return 1
+    now_epoch || return 1
+    leave_now=$NOW
     leave_lock=$KHALA_ROOT/run/brain.lock.d
     if ! acquire_lock "$leave_lock" 300 leave; then
         error "leave용 상태 잠금을 얻지 못했습니다"
@@ -4742,7 +5083,8 @@ relative_age() {
 
 print_watchdog_table() {
     watcher_table_mode=$1
-    watcher_table_now=$(date +%s) || return 1
+    now_epoch || return 1
+    watcher_table_now=$NOW
     printf 'NAME\tNODE\tOWNER\tCADENCE\tLAST\tSTATE\tSINCE\n'
     for watcher_table_file in "$KHALA_ROOT"/presence/*.watcher; do
         [ -f "$watcher_table_file" ] || continue
@@ -4851,10 +5193,12 @@ cmd_watcher() {
                 error "예약된 이름입니다: $watcher_owner_name"
                 return 1
             fi
-            watcher_cadence=$(normalize_integer "$watcher_cadence")
+            set_normalized "$watcher_cadence"
+            watcher_cadence=$normalized
             watcher_node=$(self_node) || return 1
             watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
-            watcher_now=$(date +%s) || return 1
+            now_epoch || return 1
+            watcher_now=$NOW
             watcher_lock=$KHALA_ROOT/run/brain.lock.d
             if ! acquire_lock "$watcher_lock" 300 watcher-declare; then
                 error "watcher declare용 상태 잠금을 얻지 못했습니다"
@@ -4936,7 +5280,8 @@ cmd_watcher() {
             fi
             watcher_node=$(self_node) || return 1
             watcher_marker=$KHALA_ROOT/presence/$watcher_name@$watcher_node.watcher
-            watcher_now=$(date +%s) || return 1
+            now_epoch || return 1
+            watcher_now=$NOW
             watcher_lock=$KHALA_ROOT/run/brain.lock.d
             if ! acquire_lock "$watcher_lock" 300 watcher-retire; then
                 error "watcher retire용 상태 잠금을 얻지 못했습니다"
@@ -4974,8 +5319,10 @@ cmd_minds() {
     minds_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
     [ -n "$minds_ttl" ] || minds_ttl=120
     positive_integer "$minds_ttl" || { error "config의 ttl이 양의 정수가 아닙니다"; return 1; }
-    minds_ttl=$(normalize_integer "$minds_ttl")
-    minds_now=$(date +%s) || return 1
+    set_normalized "$minds_ttl"
+    minds_ttl=$normalized
+    now_epoch || return 1
+    minds_now=$NOW
     load_listener_snapshots "$minds_now"
     minds_addresses=$(mktemp "$TMP_DIR/minds-addresses.XXXXXX") || return 1
     minds_sorted=$(mktemp "$TMP_DIR/minds-sorted.XXXXXX") || {
@@ -5024,7 +5371,8 @@ cmd_minds() {
                 minds_retired=1
             elif positive_or_zero_integer "$minds_first" && [ -z "${minds_second-}" ] && \
                 [ -z "${minds_extra-}" ]; then
-                minds_presence_epoch=$(normalize_integer "$minds_first")
+                set_normalized "$minds_first"
+                minds_presence_epoch=$normalized
                 if [ "$((minds_now - minds_presence_epoch))" -le "$minds_ttl" ]; then
                     if [ "$minds_node" = "$minds_self" ]; then
                         minds_presence_state=alive-here
@@ -5054,10 +5402,14 @@ cmd_minds() {
             minds_effort=$(header_value Effort "$minds_current"); [ -n "$minds_effort" ] || minds_effort=-
             minds_role=$(header_value Role "$minds_current"); [ -n "$minds_role" ] || minds_role=-
             minds_charge=$(header_value Charge "$minds_current"); [ -n "$minds_charge" ] || minds_charge=-
-            minds_model_declared=$(header_value Declared-Model "$minds_current")
-            minds_effort_declared=$(header_value Declared-Effort "$minds_current")
-            minds_role_declared=$(header_value Declared-Role "$minds_current")
-            minds_charge_declared=$(header_value Declared-Charge "$minds_current")
+            read_header Declared-Model "$minds_current"
+            minds_model_declared=$HEADER_VALUE
+            read_header Declared-Effort "$minds_current"
+            minds_effort_declared=$HEADER_VALUE
+            read_header Declared-Role "$minds_current"
+            minds_role_declared=$HEADER_VALUE
+            read_header Declared-Charge "$minds_current"
+            minds_charge_declared=$HEADER_VALUE
             minds_model_age=$(relative_age "$minds_model_declared" "$minds_now")
             minds_effort_age=$(relative_age "$minds_effort_declared" "$minds_now")
             minds_role_age=$(relative_age "$minds_role_declared" "$minds_now")
@@ -5065,8 +5417,10 @@ cmd_minds() {
             if [ "$(header_value State "$minds_current")" = active ]; then
                 minds_focus=$(header_value Focus "$minds_current"); [ -n "$minds_focus" ] || minds_focus=-
                 minds_stance=$(header_value Stance "$minds_current"); [ -n "$minds_stance" ] || minds_stance=-
-                minds_focus_declared=$(header_value Declared-Focus "$minds_current")
-                minds_stance_declared=$(header_value Declared-Stance "$minds_current")
+                read_header Declared-Focus "$minds_current"
+                minds_focus_declared=$HEADER_VALUE
+                read_header Declared-Stance "$minds_current"
+                minds_stance_declared=$HEADER_VALUE
                 minds_focus_age=$(relative_age "$minds_focus_declared" "$minds_now")
                 minds_stance_age=$(relative_age "$minds_stance_declared" "$minds_now")
                 if [ "$minds_focus_declared" -gt 0 ] && \
@@ -5116,7 +5470,8 @@ cmd_retire() {
             fi
             ;;
     esac
-    retire_now=$(date +%s) || return 1
+    now_epoch || return 1
+    retire_now=$NOW
     retire_lock=$KHALA_ROOT/run/brain.lock.d
     if ! acquire_lock "$retire_lock" 300 retire; then
         error "retire용 상태 잠금을 얻지 못했습니다"
@@ -5218,7 +5573,8 @@ cmd_stream() {
         error "stream cat 개수는 0 이상의 정수여야 합니다"
         return 1
     fi
-    cat_n=$(normalize_integer "$cat_n")
+    set_normalized "$cat_n"
+    cat_n=$normalized
     cat_list=$(mktemp "$TMP_DIR/stream-cat.XXXXXX") || return 1
     cat_selected=$(mktemp "$TMP_DIR/stream-cat-selected.XXXXXX") || {
         rm -f "$cat_list"
@@ -5267,11 +5623,7 @@ cmd_link() {
         error "khala-link 바이너리가 없습니다; 예상 경로: $link_home_binary 또는 $link_sibling_binary"
         return 1
     fi
-    link_script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || {
-        error "bin/khala의 절대 경로를 확인하지 못했습니다"
-        return 1
-    }
-    link_core_cli=$link_script_dir/$(basename "$0")
+    link_core_cli=$link_script_dir/${0##*/}
 
     export KHALA_BRAIN=$link_core_cli
     exec "$LINK_BINARY" "$@"
@@ -5279,7 +5631,17 @@ cmd_link() {
 
 find_link_binary() {
     LINK_BINARY=
-    link_script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd) || return 1
+    # The directory of this script cannot change while it runs: resolved once.
+    if [ -z "${link_script_dir-}" ]; then
+        case "$0" in
+            */*) link_script_parent=${0%/*} ;;
+            *) link_script_parent=. ;;
+        esac
+        link_script_dir=$(CDPATH= cd -- "${link_script_parent:-/}" && pwd) || {
+            link_script_dir=
+            return 1
+        }
+    fi
     link_home_binary=$KHALA_ROOT/bin/khala-link
     link_sibling_binary=$link_script_dir/khala-link
     if [ -x "$link_home_binary" ]; then
@@ -5626,7 +5988,7 @@ collect_watch_stream_rows() {
         IFS=' ' read -r watch_rows_state watch_rows_epoch watch_rows_extra \
             < "$watch_rows_state_file"
         [ "$watch_rows_state" = joined ] || continue
-        watch_rows_stream=$(basename "$watch_rows_state_file")
+        watch_rows_stream=${watch_rows_state_file##*/}
         watch_rows_unread=$(mktemp "$TMP_DIR/watch-stream.XXXXXX") || return 1
         if ! build_unread_stream_entries "$watch_rows_session" "$watch_rows_stream" \
             "$watch_rows_unread"; then
@@ -5635,7 +5997,8 @@ collect_watch_stream_rows() {
         fi
         while IFS="$TAB" read -r watch_rows_item_epoch watch_rows_id watch_rows_path; do
             [ -n "${watch_rows_item_epoch-}" ] || continue
-            watch_rows_from=$(header_value From "$watch_rows_path")
+            read_header From "$watch_rows_path"
+            watch_rows_from=$HEADER_VALUE
             printf '%s\t%s\tstream:%s\n' "$watch_rows_id" "$watch_rows_from" \
                 "$watch_rows_stream" >> "$watch_rows_output" || {
                 rm -f "$watch_rows_unread"
@@ -5672,6 +6035,79 @@ watch_until_stop() {
     kill -KILL "$watch_until_pid" 2>/dev/null
     wait "$watch_until_pid" 2>/dev/null
     watch_until_pid=
+}
+
+# Leaves in $watch_streams_signature everything the stream rows of the watched
+# session are computed from: for each stream in its join directory, the join
+# record, the cursor, and the name of every entry (an entry never changes once
+# it exists, and the clock can only take rows away). Built from globs and
+# `read` alone. A collection that found no rows (one that finds any ends the
+# watch) stays right for exactly as long as this text stays the same, so the
+# watch collects again only when it differs — whatever the mtimes say: rsync
+# sets a directory's mtime to the sender's, and clocks step. A session with no
+# join record has an empty signature and nothing to collect.
+watch_streams_sign() {
+    watch_streams_signature=
+    for watch_sign_join in "$KHALA_ROOT/join/$watch_session"/*; do
+        [ -f "$watch_sign_join" ] || continue
+        watch_sign_state=
+        IFS= read -r watch_sign_state < "$watch_sign_join" || :
+        watch_sign_cursor=
+        if [ -f "$KHALA_ROOT/cursor/$watch_session/${watch_sign_join##*/}" ]; then
+            IFS= read -r watch_sign_cursor \
+                < "$KHALA_ROOT/cursor/$watch_session/${watch_sign_join##*/}" || :
+        fi
+        set -- "$KHALA_ROOT/streams/${watch_sign_join##*/}"/*/*
+        watch_streams_signature=$watch_streams_signature$NEWLINE${watch_sign_join##*/}$NEWLINE$watch_sign_state$NEWLINE$watch_sign_cursor$NEWLINE$*
+    done
+} 2>/dev/null
+
+# Link freshness without a stat per pass. The relay touches run/link.fresh every
+# few seconds while it is connected, and `-nt` compares two mtimes inside the
+# shell: watch_link_look compares the marker with a file this watch rewrites at
+# each touch it notices. $watch_link_touched is the time of the last look
+# before that touch showed — at most a pass older than the marker's own mtime,
+# which only the first look and a look after a long pass read with stat.
+watch_link_start() {
+    watch_link_marker=$KHALA_ROOT/run/link.fresh
+    watch_link_seen=$watch_lock/link-seen
+    watch_link_touched=
+    watch_link_looked=$watch_started
+    if [ -f "$watch_link_marker" ] && read_file_mtime "$watch_link_marker"; then
+        watch_link_touched=$FILE_MTIME
+    fi
+    printf '\n' > "$watch_link_seen"
+}
+
+watch_link_look() {
+    if [ "$watch_link_marker" -nt "$watch_link_seen" ]; then
+        if [ "$((watch_now - watch_link_looked))" -le 1 ]; then
+            watch_link_touched=$watch_link_looked
+        elif read_file_mtime "$watch_link_marker"; then
+            watch_link_touched=$FILE_MTIME
+        fi
+        printf '\n' > "$watch_link_seen"
+    fi
+    watch_link_looked=$watch_now
+}
+
+# The second between passes. `read -t` on a FIFO this watch holds open and
+# nobody writes to is a sleep inside the shell; sleep(1) is a process per pass.
+watch_pause_start() {
+    watch_pause_fifo=$watch_lock/pause
+    if mkfifo "$watch_pause_fifo" 2>/dev/null && exec 9<>"$watch_pause_fifo"; then
+        return 0
+    fi
+    watch_pause_fifo=
+    error "$watch_lock/pause: FIFO를 만들지 못해 pass 사이 대기를 sleep(1)로 합니다"
+}
+
+watch_pause() {
+    if [ -n "$watch_pause_fifo" ]; then
+        read -r -t 1 -u 9 watch_pause_ignored || :
+    else
+        sleep 1
+    fi
 }
 
 cmd_watch() {
@@ -5722,8 +6158,10 @@ cmd_watch() {
         error "watch 최대 대기는 0 이상의 정수여야 합니다"
         return 1
     fi
-    watch_interval=$(normalize_integer "$watch_interval")
-    watch_max_wait=$(normalize_integer "$watch_max_wait")
+    set_normalized "$watch_interval"
+    watch_interval=$normalized
+    set_normalized "$watch_max_wait"
+    watch_max_wait=$normalized
     watch_session=$(session_name "$watch_session" "$watch_session_set") || return 1
     # With --until the caller waits for its own condition, so a conduit that
     # already delivers this session's mail is no reason to return: the watch
@@ -5740,7 +6178,8 @@ cmd_watch() {
         error "설정을 확인하거나 khala init 먼저 실행하세요."
         return 1
     }
-    watch_mailboxes=$(sed -n 's/^mailbox //p' "$CONFIG")
+    read_config mailbox
+    watch_mailboxes=$CONFIG_VALUE
     if [ -z "$watch_mailboxes" ]; then
         error "config의 mailbox 항목이 없습니다; khala init 먼저 실행하세요."
         return 1
@@ -5750,13 +6189,15 @@ cmd_watch() {
             error "config의 mailbox 항목이 잘못되었습니다; khala init 먼저 실행하세요."
             return 1
         fi
-        watch_endpoints=$(sed -n "s/^peer $watch_mailbox //p" "$CONFIG")
+        read_config "peer $watch_mailbox"
+        watch_endpoints=$CONFIG_VALUE
         if [ -z "$watch_endpoints" ]; then
             error "mailbox의 peer 후보가 없습니다; khala init 먼저 실행하세요."
             return 1
         fi
     done
-    watch_ttl=$(sed -n 's/^ttl //p' "$CONFIG")
+    read_config ttl
+    watch_ttl=$CONFIG_VALUE
     if [ -z "$watch_ttl" ]; then
         watch_ttl=120
     fi
@@ -5764,11 +6205,13 @@ cmd_watch() {
         error "config의 ttl이 양의 정수가 아닙니다"
         return 1
     fi
-    watch_ttl=$(normalize_integer "$watch_ttl")
-    watch_started=$(date +%s) || {
+    set_normalized "$watch_ttl"
+    watch_ttl=$normalized
+    now_epoch || {
         error "현재 시각을 읽지 못했습니다"
         return 1
     }
+    watch_started=$NOW
     watch_inbox_dir=$KHALA_ROOT/inbox/$watch_session/new
     watch_marker=$KHALA_ROOT/presence/$watch_session@$watch_self.watching
     watch_lock=$KHALA_ROOT/run/watch.$watch_session.lock.d
@@ -5789,15 +6232,20 @@ cmd_watch() {
 
     # The loop runs every second so a letter that lands in the inbox wakes the
     # watch within a second whatever the link state; the sync work keeps its own
-    # cadence below.
+    # cadence below. An idle pass starts no process: lanes keep a watch running
+    # all day, and a process a second each is what the node cannot afford.
     watch_marker_refreshed=0
     watch_synced=0
     watch_until_checked=0
+    watch_streams_collected=
+    watch_link_start
+    watch_pause_start
     while :; do
-        watch_now=$(date +%s) || {
+        now_epoch || {
             error "현재 시각을 읽지 못했습니다"
             return 1
         }
+        watch_now=$NOW
         # The condition check starts on the first pass and then once per
         # interval; the passes in between only collect its result.
         if [ "$watch_until_set" -eq 1 ] && [ -z "$watch_until_pid" ] && {
@@ -5811,30 +6259,36 @@ cmd_watch() {
         # relay distributes every content change across the cluster (measured
         # 1Hz presence noise, 57/60s). The freshness rule (interval + ttl)
         # needs one refresh per interval.
+        # The lock owner record follows the same cadence: its readers call it
+        # stale after 2 x (interval + ttl).
         if [ "$watch_marker_refreshed" -eq 0 ] || \
             [ "$((watch_now - watch_marker_refreshed))" -ge "$watch_interval" ]; then
+            if ! refresh_watch_lock; then
+                error "$watch_lock: watch lock owner를 갱신하지 못했습니다; watch를 계속합니다"
+            fi
             if refresh_watching_marker; then
                 watch_marker_refreshed=$watch_now
             else
                 error "$watch_marker: watching marker를 갱신하지 못했습니다; watch를 계속합니다"
             fi
         fi
-        if ! refresh_watch_lock; then
-            error "$watch_lock: watch lock owner를 갱신하지 못했습니다; watch를 계속합니다"
-        fi
+        watch_link_look
         watch_link_fresh=0
-        watch_link_mtime=$(file_mtime "$KHALA_ROOT/run/link.fresh") || watch_link_mtime=
-        if positive_or_zero_integer "$watch_link_mtime" && \
-            [ "$watch_now" -ge "$watch_link_mtime" ] && \
-            [ "$((watch_now - watch_link_mtime))" -lt "$TTL_LINK" ]; then
+        if [ -n "$watch_link_touched" ] && [ "$watch_now" -ge "$watch_link_touched" ] && \
+            [ "$((watch_now - watch_link_touched))" -lt "$TTL_LINK" ]; then
             watch_link_fresh=1
         fi
-        # With a fresh link the relay carries the mail and a local reconcile per
-        # pass is enough; without one, the full sync runs once per interval.
+        # With a fresh link the relay carries the mail and the link daemon runs
+        # the node's reconcile passes (on every arrival, and on its own timer for
+        # the time-driven work). This pass only delivers what already waits in
+        # the local spool; without a fresh link, the full sync runs once per
+        # interval.
         if [ "$watch_link_fresh" -eq 1 ]; then
-            SYNC_FAILED=0
-            if ! reconcile_cycle; then
-                error "reconcile 실패; watch를 계속합니다"
+            if spool_has_files "$KHALA_ROOT/spool/for/$watch_self"; then
+                SYNC_FAILED=0
+                if ! reconcile_cycle; then
+                    error "reconcile 실패; watch를 계속합니다"
+                fi
             fi
         elif [ "$watch_synced" -eq 0 ] || \
             [ "$((watch_now - watch_synced))" -ge "$watch_interval" ]; then
@@ -5849,16 +6303,24 @@ cmd_watch() {
             [ -f "$watch_file" ] || continue
             watch_count=$((watch_count + 1))
         done
-        watch_stream_rows=$(mktemp "$TMP_DIR/watch-rows.XXXXXX") || {
-            error "watch stream 목록 임시 파일을 만들지 못했습니다"
-            return 1
-        }
-        if ! collect_watch_stream_rows "$watch_session" "$watch_stream_rows"; then
-            rm -f "$watch_stream_rows"
-            error "watch stream 목록을 만들지 못했습니다"
-            return 1
+        watch_stream_rows=
+        watch_stream_count=0
+        watch_streams_sign
+        if [ "$watch_streams_signature" != "$watch_streams_collected" ]; then
+            # Signed before collecting: an entry that lands in between is either
+            # collected now or differs from this signature on the next pass.
+            watch_streams_collected=$watch_streams_signature
+            watch_stream_rows=$(mktemp "$TMP_DIR/watch-rows.XXXXXX") || {
+                error "watch stream 목록 임시 파일을 만들지 못했습니다"
+                return 1
+            }
+            if ! collect_watch_stream_rows "$watch_session" "$watch_stream_rows"; then
+                rm -f "$watch_stream_rows"
+                error "watch stream 목록을 만들지 못했습니다"
+                return 1
+            fi
+            watch_stream_count=$(wc -l < "$watch_stream_rows" | tr -d ' ')
         fi
-        watch_stream_count=$(wc -l < "$watch_stream_rows" | tr -d ' ')
         watch_total=$((watch_count + watch_stream_count))
         if [ "$watch_total" -gt 0 ]; then
             if [ "$watch_count" -gt 0 ]; then
@@ -5869,15 +6331,19 @@ cmd_watch() {
             printf '%s\n' "$watch_total"
             for watch_file in "$watch_inbox_dir"/*; do
                 [ -f "$watch_file" ] || continue
-                watch_id=$(header_value Id "$watch_file")
-                watch_from=$(header_value From "$watch_file")
+                read_header Id "$watch_file"
+                watch_id=$HEADER_VALUE
+                read_header From "$watch_file"
+                watch_from=$HEADER_VALUE
                 printf '%s\t%s\n' "$watch_id" "$watch_from"
             done
-            cat "$watch_stream_rows"
-            rm -f "$watch_stream_rows"
+            if [ -n "$watch_stream_rows" ]; then
+                cat "$watch_stream_rows"
+                rm -f "$watch_stream_rows"
+            fi
             return 0
         fi
-        rm -f "$watch_stream_rows"
+        [ -z "$watch_stream_rows" ] || rm -f "$watch_stream_rows"
 
         # Mail was reported above, so it wins a pass where both are true.
         if [ -n "$watch_until_pid" ]; then
@@ -5895,16 +6361,17 @@ cmd_watch() {
         fi
 
         if [ "$watch_max_wait" -gt 0 ]; then
-            watch_now=$(date +%s) || {
+            now_epoch || {
                 error "현재 시각을 읽지 못했습니다"
                 return 1
             }
+            watch_now=$NOW
             if [ "$((watch_now - watch_started))" -ge "$watch_max_wait" ]; then
                 error "기한 내 새 편지 없음"
                 return 3
             fi
         fi
-        sleep 1
+        watch_pause
     done
 }
 
@@ -5971,7 +6438,8 @@ cmd_inbox_interval() {
         return 0
     fi
     if bounded_integer "$interval_value"; then
-        interval_value=$(normalize_integer "$interval_value")
+        set_normalized "$interval_value"
+        interval_value=$normalized
     fi
     if ! valid_notify_interval "$interval_value"; then
         error "알림 간격은 ${NOTIFY_INTERVAL_MIN} 이상 ${NOTIFY_INTERVAL_MAX} 이하의 정수(초) 또는 off여야 합니다"
@@ -6083,10 +6551,14 @@ cmd_inbox() {
         return 1
     fi
     if [ "$inbox_mode" = drain ]; then
-        max_n=$(normalize_integer "$max_n")
-        max_bytes=$(normalize_integer "$max_bytes")
-        max_alerts=$(normalize_integer "$max_alerts")
-        max_alert_bytes=$(normalize_integer "$max_alert_bytes")
+        set_normalized "$max_n"
+        max_n=$normalized
+        set_normalized "$max_bytes"
+        max_bytes=$normalized
+        set_normalized "$max_alerts"
+        max_alerts=$normalized
+        set_normalized "$max_alert_bytes"
+        max_alert_bytes=$normalized
     fi
     inbox_session=$(session_name "$inbox_as" "$inbox_as_set") || return 1
     # list/read --as look into another identity's mailbox (a parent reading a
@@ -6097,7 +6569,8 @@ cmd_inbox() {
         return 1
     fi
     inbox_dir=$KHALA_ROOT/inbox/$inbox_session
-    if ! mkdir -p "$inbox_dir/new" "$inbox_dir/cur"; then
+    if { [ ! -d "$inbox_dir/new" ] || [ ! -d "$inbox_dir/cur" ]; } && \
+        ! mkdir -p "$inbox_dir/new" "$inbox_dir/cur"; then
         error "inbox 디렉터리를 만들지 못했습니다"
         return 1
     fi
@@ -6108,9 +6581,12 @@ cmd_inbox() {
     if [ "$inbox_mode" = summary ]; then
         for inbox_file in "$inbox_dir"/new/*; do
             [ -f "$inbox_file" ] || continue
-            list_id=$(header_value Id "$inbox_file")
-            list_from=$(header_value From "$inbox_file")
-            list_type=$(header_value Type "$inbox_file")
+            read_header Id "$inbox_file"
+            list_id=$HEADER_VALUE
+            read_header From "$inbox_file"
+            list_from=$HEADER_VALUE
+            read_header Type "$inbox_file"
+            list_type=$HEADER_VALUE
             if [ "$inbox_triage" -eq 1 ]; then
                 printf '%s\t%s\t%s\t%s\n' "$list_id" "$list_from" "$list_type" \
                     "$(triage_column "$(basename "$inbox_file")" "$list_type")"
@@ -6130,7 +6606,8 @@ cmd_inbox() {
             : > "$inbox_list_tmp" || { rm -f "$inbox_list_tmp"; return 1; }
             for inbox_file in "$inbox_dir/$inbox_list_state"/*; do
                 [ -f "$inbox_file" ] || continue
-                list_id=$(header_value Id "$inbox_file")
+                read_header Id "$inbox_file"
+                list_id=$HEADER_VALUE
                 printf '%s\t%s\n' "${list_id%%.*}" "$inbox_file" >> "$inbox_list_tmp" || {
                     rm -f "$inbox_list_tmp"
                     return 1
@@ -6139,10 +6616,14 @@ cmd_inbox() {
             sort -n -k1,1 -k2,2 "$inbox_list_tmp" | \
                 while IFS="$TAB" read -r list_epoch inbox_file; do
                     [ -n "${inbox_file-}" ] || continue
-                    list_id=$(header_value Id "$inbox_file")
-                    list_from=$(header_value From "$inbox_file")
-                    list_subject=$(header_value Subject "$inbox_file")
-                    list_date=$(header_value Date "$inbox_file")
+                    read_header Id "$inbox_file"
+                    list_id=$HEADER_VALUE
+                    read_header From "$inbox_file"
+                    list_from=$HEADER_VALUE
+                    read_header Subject "$inbox_file"
+                    list_subject=$HEADER_VALUE
+                    read_header Date "$inbox_file"
+                    list_date=$HEADER_VALUE
                     if [ "$inbox_triage" -eq 1 ]; then
                         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$list_id" "$list_from" \
                             "$list_subject" "$list_date" "$inbox_list_word" \
@@ -6218,7 +6699,8 @@ cmd_inbox() {
                 read_messages=$((read_messages + 1))
                 read_notifiable=$((read_notifiable + 1))
                 read_bytes=$((read_bytes + file_bytes))
-                inbox_message_type=$(header_value Type "$inbox_cur_file")
+                read_header Type "$inbox_cur_file"
+                inbox_message_type=$HEADER_VALUE
                 inbox_message_tag=
                 if [ "$inbox_triage" -eq 1 ] && [ "$inbox_message_type" = message ]; then
                     inbox_message_tag=$(triage_tag "$inbox_basename") || inbox_message_tag=
@@ -6236,7 +6718,8 @@ cmd_inbox() {
                 printf '\n' 2>/dev/null || :
             else
                 remaining_n=$((remaining_n + 1))
-                remaining_from=$(header_value From "$inbox_file")
+                read_header From "$inbox_file"
+                remaining_from=$HEADER_VALUE
                 case " $remaining_senders " in
                     *" $remaining_from "*) ;;
                     *)
@@ -6278,9 +6761,12 @@ cmd_inbox() {
                 fi
                 touch "$inbox_cur_file" 2>/dev/null || :
                 inbox_read_changed=1
-                notice_from=$(header_value From "$inbox_cur_file")
-                notice_subject=$(header_value Subject "$inbox_cur_file")
-                notice_urgency=$(header_value Urgency "$inbox_cur_file")
+                read_header From "$inbox_cur_file"
+                notice_from=$HEADER_VALUE
+                read_header Subject "$inbox_cur_file"
+                notice_subject=$HEADER_VALUE
+                read_header Urgency "$inbox_cur_file"
+                notice_urgency=$HEADER_VALUE
                 [ "$notice_urgency" = info ] || notice_urgency=urgent
                 read_alerts=$((read_alerts + 1))
                 if [ "$notice_urgency" = info ]; then
@@ -6300,7 +6786,8 @@ cmd_inbox() {
                 read_alert_bytes=$((read_alert_bytes + file_bytes))
             else
                 alert_remaining_n=$((alert_remaining_n + 1))
-                alert_remaining_from=$(header_value From "$inbox_file")
+                read_header From "$inbox_file"
+                alert_remaining_from=$HEADER_VALUE
                 printf '%s\n' "$alert_remaining_from" >> "$alert_remaining_senders"
             fi
         done
@@ -6315,8 +6802,16 @@ cmd_inbox() {
         printf '알림 %s건 더 (%s)\n' "$alert_remaining_n" "$alert_remaining_groups"
     fi
     rm -f "${alert_output-}" "${alert_remaining_senders-}"
-    inbox_retain_days=$(retain_days) || inbox_read_status=1
-    inbox_now=$(date +%s) || inbox_read_status=1
+    if read_retain_days; then
+        inbox_retain_days=$RETAIN_DAYS
+    else
+        inbox_read_status=1
+    fi
+    if now_epoch; then
+        inbox_now=$NOW
+    else
+        inbox_read_status=1
+    fi
     if [ "$inbox_read_status" -eq 0 ] && \
         [ "$inbox_read_selection" != notices ]; then
         inbox_retain_seconds=$((inbox_retain_days * 86400))
@@ -6343,7 +6838,8 @@ cmd_inbox() {
                     inbox_read_status=1
                     break
                 fi
-                inbox_cursor_epoch=$(normalize_integer "${inbox_cursor_id%%.*}")
+                set_normalized "${inbox_cursor_id%%.*}"
+                inbox_cursor_epoch=$normalized
                 if [ "$((inbox_cursor_epoch + inbox_retain_seconds))" -lt "$inbox_now" ]; then
                     printf 'stream %s: 커서 이전 항목들이 retention을 지나 소멸했습니다\n' \
                         "$inbox_stream"
@@ -6393,7 +6889,12 @@ cmd_inbox() {
     fi
     if [ "$inbox_read_status" -eq 0 ] || [ "$inbox_read_changed" -eq 1 ]; then
         inbox_after_digest=$(pending_queue_digest "$inbox_session")
-        inbox_read_epoch=$(date +%s) || inbox_read_status=1
+        if now_epoch; then
+            inbox_read_epoch=$NOW
+        else
+            inbox_read_epoch=
+            inbox_read_status=1
+        fi
         if [ "$inbox_read_status" -eq 0 ]; then
             inbox_marker_status=ok
         else
@@ -6439,8 +6940,10 @@ cmd_presence() {
         error "config의 ttl이 양의 정수가 아닙니다"
         return 1
     fi
-    presence_ttl=$(normalize_integer "$presence_ttl")
-    presence_now=$(date +%s) || return 1
+    set_normalized "$presence_ttl"
+    presence_ttl=$normalized
+    now_epoch || return 1
+    presence_now=$NOW
     load_listener_snapshots "$presence_now"
     printf 'ADDRESS\tSTATE\tLAST_SEEN\tWATCHING\n'
     for presence_file in "$KHALA_ROOT"/presence/*; do
@@ -6473,7 +6976,8 @@ cmd_presence() {
             error "$presence_file: 잘못된 heartbeat"
             return 1
         fi
-        presence_epoch=$(normalize_integer "$presence_epoch")
+        set_normalized "$presence_epoch"
+        presence_epoch=$normalized
         if [ "$((presence_now - presence_epoch))" -le "$presence_ttl" ]; then
             if [ "$presence_node" = "$presence_self" ]; then
                 presence_state=alive-here
