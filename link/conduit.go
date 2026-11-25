@@ -131,6 +131,8 @@ type notifier struct {
 	// notifyIntervalWarned records identities whose malformed notify-interval
 	// file has been logged; created on first use.
 	notifyIntervalWarned map[string]bool
+	// autoTrust re-records Codex hook trust (autotrust.go); nil means off.
+	autoTrust *autoTrust
 }
 
 func runNotifier(args []string) int {
@@ -204,6 +206,7 @@ func runNotifier(args []string) int {
 		turnsWarned: make(map[string]bool),
 		triage:      newTriageEngine(home, logger),
 		parentGrace: durationEnv("KHALA_CONDUIT_TEST_PARENT_GRACE", parentNoticeGrace),
+		autoTrust:   newAutoTrust(home, logger),
 	}
 	defer c.triage.close()
 	if c.listenerInterval < time.Second {
@@ -407,6 +410,14 @@ func (c *notifier) run(ctx context.Context) error {
 	defer ticker.Stop()
 	listenerTicker := time.NewTicker(c.listenerInterval)
 	defer listenerTicker.Stop()
+	var autoTrustTicks <-chan time.Time
+	var autoTrustResults <-chan autoTrustResult
+	if c.autoTrust != nil {
+		autoTrustTicker := time.NewTicker(autoTrustTick)
+		defer autoTrustTicker.Stop()
+		autoTrustTicks, autoTrustResults = autoTrustTicker.C, c.autoTrust.results
+		c.autoTrust.tick(ctx)
+	}
 	debounce := time.NewTimer(time.Hour)
 	if !debounce.Stop() {
 		<-debounce.C
@@ -460,6 +471,10 @@ func (c *notifier) run(ctx context.Context) error {
 			} else if err := c.writeListenerSnapshot(model); err != nil {
 				c.logger.Printf("write periodic listener snapshot failed: %v", err)
 			}
+		case <-autoTrustTicks:
+			c.autoTrust.tick(ctx)
+		case result := <-autoTrustResults:
+			c.autoTrust.finish(result)
 		case <-debounceC:
 			debounceC = nil
 			if c.scan() {

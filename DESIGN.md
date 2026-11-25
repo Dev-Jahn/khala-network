@@ -902,6 +902,42 @@ drain 1 <at> <before-generation|-> <after-generation|-> <ring> <info> <streams> 
   고르지 않는다(세션이 한 번만 열려 있으면 명시 `--socket`을 덮지 않는다). 고른 pid와 나머지 pid는 인스턴스·고른 pid마다 conduit 로그에 한 번 남고, `healLease`는 같은
   인스턴스·epoch·세션 안에서 lease의 pid를 등록에 맞춘다. `.ear` 사유 열거형은 그대로다.
 
+#### Codex hook trust 자동 복구 (conduit)
+
+Codex는 trust한 플러그인 hook만 실행하고, 그 trust를 설치된 플러그인 디렉터리 전체의 해시에 묶는다. 마켓플레이스를
+새로 고칠 때마다 `$CODEX_HOME/plugins/cache/<marketplace>/<plugin>/<version>/`이 다시 만들어져 hook이 조용히 멈추고,
+다시 trust할 때까지 codex 레인은 편지를 받지 못한다(5일, 21시간 동안 아무도 몰랐던 실측 두 건). 그래서 복구는 자동이다.
+
+- **opt-in**: `khala-codex auto-trust <plugins>`가 켠다 — `<KHALA_HOME>/codex-auto-trust`(플러그인 이름을 한 줄에 하나)와
+  `<KHALA_HOME>/codex-auto-trust.path`(한 줄, 실행에 쓸 PATH: node의 디렉터리, 이어서 켠 셸의 PATH)를 쓴다.
+  `khala-codex auto-trust off`가 둘 다 지운다. 목록이 없거나 비어 있으면 꺼져 있고, 그때 conduit이 하는 일은 30초마다
+  목록 파일을 열어 보는 것뿐이다(캐시를 보지 않고, 로그도 없다).
+- **감지(프로세스를 만들지 않음)**: conduit이 30초마다 목록의 플러그인에 대해 캐시의 `<marketplace>/<plugin>` 디렉터리와
+  그 아래 `<version>` 디렉터리의 이름·mtime을 읽어 서명을 만든다(목록과 PATH 파일의 내용도 서명에 든다 — 다시 켜면 변화다).
+  서명이 마지막으로 처리한 것과 다르고 **직전 tick과 같을 때**(Codex가 아직 쓰는 중일 수 있으므로 한 tick 더 기다린다)
+  `khala-codex auto-trust --run`을 한 번 실행한다. 서비스 시작 때도 같은 규칙이라 시작 약 30초 뒤에 한 번 돈다(서비스가
+  꺼져 있던 동안의 만료를 덮는다). trust 기록은 `$CODEX_HOME/config.toml`을 고칠 뿐 캐시를 건드리지 않으므로 실행이
+  다음 실행을 부르지 않는다.
+- **실행**: 서비스의 PATH에는 node도 codex도 없다(launchd는 `/usr/bin:/bin:/usr/sbin:/sbin`). 그래서 conduit은 실행 직전에
+  PATH 파일을 읽어 그 값을 자식의 PATH로 쓰고, `khala-codex`도 그 PATH에서 찾는다(다음 `~/.local/bin/khala-codex`; 절대경로).
+  목록은 있는데 PATH 파일이 없거나 비어 있으면 추측하지 않고 실행하지 않는다: exit 127과 "다시 켜라
+  (`khala-codex auto-trust <plugins>`)"는 이유를 한 번 기록한다. conduit의 `KHALA_HOME`·`CODEX_HOME`을 넘기고, 120초 안에 끝나지 않으면 프로세스 그룹째 끝낸다. 알림 루프는 기다리지 않는다.
+  설치본이 공개 릴리스와 같은지의 검증과 trust 기록은 전부 `khala-codex`의 일이다 — conduit은 Codex 설정을 직접 고치지 않는다.
+- **결과**: exit 0이면 다음 변화까지 끝. 0이 아니면(3 여전히 trust 안 됨, 4 확인 불가, 5 설치본이 릴리스와 달라 거부,
+  conduit이 붙이는 124 시간 초과·127 실행 못 함) 서명이 그대로인 동안 1분·2분·5분·15분, 이후 30분마다 다시 시도한다(거부는
+  일시적일 수 있다: Codex가 디렉터리를 아직 다시 만드는 중 — 이때 4나 5로 끝나고 아무것도 쓰지 않는다 —, 캐시 갱신보다
+  마켓 핀이 먼저 보인 경우, 네트워크 단절). 서명이 바뀌면 처음부터다. 실행하지 못한 이유(PATH 파일 없음, `khala-codex` 없음)는
+  이유마다 한 번만 기록한다.
+- **기록**: 실행마다 `log/conduit.log`에 한 줄(`codex auto-trust: exit=N changed=[plugin event was→now; …] problems=[…]`),
+  그리고 `run/codex-auto-trust.last`를 원자적으로 교체한다. 탭으로 나눈 줄이다:
+  `time <epoch> <현지 시각>` · `exit <code>` · 상태가 바뀐 hook마다 `changed <plugin> <event> <was> <now>` ·
+  문제마다 `error <text>` · `recorded <epoch> <현지 시각> <plugins>`. `recorded`는 trust를 실제로 다시 기록한 가장 최근
+  실행이며, 그 실행 24시간 뒤 conduit이 지운다(훅이 시계를 읽지 않아도 되게 하려는 것).
+- **SessionStart**: 목록이 비어 있지 않을 때만 이 파일을 셸 내장 명령으로 읽는다(프로세스 0개).
+  `khala: Codex hook trust 자동 복구 — <plugins>의 hook trust를 <시각>에 다시 기록했습니다` = 지난 24시간 안에 자동으로
+  다시 기록했다. `khala: Codex hook trust 자동 복구 실패 (<시각>) — <이유>` = 마지막 실행이 실패했다(재시도는 계속된다).
+  기존 `Codex hook trust 만료` 줄은 그대로이며 khala hook에 대해서는 그것이 지금 상태의 진실이다.
+
 클러스터 설정 (한 줄 = 한 사실):
 
 ```
