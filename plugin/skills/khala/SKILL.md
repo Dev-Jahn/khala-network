@@ -214,6 +214,31 @@ plugin is byte-identical to the published release; never work around a refusal
 (no edits to Codex's config, no other way to mark the hooks trusted) — report
 it and leave `/hooks` in the Codex TUI to the user.
 
+### Automatic hook trust recovery
+
+A node can recover by itself once the user has opted in:
+`khala-codex auto-trust <plugins>` writes the list `~/.khala/codex-auto-trust`
+(one plugin name per line) and `~/.khala/codex-auto-trust.path` (the PATH the
+service will run with); `khala-codex auto-trust off` removes both. Do not
+enable, extend or edit these unasked. While the list names a plugin, the
+conduit service notices when Codex re-creates that plugin's installed copy and
+runs `khala-codex auto-trust --run`, which re-records trust under the same
+byte-identical-to-the-release rule, retrying a failure after 1, 2, 5, 15 and
+then every 30 minutes. SessionStart then may print:
+
+- `khala: Codex hook trust 자동 복구 — <plugins>의 hook trust를 <time>에 다시 기록했습니다`
+  — trust was re-recorded automatically within the last 24 hours. Nothing to
+  do; mention it to the user if Codex lanes were silent before that time.
+- `khala: Codex hook trust 자동 복구 실패 (<time>) — <reason>` — the last
+  automatic run failed and is being retried. Tell the user the reason; the same
+  rule applies as above: never work around a refusal. A reason saying no PATH
+  is recorded means the list exists without its path file: the user enables it
+  again with `khala-codex auto-trust <plugins>`.
+
+`khala: Codex hook trust 만료` still means what it says: the khala hooks are
+not trusted right now. Each run is one line in `~/.khala/log/conduit.log`
+(`codex auto-trust: …`), and the last result is `~/.khala/run/codex-auto-trust.last`.
+
 ## Streams
 
 Mail is an obligation to one recipient; a stream is a shared record every

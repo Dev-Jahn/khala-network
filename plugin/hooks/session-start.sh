@@ -111,6 +111,42 @@ khala_codex_hook_trust() {
     rm -f "$khala_trust_out" "$khala_trust_err"
 }
 
+# With plugins listed in <KHALA_HOME>/codex-auto-trust the conduit re-records
+# lapsed hook trust by itself and leaves the last run's result in
+# run/codex-auto-trust.last (tab-separated lines: time, exit, changed, error,
+# and recorded — which the conduit keeps for 24 h after a run that re-recorded
+# trust). Reading those two files is all this does: builtins only, no process.
+khala_codex_auto_trust_report() {
+    khala_auto_list=$KHALA_ROOT/codex-auto-trust
+    khala_auto_last=$KHALA_ROOT/run/codex-auto-trust.last
+    [ -f "$khala_auto_list" ] && [ -r "$khala_auto_list" ] || return 0
+    [ -f "$khala_auto_last" ] && [ -r "$khala_auto_last" ] || return 0
+    khala_auto_on=0
+    while IFS= read -r khala_auto_line || [ -n "$khala_auto_line" ]; do
+        case $khala_auto_line in
+            *[![:space:]]*) khala_auto_on=1; break ;;
+        esac
+    done < "$khala_auto_list"
+    [ "$khala_auto_on" -eq 1 ] || return 0
+    khala_auto_time=
+    khala_auto_exit=0
+    khala_auto_errors=
+    while IFS=$'\t' read -r khala_auto_key khala_auto_a khala_auto_b khala_auto_c; do
+        case $khala_auto_key in
+            time) khala_auto_time=$khala_auto_b ;;
+            exit) khala_auto_exit=$khala_auto_a ;;
+            error) khala_auto_errors=${khala_auto_errors:+$khala_auto_errors; }$khala_auto_a ;;
+            recorded)
+                printf 'khala: Codex hook trust 자동 복구 — %s의 hook trust를 %s에 다시 기록했습니다\n' \
+                    "$khala_auto_c" "$khala_auto_b"
+                ;;
+        esac
+    done < "$khala_auto_last"
+    [ "$khala_auto_exit" != 0 ] || return 0
+    printf 'khala: Codex hook trust 자동 복구 실패 (%s) — %s\n' "$khala_auto_time" \
+        "${khala_auto_errors:-khala-codex auto-trust --run exit $khala_auto_exit}"
+}
+
 khala_start_input=$(cat 2>/dev/null) || khala_start_input=
 khala_ensure_cli "$HOOK_DIR/.."
 
@@ -120,6 +156,7 @@ if ! khala_discover; then
 fi
 khala_launch_link_autofetch
 khala_codex_hook_trust
+khala_codex_auto_trust_report
 if ! khala_resolve_session 0 1; then
     exit 0
 fi
