@@ -21,7 +21,7 @@ import (
 
 var implVersion = "0.5.0"
 
-const linkVersion = "0.9.13"
+const linkVersion = "0.9.14"
 
 type options struct {
 	serve     bool
@@ -155,23 +155,10 @@ func run(args []string) int {
 		nodeCoreCLI.trigger()
 	}
 	periodicDone := make(chan struct{})
-	if localOnly {
-		go func() {
-			defer close(periodicDone)
-			ticker := time.NewTicker(opts.scan)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					nodeCoreCLI.trigger()
-				}
-			}
-		}()
-	} else {
-		close(periodicDone)
-	}
+	go func() {
+		defer close(periodicDone)
+		nodeCoreCLI.keepPeriodic(ctx, opts.scan)
+	}()
 	defer func() {
 		stop()
 		<-periodicDone

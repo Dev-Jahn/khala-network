@@ -403,7 +403,14 @@ func (p *relayLoop) installIncoming(ins *installer, o offer, data []byte, active
 		}
 	}
 	p.logger.Printf("stored %s/%s at %s", o.Node, o.Basename, path)
-	p.coreCLI.trigger()
+	// A reconcile pass delivers spool, validates streams and collects session
+	// status generations; it reads a peer's presence file only in the
+	// retention sweep, which the periodic pass runs. Heartbeats, watching
+	// markers and listener snapshots arrive every few seconds on a busy
+	// cluster, so they must not each start a pass.
+	if o.Class != "presence" {
+		p.coreCLI.trigger()
+	}
 }
 
 func (p *relayLoop) reportAsyncError(err error) {

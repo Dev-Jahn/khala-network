@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -19,6 +20,9 @@ type coreCLI struct {
 	dirty  chan struct{}
 	mu     sync.Mutex
 	remote bool
+	// lastPass is when the latest reconcile of either kind was started (unix
+	// nanoseconds), so the periodic timer can tell whether one is owed.
+	lastPass atomic.Int64
 }
 
 func newCoreCLI(path, home string, logger *log.Logger, ownerValue ...bool) *coreCLI {
@@ -84,6 +88,7 @@ func (b *coreCLI) writeTrigger() error {
 func (b *coreCLI) reconcile(scanGate bool) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.lastPass.Store(time.Now().UnixNano())
 	cmd := exec.Command(b.path, "reconcile")
 	scanGateValue := ""
 	if scanGate {
@@ -96,6 +101,28 @@ func (b *coreCLI) reconcile(scanGate bool) error {
 	cmd.Stdout = b.logger.Writer()
 	cmd.Stderr = b.logger.Writer()
 	return cmd.Run()
+}
+
+// keepPeriodic makes sure a reconcile pass starts at least once per interval
+// for as long as this process lives. Watchdog silence, outbox expiry and the
+// retention sweeps are driven by the clock, not by an arrival, so they need a
+// pass whatever the transport is doing. A connected dial transport already
+// runs one per interval (the watcher's gated pass); this timer then finds none
+// owed and stays quiet. It fills in when there is no remote endpoint and
+// while the endpoint is down or reconnecting.
+func (b *coreCLI) keepPeriodic(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(max(interval/30, time.Millisecond))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if now.Sub(time.Unix(0, b.lastPass.Load())) >= interval {
+				b.trigger()
+			}
+		}
+	}
 }
 
 func (b *coreCLI) run(ctx context.Context) {

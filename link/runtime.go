@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -196,9 +195,7 @@ func secureDirectory(path string) error {
 
 var bootIDGOOS = runtime.GOOS
 var bootIDReadFile = os.ReadFile
-var bootIDSysctl = func(name string) ([]byte, error) {
-	return exec.Command("sysctl", "-n", name).Output()
-}
+var bootIDSysctl = bootSysctl
 var bootIDFallbackOnce sync.Once
 var bootIDFallbackLog = func() {
 	fmt.Fprintln(os.Stderr, "boot id: kern.bootsessionuuid unavailable; using kern.boottime")
@@ -313,66 +310,14 @@ func processStart(pid int, bootID string) (string, error) {
 	if pid <= 1 {
 		return "", fmt.Errorf("invalid pid %d", pid)
 	}
-	if runtime.GOOS == "linux" {
-		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-		if err != nil {
-			return "", err
-		}
-		line := string(data)
-		end := strings.LastIndex(line, ")")
-		if end < 0 {
-			return "", errors.New("malformed /proc stat")
-		}
-		fields := strings.Fields(line[end+1:])
-		if len(fields) <= 19 {
-			return "", errors.New("short /proc stat")
-		}
-		return bootID + ":" + fields[19], nil
-	}
-	data, err := processStartCommand(pid).Output()
+	value, err := processStartValue(pid)
 	if err != nil {
 		return "", err
 	}
-	value := strings.TrimSpace(string(data))
 	if value == "" {
 		return "", errors.New("empty process start time")
 	}
 	return bootID + ":" + value, nil
-}
-
-// processStartCommand reads a process start time on darwin. `ps -o lstart=`
-// renders the timestamp in the caller's locale, so a hook or Codex bridge
-// running under a Korean-locale session and a notifier under launchd (no LANG)
-// would record two different strings for one process and never match. The
-// locale is pinned so every writer and reader produces the same bytes.
-func processStartCommand(pid int) *exec.Cmd {
-	cmd := exec.Command("ps", "-o", "lstart=", "-p", strconv.Itoa(pid))
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANG=C", "LC_TIME=C")
-	return cmd
-}
-
-func processParent(pid int) (int, error) {
-	if runtime.GOOS == "linux" {
-		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
-		if err != nil {
-			return 0, err
-		}
-		line := string(data)
-		end := strings.LastIndex(line, ")")
-		if end < 0 {
-			return 0, errors.New("malformed /proc stat")
-		}
-		fields := strings.Fields(line[end+1:])
-		if len(fields) < 2 {
-			return 0, errors.New("short /proc stat")
-		}
-		return strconv.Atoi(fields[1])
-	}
-	data, err := exec.Command("ps", "-o", "ppid=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return 0, err
-	}
-	return strconv.Atoi(strings.TrimSpace(string(data)))
 }
 
 func processIsAncestor(ancestor, child int) bool {
@@ -875,25 +820,6 @@ func firstPositive(values ...int) int {
 
 func validInstanceID(value string) bool {
 	return len(value) <= 128 && validNode(value)
-}
-
-func processArgs(pid int) []string {
-	if pid <= 1 {
-		return nil
-	}
-	if runtime.GOOS == "linux" {
-		data, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-		if err != nil {
-			return nil
-		}
-		parts := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
-		return parts
-	}
-	data, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
-	if err != nil {
-		return nil
-	}
-	return strings.Fields(string(data))
 }
 
 func detectSessionKind(pid int) string {
