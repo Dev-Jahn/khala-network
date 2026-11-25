@@ -252,6 +252,21 @@ grep -R -q 'run_in_background\|watch --session\|재무장' "$RIG/ready.out" && \
     fail 6 "SessionStart retained arm/re-arm guidance"
 pass 6 "SessionStart reaches ready lease ownership and emits no arm guidance"
 
+# The conduit's last automatic hook-trust result is reported only while the
+# opt-in list names a plugin.
+mkdir -p "$ARM_HOME/run" || fail 6b "could not create run directory"
+printf 'time\t1800000000\t2027-01-15 08:00\nexit\t5\nerror\thippo: installed copy is not the published release\nrecorded\t1799990000\t2027-01-15 05:13\tkhala-network-codex\n' \
+    > "$ARM_HOME/run/codex-auto-trust.last"
+run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/auto-trust-off.out" || fail 6b "run without opt-in failed"
+grep -q '자동 복구' "$RIG/auto-trust-off.out" && fail 6b "automatic recovery reported without an opt-in list"
+printf '\nkhala-network-codex\nhippo\n' > "$ARM_HOME/codex-auto-trust"
+run_start_without_env "$ARM_HOME" "$ARM_PROJECT" "$RIG/auto-trust.out" || fail 6b "run with opt-in failed"
+grep -qx 'khala: Codex hook trust 자동 복구 — khala-network-codex의 hook trust를 2027-01-15 05:13에 다시 기록했습니다' \
+    "$RIG/auto-trust.out" || fail 6b "re-recorded trust was not reported"
+grep -qx 'khala: Codex hook trust 자동 복구 실패 (2027-01-15 08:00) — hippo: installed copy is not the published release' \
+    "$RIG/auto-trust.out" || fail 6b "failed automatic recovery was not reported"
+pass 6b "SessionStart reports the conduit's automatic Codex hook trust result only with an opt-in list"
+
 LINK_HOME=$RIG/link-home
 LINK_PROJECT=$RIG/link-session
 init_home "$LINK_HOME"
